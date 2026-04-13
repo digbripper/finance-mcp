@@ -2,12 +2,12 @@
 finance_mcp_server.py  — SSE transport edition
 ================================================
 Remote MCP server for campaign finance enrichment.
-Runs on Railway (or any host) and connects via mcp-remote.
+Runs on Railway and connects via mcp-remote.
 
 Data sources:
   - NYC CFB  (city-level, live API)
   - FEC      (federal, live API)
-  - NYS BOE  (state-level, bundled CSV — parsed_contributions.csv)
+  - NYS BOE  (state-level, bundled parsed_contributions.csv)
 
 Auth: every request must include  X-API-Key: <MCP_API_KEY>
 """
@@ -35,47 +35,49 @@ from rapidfuzz import fuzz, process
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.routing import Mount, Route
+from starlette.routing import Route
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── Config ────────────────────────────────────────────────────────────────────
+# ─── Config (lazy — never crash at import time) ───────────────────────────────
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-FEC_API_KEY  = os.getenv("FEC_API_KEY", "DEMO_KEY")
-MCP_API_KEY  = os.environ["MCP_API_KEY"]   # required — set in Railway env vars
+def _cfg(key: str, default: str = "") -> str:
+    return os.environ.get(key, default)
+
+def _require(key: str) -> str:
+    val = os.environ.get(key, "")
+    if not val:
+        raise RuntimeError(f"Required env var {key!r} is not set")
+    return val
 
 CFB_BASE             = "https://data.cityofnewyork.us/resource"
 FEC_BASE             = "https://api.open.fec.gov/v1"
 CFB_CONTRIBUTIONS_ID = "k3cd-yu9d"
+MATCH_THRESHOLD      = 82
 
-MATCH_THRESHOLD = 82
-
-# NYS BOE CSV lives next to this file (bundled in Docker image)
 BOE_CSV_PATH = Path(__file__).parent / "nys_boe_data" / "parsed_contributions.csv"
 
-# ─── NYS BOE CSV cache (loaded once at startup) ────────────────────────────────
+# ─── NYS BOE CSV cache ────────────────────────────────────────────────────────
 
-_boe_rows: list[dict] = []
-_boe_loaded = False
+_boe_rows:   list[dict] = []
+_boe_loaded: bool       = False
 
 def _load_boe_csv():
     global _boe_rows, _boe_loaded
     if _boe_loaded:
         return
     if not BOE_CSV_PATH.exists():
-        log.warning(f"NYS BOE CSV not found at {BOE_CSV_PATH} — state data unavailable")
+        log.warning(f"NYS BOE CSV not found at {BOE_CSV_PATH}")
         _boe_loaded = True
         return
     with open(BOE_CSV_PATH, newline="", encoding="utf-8") as f:
         _boe_rows = list(csv.DictReader(f))
-    log.info(f"Loaded {len(_boe_rows):,} NYS BOE contributions from CSV")
+    log.info(f"Loaded {len(_boe_rows):,} NYS BOE contributions")
     _boe_loaded = True
 
 def boe_donors_to(candidate_name: str, limit: int = 100) -> list[dict]:
-    """Return BOE rows where candidate_name fuzzy-matches."""
     _load_boe_csv()
     if not _boe_rows:
         return []
@@ -83,16 +85,13 @@ def boe_donors_to(candidate_name: str, limit: int = 100) -> list[dict]:
     results = []
     for row in _boe_rows:
         cname = (row.get("candidate_name") or "").strip()
-        if not cname:
-            continue
-        if fuzz.token_sort_ratio(normalize(cname), norm_target) >= MATCH_THRESHOLD:
+        if cname and fuzz.token_sort_ratio(normalize(cname), norm_target) >= MATCH_THRESHOLD:
             results.append(row)
-        if len(results) >= limit:
-            break
+            if len(results) >= limit:
+                break
     return results
 
 def boe_donations_by(donor_name: str, limit: int = 100) -> list[dict]:
-    """Return BOE rows where contributor_name fuzzy-matches."""
     _load_boe_csv()
     if not _boe_rows:
         return []
@@ -100,18 +99,16 @@ def boe_donations_by(donor_name: str, limit: int = 100) -> list[dict]:
     results = []
     for row in _boe_rows:
         cname = (row.get("contributor_name") or "").strip()
-        if not cname:
-            continue
-        if fuzz.token_sort_ratio(normalize(cname), norm_target) >= MATCH_THRESHOLD:
+        if cname and fuzz.token_sort_ratio(normalize(cname), norm_target) >= MATCH_THRESHOLD:
             results.append(row)
-        if len(results) >= limit:
-            break
+            if len(results) >= limit:
+                break
     return results
 
-# ─── DB helpers ────────────────────────────────────────────────────────────────
+# ─── DB helpers ───────────────────────────────────────────────────────────────
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return psycopg2.connect(_require("DATABASE_URL"), cursor_factory=psycopg2.extras.RealDictCursor)
 
 def get_all_contacts() -> list[dict]:
     with get_db() as conn:
@@ -155,8 +152,7 @@ def write_relationship(from_id: str, to_id: str, rel_type: str, context: str, no
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id FROM people_personrelationship
-                WHERE from_person_id = %s AND to_person_id = %s
-                  AND relationship_type = %s
+                WHERE from_person_id = %s AND to_person_id = %s AND relationship_type = %s
             """, (from_id, to_id, rel_type))
             if cur.fetchone():
                 return False
@@ -169,7 +165,7 @@ def write_relationship(from_id: str, to_id: str, rel_type: str, context: str, no
         conn.commit()
         return True
 
-# ─── Name utilities ─────────────────────────────────────────────────────────────
+# ─── Name utilities ───────────────────────────────────────────────────────────
 
 _SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "esq", "phd", "md", "cpa", "dr"}
 
@@ -195,86 +191,73 @@ def best_match(name: str, index: dict, keys: list[str]) -> tuple[Optional[dict],
         return None, 0.0
     return index[result[0]], result[1]
 
-# ─── Live finance API calls ──────────────────────────────────────────────────────
+# ─── Finance API calls ────────────────────────────────────────────────────────
 
 def cfb_donations_received(candidate_name: str, limit: int = 50) -> list[dict]:
     last = candidate_name.strip().split()[-1]
-    url = f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json"
-    params = {
-        "$limit": limit,
-        "$where": f"upper(candidate_name) like upper('%{last}%') AND amount >= 500",
-        "$order": "amount DESC",
-    }
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(
+            f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json",
+            params={"$limit": limit,
+                    "$where": f"upper(candidate_name) like upper('%{last}%') AND amount >= 500",
+                    "$order": "amount DESC"},
+            timeout=15
+        )
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        log.warning(f"CFB donations received error: {e}")
+        log.warning(f"CFB received error: {e}")
         return []
 
 def cfb_donations_made(donor_name: str, limit: int = 50) -> list[dict]:
     last = donor_name.strip().split()[-1]
-    url = f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json"
-    params = {
-        "$limit": limit,
-        "$where": f"upper(contributor_name) like upper('%{last}%') AND amount >= 250",
-        "$order": "amount DESC",
-    }
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(
+            f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json",
+            params={"$limit": limit,
+                    "$where": f"upper(contributor_name) like upper('%{last}%') AND amount >= 250",
+                    "$order": "amount DESC"},
+            timeout=15
+        )
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        log.warning(f"CFB donations made error: {e}")
+        log.warning(f"CFB made error: {e}")
         return []
 
 def fec_donations_to(candidate_name: str, limit: int = 50) -> list[dict]:
+    key = _cfg("FEC_API_KEY", "DEMO_KEY")
     last = candidate_name.strip().split()[-1]
-    url = f"{FEC_BASE}/schedules/schedule_a/"
-    params = {
-        "api_key": FEC_API_KEY,
-        "per_page": min(limit, 100),
-        "contributor_state": "NY",
-        "min_amount": 500,
-        "sort": "-contribution_receipt_amount",
-        "sort_hide_null": True,
-    }
     try:
-        cand_resp = requests.get(
-            f"{FEC_BASE}/candidates/search/",
-            params={"api_key": FEC_API_KEY, "q": last, "state": "NY", "per_page": 3},
-            timeout=10
-        )
-        cand_resp.raise_for_status()
-        cands = cand_resp.json().get("results", [])
+        cands = requests.get(f"{FEC_BASE}/candidates/search/",
+            params={"api_key": key, "q": last, "state": "NY", "per_page": 3}, timeout=10
+        ).json().get("results", [])
+        params = {"api_key": key, "per_page": min(limit, 100), "contributor_state": "NY",
+                  "min_amount": 500, "sort": "-contribution_receipt_amount", "sort_hide_null": True}
         if cands:
             params["committee_id"] = cands[0].get("principal_committees", [{}])[0].get("id", "")
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(f"{FEC_BASE}/schedules/schedule_a/", params=params, timeout=15)
         resp.raise_for_status()
         return resp.json().get("results", [])
     except Exception as e:
-        log.warning(f"FEC donations to error: {e}")
+        log.warning(f"FEC to error: {e}")
         return []
 
 def fec_donations_by(donor_name: str, limit: int = 50) -> list[dict]:
+    key = _cfg("FEC_API_KEY", "DEMO_KEY")
     last = donor_name.strip().split()[-1]
-    url = f"{FEC_BASE}/schedules/schedule_a/"
-    params = {
-        "api_key": FEC_API_KEY,
-        "per_page": min(limit, 100),
-        "contributor_name": last,
-        "contributor_state": "NY",
-        "min_amount": 250,
-        "sort": "-contribution_receipt_amount",
-    }
     try:
         time.sleep(0.3)
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(f"{FEC_BASE}/schedules/schedule_a/",
+            params={"api_key": key, "per_page": min(limit, 100), "contributor_name": last,
+                    "contributor_state": "NY", "min_amount": 250,
+                    "sort": "-contribution_receipt_amount"},
+            timeout=15
+        )
         resp.raise_for_status()
         return resp.json().get("results", [])
     except Exception as e:
-        log.warning(f"FEC donations by error: {e}")
+        log.warning(f"FEC by error: {e}")
         return []
 
 # ─── Core enrichment ──────────────────────────────────────────────────────────
@@ -282,7 +265,6 @@ def fec_donations_by(donor_name: str, limit: int = 50) -> list[dict]:
 def enrich_person(person_name: str) -> dict:
     contacts = get_all_contacts()
     index, keys = build_index(contacts)
-
     subject, _ = best_match(person_name, index, keys)
     subject_id = subject["id"] if subject else None
 
@@ -297,176 +279,96 @@ def enrich_person(person_name: str) -> dict:
         "new_connections_written": 0,
     }
 
-    # ── 1. Who donated TO this person? (CFB + FEC + BOE) ──────────────────────
+    # 1. Who donated TO this person?
     all_received = []
     for row in cfb_donations_received(person_name):
-        dname = (row.get("contributor_name") or "").strip()
-        if not dname:
-            continue
-        all_received.append({
-            "donor_name": dname,
-            "amount": float(row.get("amount") or 0),
-            "year": (row.get("date") or "")[:4],
-            "source": "NYC CFB",
-        })
-
+        d = (row.get("contributor_name") or "").strip()
+        if d: all_received.append({"donor_name": d, "amount": float(row.get("amount") or 0),
+                                    "year": (row.get("date") or "")[:4], "source": "NYC CFB"})
     for row in fec_donations_to(person_name):
-        dname = (row.get("contributor_name") or "").strip()
-        if not dname:
-            continue
-        all_received.append({
-            "donor_name": dname,
-            "amount": float(row.get("contribution_receipt_amount") or 0),
-            "year": (row.get("contribution_receipt_date") or "")[:4],
-            "source": "FEC",
-        })
-
+        d = (row.get("contributor_name") or "").strip()
+        if d: all_received.append({"donor_name": d,
+                                    "amount": float(row.get("contribution_receipt_amount") or 0),
+                                    "year": (row.get("contribution_receipt_date") or "")[:4], "source": "FEC"})
     for row in boe_donors_to(person_name):
-        dname = (row.get("contributor_name") or "").strip()
-        if not dname:
-            continue
-        all_received.append({
-            "donor_name": dname,
-            "amount": float(row.get("amount") or 0),
-            "year": row.get("election_year") or (row.get("date") or "")[:4],
-            "source": "NYS BOE",
-        })
+        d = (row.get("contributor_name") or "").strip()
+        if d: all_received.append({"donor_name": d, "amount": float(row.get("amount") or 0),
+                                    "year": row.get("election_year") or (row.get("date") or "")[:4],
+                                    "source": "NYS BOE"})
 
     for item in all_received:
-        donor_contact, score = best_match(item["donor_name"], index, keys)
-        if not donor_contact:
-            continue
-        entry = {
-            "name": donor_contact["_display"],
-            "person_id": donor_contact["id"],
-            "orgs": donor_contact.get("orgs", ""),
-            "amount": item["amount"],
-            "source": item["source"],
-            "year": item["year"],
-        }
-        findings["known_donors_in_db"].append(entry)
-        note = f"[{item['source']} {item['year']}] Donated ${item['amount']:,.0f} to {person_name} (auto-detected)"
-        write_finance_note(donor_contact["id"], note)
-        if subject_id:
-            new = write_relationship(
-                donor_contact["id"], subject_id,
-                rel_type="Campaign Donor",
-                context=f"Donated to {person_name}",
-                notes=f"${item['amount']:,.0f} | Source: {item['source']} | {item['year']}"
-            )
-            if new:
-                findings["new_connections_written"] += 1
+        dc, _ = best_match(item["donor_name"], index, keys)
+        if not dc: continue
+        findings["known_donors_in_db"].append({
+            "name": dc["_display"], "person_id": dc["id"], "orgs": dc.get("orgs", ""),
+            "amount": item["amount"], "source": item["source"], "year": item["year"],
+        })
+        write_finance_note(dc["id"],
+            f"[{item['source']} {item['year']}] Donated ${item['amount']:,.0f} to {person_name} (auto-detected)")
+        if subject_id and write_relationship(dc["id"], subject_id, "Campaign Donor",
+                f"Donated to {person_name}",
+                f"${item['amount']:,.0f} | Source: {item['source']} | {item['year']}"):
+            findings["new_connections_written"] += 1
 
-    # ── 2. Who did THIS person donate to? (CFB + FEC + BOE) ───────────────────
-    recipient_map: dict[str, dict] = {}
-
+    # 2. Who did THIS person donate to?
+    rmap: dict[str, dict] = {}
     for row in cfb_donations_made(person_name):
-        cname = (row.get("candidate_name") or "").strip()
-        if not cname:
-            continue
-        if cname not in recipient_map:
-            recipient_map[cname] = {"amount": 0, "year": (row.get("date") or "")[:4], "source": "NYC CFB"}
-        recipient_map[cname]["amount"] += float(row.get("amount") or 0)
-
+        c = (row.get("candidate_name") or "").strip()
+        if c:
+            if c not in rmap: rmap[c] = {"amount": 0, "year": (row.get("date") or "")[:4], "source": "NYC CFB"}
+            rmap[c]["amount"] += float(row.get("amount") or 0)
     for row in fec_donations_by(person_name):
-        cname = (row.get("committee_name") or "").strip()
-        if not cname:
-            continue
-        if cname not in recipient_map:
-            recipient_map[cname] = {"amount": 0, "year": (row.get("contribution_receipt_date") or "")[:4], "source": "FEC"}
-        recipient_map[cname]["amount"] += float(row.get("contribution_receipt_amount") or 0)
-
+        c = (row.get("committee_name") or "").strip()
+        if c:
+            if c not in rmap: rmap[c] = {"amount": 0, "year": (row.get("contribution_receipt_date") or "")[:4], "source": "FEC"}
+            rmap[c]["amount"] += float(row.get("contribution_receipt_amount") or 0)
     for row in boe_donations_by(person_name):
-        cname = (row.get("candidate_name") or "").strip()
-        if not cname:
-            continue
-        if cname not in recipient_map:
-            recipient_map[cname] = {"amount": 0, "year": row.get("election_year") or "", "source": "NYS BOE"}
-        recipient_map[cname]["amount"] += float(row.get("amount") or 0)
+        c = (row.get("candidate_name") or "").strip()
+        if c:
+            if c not in rmap: rmap[c] = {"amount": 0, "year": row.get("election_year") or "", "source": "NYS BOE"}
+            rmap[c]["amount"] += float(row.get("amount") or 0)
 
-    for cname, info in sorted(recipient_map.items(), key=lambda x: -x[1]["amount"])[:15]:
-        cand_contact, _ = best_match(cname, index, keys)
-        entry = {
-            "candidate_name": cname,
-            "in_db": bool(cand_contact),
-            "db_match": cand_contact["_display"] if cand_contact else None,
-            **info,
-        }
-        findings["known_recipients_in_db"].append(entry)
-        if subject_id and cand_contact:
-            note = f"[{info['source']} {info['year']}] Donated ${info['amount']:,.0f} to {cname} (auto-detected)"
-            write_finance_note(subject_id, note)
-            new = write_relationship(
-                subject_id, cand_contact["id"],
-                rel_type="Campaign Donor",
-                context=f"Donated to {cname}",
-                notes=f"${info['amount']:,.0f} | Source: {info['source']} | {info['year']}"
-            )
-            if new:
+    for cname, info in sorted(rmap.items(), key=lambda x: -x[1]["amount"])[:15]:
+        cc, _ = best_match(cname, index, keys)
+        findings["known_recipients_in_db"].append({
+            "candidate_name": cname, "in_db": bool(cc),
+            "db_match": cc["_display"] if cc else None, **info,
+        })
+        if subject_id and cc:
+            write_finance_note(subject_id,
+                f"[{info['source']} {info['year']}] Donated ${info['amount']:,.0f} to {cname} (auto-detected)")
+            if write_relationship(subject_id, cc["id"], "Campaign Donor",
+                    f"Donated to {cname}",
+                    f"${info['amount']:,.0f} | Source: {info['source']} | {info['year']}"):
                 findings["new_connections_written"] += 1
 
-    # ── 3. Co-donors ───────────────────────────────────────────────────────────
-    if recipient_map:
-        top_candidate = max(recipient_map, key=lambda k: recipient_map[k]["amount"])
-        co_donors_seen: set[str] = set()
-
-        for row in cfb_donations_received(top_candidate, limit=100):
-            dname = (row.get("contributor_name") or "").strip()
-            if not dname or normalize(dname) == normalize(person_name):
-                continue
-            match, _ = best_match(dname, index, keys)
-            if match and match["id"] not in co_donors_seen:
-                co_donors_seen.add(match["id"])
+    # 3. Co-donors
+    if rmap:
+        top = max(rmap, key=lambda k: rmap[k]["amount"])
+        seen: set[str] = set()
+        for row in list(cfb_donations_received(top, limit=100)) + list(boe_donors_to(top)):
+            d = (row.get("contributor_name") or "").strip()
+            if not d or normalize(d) == normalize(person_name): continue
+            m, _ = best_match(d, index, keys)
+            if m and m["id"] not in seen:
+                seen.add(m["id"])
                 findings["co_donors_in_db"].append({
-                    "name": match["_display"],
-                    "person_id": match["id"],
-                    "orgs": match.get("orgs", ""),
-                    "shared_candidate": top_candidate,
-                    "their_amount": float(row.get("amount") or 0),
-                    "source": "NYC CFB",
+                    "name": m["_display"], "person_id": m["id"], "orgs": m.get("orgs", ""),
+                    "shared_candidate": top, "their_amount": float(row.get("amount") or 0),
+                    "source": "NYS BOE" if row.get("election_year") else "NYC CFB",
                 })
-                if subject_id and match["id"] != subject_id:
-                    new = write_relationship(
-                        subject_id, match["id"],
-                        rel_type="Co-Donor",
-                        context=f"Co-donors to {top_candidate}",
-                        notes=f"Both donated to {top_candidate} (auto-detected)"
-                    )
-                    if new:
-                        findings["new_connections_written"] += 1
-
-        for row in boe_donors_to(top_candidate):
-            dname = (row.get("contributor_name") or "").strip()
-            if not dname or normalize(dname) == normalize(person_name):
-                continue
-            match, _ = best_match(dname, index, keys)
-            if match and match["id"] not in co_donors_seen:
-                co_donors_seen.add(match["id"])
-                findings["co_donors_in_db"].append({
-                    "name": match["_display"],
-                    "person_id": match["id"],
-                    "orgs": match.get("orgs", ""),
-                    "shared_candidate": top_candidate,
-                    "their_amount": float(row.get("amount") or 0),
-                    "source": "NYS BOE",
-                })
-                if subject_id and match["id"] != subject_id:
-                    new = write_relationship(
-                        subject_id, match["id"],
-                        rel_type="Co-Donor",
-                        context=f"Co-donors to {top_candidate}",
-                        notes=f"Both donated to {top_candidate} (NYS BOE)"
-                    )
-                    if new:
+                if subject_id and m["id"] != subject_id:
+                    if write_relationship(subject_id, m["id"], "Co-Donor",
+                            f"Co-donors to {top}", f"Both donated to {top} (auto-detected)"):
                         findings["new_connections_written"] += 1
 
     return findings
 
 # ─── MCP Server ───────────────────────────────────────────────────────────────
 
-app = Server("finance-enrichment")
+mcp_server = Server("finance-enrichment")
 
-@app.list_tools()
+@mcp_server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
@@ -482,10 +384,7 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "person_name": {
-                        "type": "string",
-                        "description": "Full name of the politician or contact to look up"
-                    }
+                    "person_name": {"type": "string", "description": "Full name of the politician or contact to look up"}
                 },
                 "required": ["person_name"]
             }
@@ -508,68 +407,70 @@ async def list_tools() -> list[types.Tool]:
         ),
     ]
 
-@app.call_tool()
+@mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     loop = asyncio.get_event_loop()
-
     if name == "lookup_finance_connections":
-        person_name = arguments["person_name"]
-        log.info(f"Finance lookup: {person_name}")
-        findings = await loop.run_in_executor(None, enrich_person, person_name)
+        log.info(f"Finance lookup: {arguments['person_name']}")
+        findings = await loop.run_in_executor(None, enrich_person, arguments["person_name"])
         return [types.TextContent(type="text", text=json.dumps(findings, indent=2, default=str))]
-
     elif name == "find_financial_path":
-        person_a = arguments["person_a"]
-        person_b = arguments["person_b"]
-        log.info(f"Financial path: {person_a} <-> {person_b}")
-        findings_a, findings_b = await asyncio.gather(
-            loop.run_in_executor(None, enrich_person, person_a),
-            loop.run_in_executor(None, enrich_person, person_b),
+        log.info(f"Financial path: {arguments['person_a']} <-> {arguments['person_b']}")
+        fa, fb = await asyncio.gather(
+            loop.run_in_executor(None, enrich_person, arguments["person_a"]),
+            loop.run_in_executor(None, enrich_person, arguments["person_b"]),
         )
-        a_cands = {r["candidate_name"] for r in findings_a.get("known_recipients_in_db", [])}
-        b_cands = {r["candidate_name"] for r in findings_b.get("known_recipients_in_db", [])}
+        a_cands = {r["candidate_name"] for r in fa.get("known_recipients_in_db", [])}
+        b_cands = {r["candidate_name"] for r in fb.get("known_recipients_in_db", [])}
         result = {
-            "person_a": person_a,
-            "person_b": person_b,
+            "person_a": arguments["person_a"], "person_b": arguments["person_b"],
             "shared_donation_targets": list(a_cands & b_cands),
-            "a_donated_to_b_allies": [r for r in findings_a.get("known_recipients_in_db", []) if r.get("in_db")],
-            "b_donated_to_a_allies": [r for r in findings_b.get("known_recipients_in_db", []) if r.get("in_db")],
+            "a_donated_to_b_allies": [r for r in fa.get("known_recipients_in_db", []) if r.get("in_db")],
+            "b_donated_to_a_allies": [r for r in fb.get("known_recipients_in_db", []) if r.get("in_db")],
         }
         return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
-# ─── Starlette app with auth middleware ───────────────────────────────────────
+# ─── Starlette app ────────────────────────────────────────────────────────────
 
-sse = SseServerTransport("/messages/")
+sse_transport = SseServerTransport("/messages/")
+
+def _check_auth(request: Request) -> bool:
+    expected = _cfg("MCP_API_KEY")
+    if not expected:
+        return True
+    provided = request.headers.get("x-api-key") or request.query_params.get("api_key", "")
+    return provided == expected
 
 async def handle_sse(request: Request):
-    # Auth check
-    api_key = request.headers.get("x-api-key") or request.query_params.get("api_key")
-    if api_key != MCP_API_KEY:
+    if not _check_auth(request):
         return Response("Unauthorized", status_code=401)
-
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-        await app.run(streams[0], streams[1], app.create_initialization_options())
+    log.info(f"SSE connection from {request.client}")
+    async with sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
+        await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
 
 async def handle_messages(request: Request):
-    api_key = request.headers.get("x-api-key") or request.query_params.get("api_key")
-    if api_key != MCP_API_KEY:
+    if not _check_auth(request):
         return Response("Unauthorized", status_code=401)
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+    await sse_transport.handle_post_message(request.scope, request.receive, request._send)
 
 async def healthcheck(request: Request):
-    boe_count = len(_boe_rows) if _boe_loaded else "not loaded"
+    boe_status = f"{len(_boe_rows):,} rows loaded" if _boe_loaded else "not yet loaded"
     return Response(
-        json.dumps({"status": "ok", "boe_rows": boe_count}),
+        json.dumps({"status": "ok", "boe_csv": boe_status}),
         media_type="application/json"
     )
 
 @asynccontextmanager
 async def lifespan(app):
-    log.info("Starting up — loading NYS BOE CSV...")
+    log.info("=== finance-enrichment MCP server starting ===")
+    log.info(f"DATABASE_URL set: {bool(os.environ.get('DATABASE_URL'))}")
+    log.info(f"MCP_API_KEY set:  {bool(os.environ.get('MCP_API_KEY'))}")
+    log.info(f"FEC_API_KEY set:  {bool(os.environ.get('FEC_API_KEY'))}")
     _load_boe_csv()
-    log.info("Ready.")
+    log.info("=== Ready ===")
     yield
 
 starlette_app = Starlette(
@@ -577,12 +478,12 @@ starlette_app = Starlette(
     routes=[
         Route("/health", healthcheck),
         Route("/sse", handle_sse),
-        Mount("/messages/", app=sse.handle_post_message),
+        Route("/messages/", handle_messages, methods=["POST"]),
     ],
 )
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    log.info(f"Starting finance-enrichment MCP server on port {port}")
+    port = int(os.environ.get("PORT", "8000"))
+    log.info(f"Listening on 0.0.0.0:{port}")
     uvicorn.run(starlette_app, host="0.0.0.0", port=port)
