@@ -1,0 +1,21 @@
+# Secrets
+.env
+*.env
+
+# Large BOE zip files — only the CSV goes in
+nys_boe_data/*.zip
+nys_boe_data/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Mac
+.DS_Store
+
+# Misc
+diagnose.py
