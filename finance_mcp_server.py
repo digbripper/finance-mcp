@@ -35,7 +35,7 @@ from rapidfuzz import fuzz, process
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -451,10 +451,15 @@ async def handle_sse(request: Request):
     ) as streams:
         await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
 
-async def handle_messages(request: Request):
+# /messages/ must be a raw ASGI app — handle_post_message sends its own response
+async def messages_asgi(scope, receive, send):
+    """Raw ASGI wrapper so auth check works with handle_post_message."""
+    request = Request(scope, receive)
     if not _check_auth(request):
-        return Response("Unauthorized", status_code=401)
-    await sse_transport.handle_post_message(request.scope, request.receive, request._send)
+        response = Response("Unauthorized", status_code=401)
+        await response(scope, receive, send)
+        return
+    await sse_transport.handle_post_message(scope, receive, send)
 
 async def healthcheck(request: Request):
     boe_status = f"{len(_boe_rows):,} rows loaded" if _boe_loaded else "not yet loaded"
@@ -478,7 +483,7 @@ starlette_app = Starlette(
     routes=[
         Route("/health", healthcheck),
         Route("/sse", handle_sse),
-        Route("/messages/", handle_messages, methods=["POST"]),
+        Mount("/messages/", app=messages_asgi),
     ],
 )
 
