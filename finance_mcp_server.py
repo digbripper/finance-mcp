@@ -359,37 +359,61 @@ NYS_LOBBY_DATASETS = {
 }
 NYS_OPEN_DATA = "https://data.ny.gov/resource"
 
+# Map of well-known officials to their office titles as they appear in party_name.
+# When a name alone returns nothing, we also search these aliases.
+NYS_OFFICIAL_ALIASES: dict[str, list[str]] = {
+    "hochul":    ["Executive Chamber", "Governor Kathy Hochul", "Governor's Office"],
+    "cuomo":     ["Executive Chamber", "Governor Andrew Cuomo"],
+    "adams":     ["Office of the Mayor", "Mayor Eric Adams"],
+    "james":     ["Attorney General Letitia James", "Office of the Attorney General"],
+    "dinapoli":  ["Office of the State Comptroller", "Comptroller Thomas DiNapoli"],
+}
+
 def nys_lobbying_targets(official_name: str, years: list[str] | None = None,
                          limit_per_year: int = 200) -> list[dict]:
     """
     Return NYS COELIG bi-monthly rows where party_name matches the official.
-    Searches the two most recent years by default; pass years=["2022","2023"] to override.
+    Also searches office-title aliases for Governor/Mayor/AG-level officials.
+    Searches the two most recent years by default.
     """
     if years is None:
         years = ["2025", "2024"]
 
-    last = official_name.strip().split()[-1]
+    last = official_name.strip().split()[-1].lower()
     all_rows: list[dict] = []
+
+    # Build list of search terms: last name + any known aliases
+    search_terms = [official_name.strip().split()[-1]]  # last name
+    for alias_key, aliases in NYS_OFFICIAL_ALIASES.items():
+        if alias_key in last:
+            search_terms.extend(aliases)
 
     for year in years:
         dataset_id = NYS_LOBBY_DATASETS.get(year)
         if not dataset_id:
             continue
         url = f"{NYS_OPEN_DATA}/{dataset_id}.json"
-        where = f"upper(party_name) like upper('%{last}%')"
-        try:
-            resp = requests.get(url,
-                params={"$where": where, "$limit": limit_per_year,
-                        "$order": "compensation DESC"},
-                timeout=12)
-            resp.raise_for_status()
-            rows = resp.json()
-            # Verify full name actually appears (last-name search can be noisy)
-            verified = [r for r in rows if last.lower() in (r.get("party_name") or "").lower()]
-            log.info(f"NYS lobbying {year}: {len(verified)} rows targeting {official_name}")
-            all_rows.extend(verified)
-        except Exception as e:
-            log.warning(f"NYS lobbying {year} error: {e}")
+        seen_ids: set[str] = set()
+
+        for term in search_terms:
+            where = f"upper(party_name) like upper('%{term}%')"
+            try:
+                resp = requests.get(url,
+                    params={"$where": where, "$limit": limit_per_year,
+                            "$order": "compensation DESC"},
+                    timeout=12)
+                resp.raise_for_status()
+                rows = resp.json()
+                for r in rows:
+                    uid = r.get("unique_id") or r.get("form_submission_id", "")
+                    if uid and uid not in seen_ids:
+                        seen_ids.add(uid)
+                        r["_matched_alias"] = term
+                        all_rows.append(r)
+            except Exception as e:
+                log.warning(f"NYS lobbying {year}/{term} error: {e}")
+
+        log.info(f"NYS lobbying {year}: {len(seen_ids)} rows targeting {official_name}")
 
     return all_rows
 
@@ -443,6 +467,170 @@ def _dedupe_nys_lobbying(rows: list[dict]) -> list[dict]:
             pass
     return sorted(seen.values(), key=lambda x: -x["compensation"])
 
+
+# ─── Federal LDA Lobbying (lda.senate.gov/api/v1) ────────────────────────────
+# LD-2 quarterly activity reports. Each filing covers one registrant+client pair
+# per quarter. lobbying_activities[] lists issue areas and individual lobbyists.
+# government_entities[] within each activity lists the agencies/bodies contacted.
+# No API key required for anonymous access.
+
+LDA_BASE = "https://lda.senate.gov/api/v1"
+
+# Map well-known officials to the government entity names as they appear in LDA data.
+# LDA uses standardized entity names from a constants list.
+LDA_OFFICIAL_ENTITIES: dict[str, list[str]] = {
+    "schumer":   ["Senate", "U.S. Senate", "Senate Majority Leader"],
+    "gillibrand":["Senate"],
+    "jeffries":  ["House of Representatives", "U.S. House of Representatives"],
+    "ocasio":    ["House of Representatives"],
+    "nadler":    ["House of Representatives"],
+    "meeks":     ["House of Representatives"],
+    "bowman":    ["House of Representatives"],
+    "torres":    ["House of Representatives"],
+    "hochul":    [],  # state-level; skip federal LDA
+    "adams":     [],  # city-level; skip federal LDA
+}
+
+def lda_lobbying_by_registrant(registrant_name: str,
+                                years: list[int] | None = None,
+                                limit: int = 50) -> list[dict]:
+    """Search LDA filings by registrant (lobbying firm) name."""
+    if years is None:
+        years = [2025, 2024]
+    all_filings: list[dict] = []
+    for year in years:
+        try:
+            resp = requests.get(f"{LDA_BASE}/filings/",
+                params={"registrant_name": registrant_name,
+                        "filing_year": year, "filing_type": "Q1,Q2,Q3,Q4",
+                        "limit": limit},
+                timeout=12,
+                headers={"Accept": "application/json"})
+            resp.raise_for_status()
+            all_filings.extend(resp.json().get("results", []))
+        except Exception as e:
+            log.warning(f"LDA registrant search error {year}: {e}")
+    return all_filings
+
+def lda_lobbying_by_client(client_name: str,
+                            years: list[int] | None = None,
+                            limit: int = 50) -> list[dict]:
+    """Search LDA filings by client name."""
+    if years is None:
+        years = [2025, 2024]
+    all_filings: list[dict] = []
+    for year in years:
+        try:
+            resp = requests.get(f"{LDA_BASE}/filings/",
+                params={"client_name": client_name,
+                        "filing_year": year, "filing_type": "Q1,Q2,Q3,Q4",
+                        "limit": limit},
+                timeout=12,
+                headers={"Accept": "application/json"})
+            resp.raise_for_status()
+            all_filings.extend(resp.json().get("results", []))
+        except Exception as e:
+            log.warning(f"LDA client search error {year}: {e}")
+    return all_filings
+
+def lda_lobbying_targeting(official_name: str,
+                            years: list[int] | None = None,
+                            limit: int = 100) -> list[dict]:
+    """
+    Find federal LDA filings where lobbying_activities contain government_entities
+    matching the official's name or known entity aliases.
+    Strategy: search by government_entities parameter if available, else filter post-fetch
+    by issue area for known federal officials.
+    """
+    last = official_name.strip().split()[-1].lower()
+
+    # Skip if this is a state/local official with no federal LDA presence
+    aliases = LDA_OFFICIAL_ENTITIES.get(last)
+    if aliases is not None and len(aliases) == 0:
+        log.info(f"LDA: {official_name} is state/local, skipping federal search")
+        return []
+
+    if years is None:
+        years = [2025, 2024]
+
+    all_filings: list[dict] = []
+    for year in years:
+        try:
+            resp = requests.get(f"{LDA_BASE}/filings/",
+                params={"filing_year": year,
+                        "filing_type": "Q1,Q2,Q3,Q4",
+                        "limit": limit},
+                timeout=12,
+                headers={"Accept": "application/json"})
+            resp.raise_for_status()
+            filings = resp.json().get("results", [])
+
+            # Filter to filings where any lobbying activity targets this official
+            for filing in filings:
+                for activity in filing.get("lobbying_activities") or []:
+                    entities = [
+                        (e.get("name") or "").lower()
+                        for e in (activity.get("government_entities") or [])
+                    ]
+                    lobbyists = activity.get("lobbyists") or []
+                    # Check if any entity or lobbyist name matches
+                    if any(last in e for e in entities):
+                        all_filings.append(filing)
+                        break
+                    if any(last in (l.get("lobbyist", {}).get("last_name") or "").lower()
+                           for l in lobbyists):
+                        all_filings.append(filing)
+                        break
+        except Exception as e:
+            log.warning(f"LDA targeting search error {year}: {e}")
+
+    log.info(f"LDA: {len(all_filings)} filings found for {official_name}")
+    return all_filings
+
+def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
+    """Collapse LDA filings to one entry per registrant+client+year."""
+    seen: dict[str, dict] = {}
+    for f in filings:
+        registrant = (f.get("registrant") or {}).get("name", "")
+        client = (f.get("client") or {}).get("name", "")
+        year = str(f.get("filing_year", ""))
+        key = f"{registrant}|{client}|{year}"
+
+        if key not in seen:
+            # Collect all issue areas and lobbyist names across activities
+            issues: set[str] = set()
+            lobbyist_names: list[str] = []
+            entities: set[str] = set()
+            for act in (f.get("lobbying_activities") or []):
+                if act.get("general_issue_code_display"):
+                    issues.add(act["general_issue_code_display"])
+                for lb in (act.get("lobbyists") or []):
+                    lobj = lb.get("lobbyist") or {}
+                    fn = lobj.get("first_name", "")
+                    ln = lobj.get("last_name", "")
+                    if fn or ln:
+                        lobbyist_names.append(f"{fn} {ln}".strip())
+                for ent in (act.get("government_entities") or []):
+                    if ent.get("name"):
+                        entities.add(ent["name"])
+
+            seen[key] = {
+                "registrant_name":  registrant,
+                "client_name":      client,
+                "year":             year,
+                "filing_type":      f.get("filing_type_display", ""),
+                "income":           float(f.get("income") or 0),
+                "expenses":         float(f.get("expenses") or 0),
+                "issues":           ", ".join(sorted(issues))[:300],
+                "lobbyist_names":   list(set(lobbyist_names))[:10],
+                "government_entities": list(entities)[:10],
+            }
+        else:
+            seen[key]["income"]   += float(f.get("income") or 0)
+            seen[key]["expenses"] += float(f.get("expenses") or 0)
+
+    return sorted(seen.values(), key=lambda x: -(x["income"] + x["expenses"]))
+
 # ─── Core enrichment ──────────────────────────────────────────────────────────
 
 def enrich_person(person_name: str) -> dict:
@@ -461,6 +649,7 @@ def enrich_person(person_name: str) -> dict:
         "co_donors_in_db": [],
         "lobbied_by": [],
         "nys_lobbied_by": [],
+        "federal_lobbied_by": [],
         "lobbying_clients_in_db": [],
         "new_connections_written": 0,
     }
@@ -665,6 +854,58 @@ def enrich_person(person_name: str) -> dict:
 
             findings["nys_lobbied_by"].append(entry)
 
+
+        # ── 4d. Federal LDA lobbying targeting this official ─────────────────
+        lda_filings = lda_lobbying_targeting(person_name)
+        lda_deduped = _dedupe_lda_filings(lda_filings)
+        log.info(f"Federal LDA deduped: {len(lda_deduped)} unique registrant/client pairs")
+
+        for item in lda_deduped[:30]:
+            entry = {
+                "registrant": item["registrant_name"],
+                "client": item["client_name"],
+                "year": item["year"],
+                "filing_type": item["filing_type"],
+                "income": item["income"],
+                "expenses": item["expenses"],
+                "issues": item["issues"],
+                "government_entities": item["government_entities"],
+                "lobbyist_names": item["lobbyist_names"],
+                "registrant_in_db": False,
+                "client_in_db": False,
+                "source": "Federal LDA",
+            }
+
+            # Match individual lobbyists against contacts
+            for lname in item["lobbyist_names"]:
+                lm, _ = best_match(lname, index, keys)
+                if lm:
+                    entry["registrant_in_db"] = True
+                    entry["registrant_person_id"] = lm["id"]
+                    entry["registrant_db_name"] = lm["_display"]
+                    write_finance_note(lm["id"],
+                        f"[Federal LDA {item['year']}] Lobbied on behalf of {item['client_name']}")
+                    if subject_id:
+                        if write_relationship(lm["id"], subject_id, "Lobbyist",
+                                f"Federal lobbyist for {item['client_name']} ({item['year']})",
+                                f"Income: ${item['income']:,.0f} | Issues: {item['issues'][:100]}"):
+                            findings["new_connections_written"] += 1
+                    break
+
+            # Match client against contacts
+            cm, _ = best_match(item["client_name"], index, keys)
+            if cm:
+                entry["client_in_db"] = True
+                entry["client_person_id"] = cm["id"]
+                entry["client_db_name"] = cm["_display"]
+                if subject_id:
+                    if write_relationship(cm["id"], subject_id, "Lobbying Client",
+                            f"Federal lobbying client targeting {person_name} ({item['year']})",
+                            f"Registrant: {item['registrant_name']} | Income: ${item['income']:,.0f}"):
+                        findings["new_connections_written"] += 1
+
+            findings["federal_lobbied_by"].append(entry)
+
         # Did this person/org hire lobbyists?
         client_rows = nyc_lobbying_by_client(person_name)
         if client_rows:
@@ -692,10 +933,10 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="lookup_finance_connections",
             description=(
-                "Look up campaign finance AND lobbying connections for a named person using NYC CFB, FEC, NYS BOE, and NYC City Clerk eLobbyist data. "
+                "Look up campaign finance AND lobbying connections for a named person using NYC CFB, FEC, NYS BOE, NYC City Clerk eLobbyist, NYS COELIG, and Federal LDA data. "
                 "Call this automatically whenever a query involves political influence, access to an elected official, "
                 "or background on a political figure. "
-                "Returns: who donated to them, who they donated to, co-donors in your contacts database, AND who lobbied them (lobbyist firm, client, compensation, subject matter). "
+                "Returns: who donated to them, who they donated to, co-donors in your contacts database, AND who lobbied them at city (NYC), state (NYS COELIG), and federal (LDA) levels. "
                 "Also writes new relationships back to the database in real time. "
                 "ALWAYS call this for political figures before answering influence questions."
             ),
@@ -743,10 +984,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         b_cands = {r["candidate_name"] for r in fb.get("known_recipients_in_db", [])}
 
         # Shared lobbying: officials both people lobbied, or one lobbied the other
-        a_lobbied = {r["client"] for r in fa.get("lobbied_by", [])}
-        b_lobbied = {r["client"] for r in fb.get("lobbied_by", [])}
-        a_lobbied_nys = {r["client"] for r in fa.get("nys_lobbied_by", [])}
-        b_lobbied_nys = {r["client"] for r in fb.get("nys_lobbied_by", [])}
+        a_lobbied      = {r["client"] for r in fa.get("lobbied_by", [])}
+        b_lobbied      = {r["client"] for r in fb.get("lobbied_by", [])}
+        a_lobbied_nys  = {r["client"] for r in fa.get("nys_lobbied_by", [])}
+        b_lobbied_nys  = {r["client"] for r in fb.get("nys_lobbied_by", [])}
+        a_lobbied_fed  = {r["client"] for r in fa.get("federal_lobbied_by", [])}
+        b_lobbied_fed  = {r["client"] for r in fb.get("federal_lobbied_by", [])}
 
         # B lobbied A (B appears in A's lobbied_by list)
         b_lobbied_a_nyc = [r for r in fa.get("lobbied_by", [])
@@ -763,6 +1006,16 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                            if normalize(r.get("client","")) == normalize(arguments["person_a"])
                            or normalize(r.get("lobbyist","")) == normalize(arguments["person_a"])]
 
+        # Federal: did either person appear as lobbyist in the other's federal filings?
+        b_lobbied_a_fed = [r for r in fa.get("federal_lobbied_by", [])
+                           if normalize(r.get("client","")) == normalize(arguments["person_b"])
+                           or any(normalize(l) == normalize(arguments["person_b"])
+                                  for l in r.get("lobbyist_names", []))]
+        a_lobbied_b_fed = [r for r in fb.get("federal_lobbied_by", [])
+                           if normalize(r.get("client","")) == normalize(arguments["person_a"])
+                           or any(normalize(l) == normalize(arguments["person_a"])
+                                  for l in r.get("lobbyist_names", []))]
+
         result = {
             "person_a": arguments["person_a"],
             "person_b": arguments["person_b"],
@@ -770,13 +1023,18 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             "shared_donation_targets": list(a_cands & b_cands),
             "a_donated_to_b_allies": [r for r in fa.get("known_recipients_in_db", []) if r.get("in_db")],
             "b_donated_to_a_allies": [r for r in fb.get("known_recipients_in_db", []) if r.get("in_db")],
-            # Lobbying connections
+            # NYC lobbying connections
             "b_lobbied_a_nyc": b_lobbied_a_nyc,
             "a_lobbied_b_nyc": a_lobbied_b_nyc,
+            "shared_nyc_lobbying_clients": list(a_lobbied & b_lobbied),
+            # NYS lobbying connections
             "b_lobbied_a_nys": b_lobbied_a_nys,
             "a_lobbied_b_nys": a_lobbied_b_nys,
-            "shared_nyc_lobbying_clients": list(a_lobbied & b_lobbied),
             "shared_nys_lobbying_clients": list(a_lobbied_nys & b_lobbied_nys),
+            # Federal LDA connections
+            "b_lobbied_a_federal": b_lobbied_a_fed,
+            "a_lobbied_b_federal": a_lobbied_b_fed,
+            "shared_federal_lobbying_clients": list(a_lobbied_fed & b_lobbied_fed),
         }
         return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
