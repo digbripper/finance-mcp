@@ -284,7 +284,7 @@ def nyc_lobbying_targets(official_name: str, year: str = "", limit: int = 200) -
     last = official_name.strip().split()[-1]
     url  = f"{NYC_OPEN_DATA}/{NYC_LOBBYING_ID}.json"
     try:
-        resp = requests.get(url, params=_lobbying_params(last, year, limit), timeout=20)
+        resp = requests.get(url, params=_lobbying_params(last, year, limit), timeout=10)
         resp.raise_for_status()
         rows = resp.json()
         # Verify the name actually appears (last-name search can get false positives)
@@ -314,7 +314,7 @@ def nyc_lobbying_by_client(client_name: str, year: str = "", limit: int = 100) -
             where += f" AND report_year='{year}'"
         resp = requests.get(url,
             params={"$where": where, "$limit": limit, "$order": "compensation_total DESC"},
-            timeout=20)
+            timeout=10)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -449,70 +449,75 @@ def enrich_person(person_name: str) -> dict:
 
 
     # 4. Who lobbied THIS person? (NYC City Clerk eLobbyist data)
-    # ── 4a. Raw lobbying filings targeting this official ──────────────────────
-    current_year = str(__import__("datetime").datetime.now().year)
-    lobby_rows = nyc_lobbying_targets(person_name)
-    deduped_lobbying = _dedupe_lobbying(lobby_rows)
+    try:
+        log.info(f"Fetching NYC lobbying data for {person_name}...")
+        lobby_rows = nyc_lobbying_targets(person_name)
+        log.info(f"Got {len(lobby_rows)} raw lobbying rows")
+        deduped_lobbying = _dedupe_lobbying(lobby_rows)
+        log.info(f"Deduped to {len(deduped_lobbying)} unique client/lobbyist pairs")
 
-    for item in deduped_lobbying[:50]:  # cap at 50 unique client/lobbyist pairs
-        entry = {
-            "lobbyist": item["lobbyist_name"],
-            "client": item["client_name"],
-            "client_industry": item["client_industry"],
-            "year": item["year"],
-            "compensation": item["compensation"],
-            "activities": item["activities"][:200] if item["activities"] else "",
-            "lobbyist_in_db": False,
-            "client_in_db": False,
-            "lobbyist_person_id": None,
-            "client_person_id": None,
-        }
-
-        # Match lobbyist principal against contacts
-        lpo = item.get("lobbyist_po", "")
-        if lpo:
-            lm, _ = best_match(lpo, index, keys)
-            if lm:
-                entry["lobbyist_in_db"] = True
-                entry["lobbyist_person_id"] = lm["id"]
-                entry["lobbyist_db_name"] = lm["_display"]
-                write_finance_note(lm["id"],
-                    f"[NYC Lobbying {item['year']}] Lobbied {person_name} on behalf of {item['client_name']}")
-                if subject_id:
-                    if write_relationship(lm["id"], subject_id, "Lobbyist",
-                            f"Lobbied {person_name} ({item['year']})",
-                            f"Client: {item['client_name']} | Compensation: ${item['compensation']:,.0f}"):
-                        findings["new_connections_written"] += 1
-
-        # Match client principal against contacts
-        cpo = item.get("client_po", "")
-        if cpo:
-            cm, _ = best_match(cpo, index, keys)
-            if cm:
-                entry["client_in_db"] = True
-                entry["client_person_id"] = cm["id"]
-                entry["client_db_name"] = cm["_display"]
-                write_finance_note(cm["id"],
-                    f"[NYC Lobbying {item['year']}] Hired lobbyist to target {person_name} re: {item['activities'][:100]}")
-                if subject_id:
-                    if write_relationship(cm["id"], subject_id, "Lobbying Client",
-                            f"Hired lobbyist targeting {person_name} ({item['year']})",
-                            f"Lobbyist: {item['lobbyist_name']} | Compensation: ${item['compensation']:,.0f}"):
-                        findings["new_connections_written"] += 1
-
-        findings["lobbied_by"].append(entry)
-
-    # ── 4b. Did this person (or their org) hire lobbyists? ────────────────────
-    client_rows = nyc_lobbying_by_client(person_name)
-    if client_rows:
-        for item in _dedupe_lobbying(client_rows)[:10]:
-            findings["lobbying_clients_in_db"].append({
-                "as_client": item["client_name"],
-                "hired_lobbyist": item["lobbyist_name"],
+        for item in deduped_lobbying[:50]:
+            entry = {
+                "lobbyist": item["lobbyist_name"],
+                "client": item["client_name"],
+                "client_industry": item["client_industry"],
                 "year": item["year"],
                 "compensation": item["compensation"],
                 "activities": item["activities"][:200] if item["activities"] else "",
-            })
+                "lobbyist_in_db": False,
+                "client_in_db": False,
+                "lobbyist_person_id": None,
+                "client_person_id": None,
+            }
+
+            # Match lobbyist principal against contacts
+            lpo = item.get("lobbyist_po", "")
+            if lpo:
+                lm, _ = best_match(lpo, index, keys)
+                if lm:
+                    entry["lobbyist_in_db"] = True
+                    entry["lobbyist_person_id"] = lm["id"]
+                    entry["lobbyist_db_name"] = lm["_display"]
+                    write_finance_note(lm["id"],
+                        f"[NYC Lobbying {item['year']}] Lobbied {person_name} on behalf of {item['client_name']}")
+                    if subject_id:
+                        if write_relationship(lm["id"], subject_id, "Lobbyist",
+                                f"Lobbied {person_name} ({item['year']})",
+                                f"Client: {item['client_name']} | Compensation: ${item['compensation']:,.0f}"):
+                            findings["new_connections_written"] += 1
+
+            # Match client principal against contacts
+            cpo = item.get("client_po", "")
+            if cpo:
+                cm, _ = best_match(cpo, index, keys)
+                if cm:
+                    entry["client_in_db"] = True
+                    entry["client_person_id"] = cm["id"]
+                    entry["client_db_name"] = cm["_display"]
+                    write_finance_note(cm["id"],
+                        f"[NYC Lobbying {item['year']}] Hired lobbyist to target {person_name} re: {item['activities'][:100]}")
+                    if subject_id:
+                        if write_relationship(cm["id"], subject_id, "Lobbying Client",
+                                f"Hired lobbyist targeting {person_name} ({item['year']})",
+                                f"Lobbyist: {item['lobbyist_name']} | Compensation: ${item['compensation']:,.0f}"):
+                            findings["new_connections_written"] += 1
+
+            findings["lobbied_by"].append(entry)
+
+        # Did this person/org hire lobbyists?
+        client_rows = nyc_lobbying_by_client(person_name)
+        if client_rows:
+            for item in _dedupe_lobbying(client_rows)[:10]:
+                findings["lobbying_clients_in_db"].append({
+                    "as_client": item["client_name"],
+                    "hired_lobbyist": item["lobbyist_name"],
+                    "year": item["year"],
+                    "compensation": item["compensation"],
+                    "activities": item["activities"][:200] if item["activities"] else "",
+                })
+    except Exception as e:
+        log.error(f"Lobbying lookup failed for {person_name}: {e}", exc_info=True)
+        findings["lobbying_error"] = str(e)
 
     return findings
 
@@ -562,6 +567,7 @@ async def list_tools() -> list[types.Tool]:
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     loop = asyncio.get_event_loop()
+    log.info(f"Tool called: {name} args={arguments}")
     if name == "lookup_finance_connections":
         log.info(f"Finance lookup: {arguments['person_name']}")
         findings = await loop.run_in_executor(None, enrich_person, arguments["person_name"])
