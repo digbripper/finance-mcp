@@ -535,54 +535,51 @@ def lda_lobbying_by_client(client_name: str,
 
 def lda_lobbying_targeting(official_name: str,
                             years: list[int] | None = None,
-                            limit: int = 100) -> list[dict]:
+                            limit: int = 50) -> list[dict]:
     """
-    Find federal LDA filings where lobbying_activities contain government_entities
-    matching the official's name or known entity aliases.
-    Strategy: search by government_entities parameter if available, else filter post-fetch
-    by issue area for known federal officials.
+    Find federal LDA filings where a lobbyist name OR registrant/client name
+    matches the official. Also searches by client_name for federal legislators
+    (who sometimes appear as clients of their own PAC lobbyists).
+
+    For state/local officials (Hochul, Adams, etc.) returns [] immediately.
     """
     last = official_name.strip().split()[-1].lower()
+    first_words = official_name.strip().split()
 
-    # Skip if this is a state/local official with no federal LDA presence
+    # Skip state/local officials — they don't appear in federal LDA
     aliases = LDA_OFFICIAL_ENTITIES.get(last)
     if aliases is not None and len(aliases) == 0:
-        log.info(f"LDA: {official_name} is state/local, skipping federal search")
+        log.info(f"LDA: {official_name} is state/local, skipping")
         return []
 
     if years is None:
         years = [2025, 2024]
 
     all_filings: list[dict] = []
-    for year in years:
-        try:
-            resp = requests.get(f"{LDA_BASE}/filings/",
-                params={"filing_year": year,
-                        "filing_type": "Q1,Q2,Q3,Q4",
-                        "limit": limit},
-                timeout=12,
-                headers={"Accept": "application/json"})
-            resp.raise_for_status()
-            filings = resp.json().get("results", [])
+    seen_uuids: set[str] = set()
 
-            # Filter to filings where any lobbying activity targets this official
-            for filing in filings:
-                for activity in filing.get("lobbying_activities") or []:
-                    entities = [
-                        (e.get("name") or "").lower()
-                        for e in (activity.get("government_entities") or [])
-                    ]
-                    lobbyists = activity.get("lobbyists") or []
-                    # Check if any entity or lobbyist name matches
-                    if any(last in e for e in entities):
-                        all_filings.append(filing)
-                        break
-                    if any(last in (l.get("lobbyist", {}).get("last_name") or "").lower()
-                           for l in lobbyists):
-                        all_filings.append(filing)
-                        break
-        except Exception as e:
-            log.warning(f"LDA targeting search error {year}: {e}")
+    for year in years:
+        # Search by lobbyist last name — catches cases where the person IS a lobbyist
+        # Search by registrant name — catches their firm
+        # Both are fast indexed lookups on the LDA side
+        searches = [
+            {"lobbyist_name": last, "filing_year": year, "limit": limit},
+            {"registrant_name": " ".join(first_words[:2]) if len(first_words) >= 2 else last,
+             "filing_year": year, "limit": limit},
+        ]
+        for params in searches:
+            try:
+                resp = requests.get(f"{LDA_BASE}/filings/",
+                    params=params, timeout=10,
+                    headers={"Accept": "application/json"})
+                resp.raise_for_status()
+                for f in resp.json().get("results", []):
+                    uid = f.get("filing_uuid") or f.get("id") or ""
+                    if uid and uid not in seen_uuids:
+                        seen_uuids.add(uid)
+                        all_filings.append(f)
+            except Exception as e:
+                log.warning(f"LDA search error ({params}): {e}")
 
     log.info(f"LDA: {len(all_filings)} filings found for {official_name}")
     return all_filings
@@ -634,6 +631,8 @@ def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
 # ─── Core enrichment ──────────────────────────────────────────────────────────
 
 def enrich_person(person_name: str) -> dict:
+    import concurrent.futures as _cf
+
     contacts = get_all_contacts()
     index, keys = build_index(contacts)
     subject, _ = best_match(person_name, index, keys)
@@ -654,18 +653,30 @@ def enrich_person(person_name: str) -> dict:
         "new_connections_written": 0,
     }
 
-    # 1. Who donated TO this person?
+    # 1. Who donated TO this person? — fetch all sources in parallel
+    with _cf.ThreadPoolExecutor(max_workers=8) as pool:
+        f_cfb_recv  = pool.submit(cfb_donations_received, person_name)
+        f_fec_recv  = pool.submit(fec_donations_to, person_name)
+        f_boe_recv  = pool.submit(boe_donors_to, person_name)
+        f_cfb_made  = pool.submit(cfb_donations_made, person_name)
+        f_fec_made  = pool.submit(fec_donations_by, person_name)
+        f_boe_made  = pool.submit(boe_donations_by, person_name)
+        f_nyc_lobby = pool.submit(nyc_lobbying_targets, person_name)
+        f_nys_lobby = pool.submit(nys_lobbying_targets, person_name)
+        # Federal LDA — only for federal officials; state/local officials return [] immediately
+        f_fed_lobby = pool.submit(lda_lobbying_targeting, person_name)
+
     all_received = []
-    for row in cfb_donations_received(person_name):
+    for row in (f_cfb_recv.result() or []):
         d = (row.get("contributor_name") or "").strip()
         if d: all_received.append({"donor_name": d, "amount": float(row.get("amount") or 0),
                                     "year": (row.get("date") or "")[:4], "source": "NYC CFB"})
-    for row in fec_donations_to(person_name):
+    for row in (f_fec_recv.result() or []):
         d = (row.get("contributor_name") or "").strip()
         if d: all_received.append({"donor_name": d,
                                     "amount": float(row.get("contribution_receipt_amount") or 0),
                                     "year": (row.get("contribution_receipt_date") or "")[:4], "source": "FEC"})
-    for row in boe_donors_to(person_name):
+    for row in (f_boe_recv.result() or []):
         d = (row.get("contributor_name") or "").strip()
         if d: all_received.append({"donor_name": d, "amount": float(row.get("amount") or 0),
                                     "year": row.get("election_year") or (row.get("date") or "")[:4],
@@ -685,19 +696,19 @@ def enrich_person(person_name: str) -> dict:
                 f"${item['amount']:,.0f} | Source: {item['source']} | {item['year']}"):
             findings["new_connections_written"] += 1
 
-    # 2. Who did THIS person donate to?
+    # 2. Who did THIS person donate to? — use results fetched in parallel above
     rmap: dict[str, dict] = {}
-    for row in cfb_donations_made(person_name):
+    for row in (f_cfb_made.result() or []):
         c = (row.get("candidate_name") or "").strip()
         if c:
             if c not in rmap: rmap[c] = {"amount": 0, "year": (row.get("date") or "")[:4], "source": "NYC CFB"}
             rmap[c]["amount"] += float(row.get("amount") or 0)
-    for row in fec_donations_by(person_name):
+    for row in (f_fec_made.result() or []):
         c = (row.get("committee_name") or "").strip()
         if c:
             if c not in rmap: rmap[c] = {"amount": 0, "year": (row.get("contribution_receipt_date") or "")[:4], "source": "FEC"}
             rmap[c]["amount"] += float(row.get("contribution_receipt_amount") or 0)
-    for row in boe_donations_by(person_name):
+    for row in (f_boe_made.result() or []):
         c = (row.get("candidate_name") or "").strip()
         if c:
             if c not in rmap: rmap[c] = {"amount": 0, "year": row.get("election_year") or "", "source": "NYS BOE"}
@@ -740,9 +751,9 @@ def enrich_person(person_name: str) -> dict:
 
     # 4. Who lobbied THIS person? (NYC City Clerk eLobbyist data)
     try:
-        log.info(f"Fetching NYC lobbying data for {person_name}...")
-        lobby_rows = nyc_lobbying_targets(person_name)
-        log.info(f"Got {len(lobby_rows)} raw lobbying rows")
+        log.info(f"Processing NYC lobbying data for {person_name}...")
+        lobby_rows = f_nyc_lobby.result() or []
+        log.info(f"Got {len(lobby_rows)} raw NYC lobbying rows")
         deduped_lobbying = _dedupe_lobbying(lobby_rows)
         log.info(f"Deduped to {len(deduped_lobbying)} unique client/lobbyist pairs")
 
@@ -796,7 +807,7 @@ def enrich_person(person_name: str) -> dict:
 
 
         # ── 4c. NYS state-level lobbying targeting this official ──────────────
-        nys_rows = nys_lobbying_targets(person_name)
+        nys_rows = f_nys_lobby.result() or []
         nys_deduped = _dedupe_nys_lobbying(nys_rows)
         log.info(f"NYS deduped: {len(nys_deduped)} unique lobbyist/client pairs")
 
@@ -856,7 +867,7 @@ def enrich_person(person_name: str) -> dict:
 
 
         # ── 4d. Federal LDA lobbying targeting this official ─────────────────
-        lda_filings = lda_lobbying_targeting(person_name)
+        lda_filings = f_fed_lobby.result() or []
         lda_deduped = _dedupe_lda_filings(lda_filings)
         log.info(f"Federal LDA deduped: {len(lda_deduped)} unique registrant/client pairs")
 
