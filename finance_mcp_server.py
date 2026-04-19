@@ -343,6 +343,106 @@ def _dedupe_lobbying(rows: list[dict]) -> list[dict]:
             pass
     return sorted(seen.values(), key=lambda x: -x["compensation"])
 
+
+# ─── NYS Lobbying (COELIG/JCOPE, data.ny.gov — annual datasets) ──────────────
+# Each row = one contact with a covered official during a bi-monthly period.
+# Key fields: party_name (official), principal_lobbyist_name, contractual_client_name,
+#             lobbying_subjects, compensation, reporting_year, government_body
+
+NYS_LOBBY_DATASETS = {
+    "2025": "kn4r-wkd3",
+    "2024": "erp5-6f4d",
+    "2023": "th4u-mq5q",
+    "2022": "2u7m-echw",
+    "2021": "jy9e-nxib",
+    "2020": "cuzx-2f5f",
+}
+NYS_OPEN_DATA = "https://data.ny.gov/resource"
+
+def nys_lobbying_targets(official_name: str, years: list[str] | None = None,
+                         limit_per_year: int = 200) -> list[dict]:
+    """
+    Return NYS COELIG bi-monthly rows where party_name matches the official.
+    Searches the two most recent years by default; pass years=["2022","2023"] to override.
+    """
+    if years is None:
+        years = ["2025", "2024"]
+
+    last = official_name.strip().split()[-1]
+    all_rows: list[dict] = []
+
+    for year in years:
+        dataset_id = NYS_LOBBY_DATASETS.get(year)
+        if not dataset_id:
+            continue
+        url = f"{NYS_OPEN_DATA}/{dataset_id}.json"
+        where = f"upper(party_name) like upper('%{last}%')"
+        try:
+            resp = requests.get(url,
+                params={"$where": where, "$limit": limit_per_year,
+                        "$order": "compensation DESC"},
+                timeout=12)
+            resp.raise_for_status()
+            rows = resp.json()
+            # Verify full name actually appears (last-name search can be noisy)
+            verified = [r for r in rows if last.lower() in (r.get("party_name") or "").lower()]
+            log.info(f"NYS lobbying {year}: {len(verified)} rows targeting {official_name}")
+            all_rows.extend(verified)
+        except Exception as e:
+            log.warning(f"NYS lobbying {year} error: {e}")
+
+    return all_rows
+
+def nys_lobbying_by_client(client_name: str, years: list[str] | None = None,
+                            limit_per_year: int = 100) -> list[dict]:
+    """Return NYS rows where contractual_client_name matches."""
+    if years is None:
+        years = ["2025", "2024"]
+    last = client_name.strip().split()[-1]
+    all_rows: list[dict] = []
+    for year in years:
+        dataset_id = NYS_LOBBY_DATASETS.get(year)
+        if not dataset_id:
+            continue
+        url = f"{NYS_OPEN_DATA}/{dataset_id}.json"
+        try:
+            resp = requests.get(url,
+                params={"$where": f"upper(contractual_client_name) like upper('%{last}%')",
+                        "$limit": limit_per_year, "$order": "compensation DESC"},
+                timeout=12)
+            resp.raise_for_status()
+            all_rows.extend(resp.json())
+        except Exception as e:
+            log.warning(f"NYS lobbying by client {year} error: {e}")
+    return all_rows
+
+def _dedupe_nys_lobbying(rows: list[dict]) -> list[dict]:
+    """Collapse bi-monthly rows into one entry per lobbyist+client+official+year."""
+    seen: dict[str, dict] = {}
+    for row in rows:
+        key = "|".join([
+            row.get("principal_lobbyist_name", ""),
+            row.get("contractual_client_name", ""),
+            row.get("party_name", ""),
+            row.get("reporting_year", ""),
+        ])
+        if key not in seen:
+            seen[key] = {
+                "lobbyist_name":   (row.get("principal_lobbyist_name") or "").strip(),
+                "client_name":     (row.get("contractual_client_name") or "").strip(),
+                "official_name":   (row.get("party_name") or "").strip(),
+                "year":            (row.get("reporting_year") or "").strip(),
+                "government_body": (row.get("government_body") or "").strip(),
+                "subjects":        (row.get("lobbying_subjects") or "").strip(),
+                "compensation":    0.0,
+                "individual_lobbyists": (row.get("individual_lobbyist_name") or "").strip(),
+            }
+        try:
+            seen[key]["compensation"] += float(row.get("compensation") or 0)
+        except (ValueError, TypeError):
+            pass
+    return sorted(seen.values(), key=lambda x: -x["compensation"])
+
 # ─── Core enrichment ──────────────────────────────────────────────────────────
 
 def enrich_person(person_name: str) -> dict:
@@ -360,6 +460,7 @@ def enrich_person(person_name: str) -> dict:
         "known_recipients_in_db": [],
         "co_donors_in_db": [],
         "lobbied_by": [],
+        "nys_lobbied_by": [],
         "lobbying_clients_in_db": [],
         "new_connections_written": 0,
     }
@@ -504,6 +605,66 @@ def enrich_person(person_name: str) -> dict:
 
             findings["lobbied_by"].append(entry)
 
+
+        # ── 4c. NYS state-level lobbying targeting this official ──────────────
+        nys_rows = nys_lobbying_targets(person_name)
+        nys_deduped = _dedupe_nys_lobbying(nys_rows)
+        log.info(f"NYS deduped: {len(nys_deduped)} unique lobbyist/client pairs")
+
+        for item in nys_deduped[:50]:
+            entry = {
+                "lobbyist": item["lobbyist_name"],
+                "client": item["client_name"],
+                "year": item["year"],
+                "compensation": item["compensation"],
+                "government_body": item["government_body"],
+                "subjects": item["subjects"][:200] if item["subjects"] else "",
+                "individual_lobbyists": item["individual_lobbyists"][:200] if item["individual_lobbyists"] else "",
+                "lobbyist_in_db": False,
+                "client_in_db": False,
+                "lobbyist_person_id": None,
+                "client_person_id": None,
+                "source": "NYS COELIG",
+            }
+
+            # Match individual lobbyists (semicolon-separated "Last, First" names)
+            for raw in item["individual_lobbyists"].split(";"):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                # Convert "Last, First" -> "First Last" for matching
+                parts = raw.split(",", 1)
+                name = f"{parts[1].strip()} {parts[0].strip()}" if len(parts) == 2 else raw
+                lm, _ = best_match(name, index, keys)
+                if lm:
+                    entry["lobbyist_in_db"] = True
+                    entry["lobbyist_person_id"] = lm["id"]
+                    entry["lobbyist_db_name"] = lm["_display"]
+                    write_finance_note(lm["id"],
+                        f"[NYS Lobbying {item['year']}] Lobbied {person_name} on behalf of {item['client_name']}")
+                    if subject_id:
+                        if write_relationship(lm["id"], subject_id, "Lobbyist",
+                                f"Lobbied {person_name} ({item['year']})",
+                                f"Client: {item['client_name']} | NYS COELIG | ${item['compensation']:,.0f}"):
+                            findings["new_connections_written"] += 1
+                    break  # one match per entry is enough
+
+            # Match client name
+            cm, _ = best_match(item["client_name"], index, keys)
+            if cm:
+                entry["client_in_db"] = True
+                entry["client_person_id"] = cm["id"]
+                entry["client_db_name"] = cm["_display"]
+                write_finance_note(cm["id"],
+                    f"[NYS Lobbying {item['year']}] Hired lobbyist to target {person_name} re: {item['subjects'][:100]}")
+                if subject_id:
+                    if write_relationship(cm["id"], subject_id, "Lobbying Client",
+                            f"Hired lobbyist targeting {person_name} ({item['year']})",
+                            f"Lobbyist: {item['lobbyist_name']} | NYS COELIG | ${item['compensation']:,.0f}"):
+                        findings["new_connections_written"] += 1
+
+            findings["nys_lobbied_by"].append(entry)
+
         # Did this person/org hire lobbyists?
         client_rows = nyc_lobbying_by_client(person_name)
         if client_rows:
@@ -580,11 +741,42 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         )
         a_cands = {r["candidate_name"] for r in fa.get("known_recipients_in_db", [])}
         b_cands = {r["candidate_name"] for r in fb.get("known_recipients_in_db", [])}
+
+        # Shared lobbying: officials both people lobbied, or one lobbied the other
+        a_lobbied = {r["client"] for r in fa.get("lobbied_by", [])}
+        b_lobbied = {r["client"] for r in fb.get("lobbied_by", [])}
+        a_lobbied_nys = {r["client"] for r in fa.get("nys_lobbied_by", [])}
+        b_lobbied_nys = {r["client"] for r in fb.get("nys_lobbied_by", [])}
+
+        # B lobbied A (B appears in A's lobbied_by list)
+        b_lobbied_a_nyc = [r for r in fa.get("lobbied_by", [])
+                           if normalize(r.get("client","")) == normalize(arguments["person_b"])
+                           or normalize(r.get("lobbyist","")) == normalize(arguments["person_b"])]
+        b_lobbied_a_nys = [r for r in fa.get("nys_lobbied_by", [])
+                           if normalize(r.get("client","")) == normalize(arguments["person_b"])
+                           or normalize(r.get("lobbyist","")) == normalize(arguments["person_b"])]
+        # A lobbied B
+        a_lobbied_b_nyc = [r for r in fb.get("lobbied_by", [])
+                           if normalize(r.get("client","")) == normalize(arguments["person_a"])
+                           or normalize(r.get("lobbyist","")) == normalize(arguments["person_a"])]
+        a_lobbied_b_nys = [r for r in fb.get("nys_lobbied_by", [])
+                           if normalize(r.get("client","")) == normalize(arguments["person_a"])
+                           or normalize(r.get("lobbyist","")) == normalize(arguments["person_a"])]
+
         result = {
-            "person_a": arguments["person_a"], "person_b": arguments["person_b"],
+            "person_a": arguments["person_a"],
+            "person_b": arguments["person_b"],
+            # Campaign finance connections
             "shared_donation_targets": list(a_cands & b_cands),
             "a_donated_to_b_allies": [r for r in fa.get("known_recipients_in_db", []) if r.get("in_db")],
             "b_donated_to_a_allies": [r for r in fb.get("known_recipients_in_db", []) if r.get("in_db")],
+            # Lobbying connections
+            "b_lobbied_a_nyc": b_lobbied_a_nyc,
+            "a_lobbied_b_nyc": a_lobbied_b_nyc,
+            "b_lobbied_a_nys": b_lobbied_a_nys,
+            "a_lobbied_b_nys": a_lobbied_b_nys,
+            "shared_nyc_lobbying_clients": list(a_lobbied & b_lobbied),
+            "shared_nys_lobbying_clients": list(a_lobbied_nys & b_lobbied_nys),
         }
         return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
