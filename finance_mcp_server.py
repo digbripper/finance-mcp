@@ -604,13 +604,26 @@ async def handle_sse(request: Request):
         await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
 
 # /messages/ must be a raw ASGI app — handle_post_message sends its own response
+# IMPORTANT: do NOT create a Request(scope, receive) here — it consumes the body,
+# leaving handle_post_message with nothing to parse. Read auth from scope directly.
 async def messages_asgi(scope, receive, send):
-    """Raw ASGI wrapper so auth check works with handle_post_message."""
-    request = Request(scope, receive)
-    if not _check_auth(request):
-        response = Response("Unauthorized", status_code=401)
-        await response(scope, receive, send)
-        return
+    """Raw ASGI wrapper with auth check that doesn't consume the request body."""
+    expected = _cfg("MCP_API_KEY")
+    if expected:
+        # Read headers from scope without touching the body
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        api_key = headers.get(b"x-api-key", b"").decode()
+        if not api_key:
+            # Fallback: check query string
+            qs = scope.get("query_string", b"").decode()
+            for part in qs.split("&"):
+                if part.startswith("api_key="):
+                    api_key = part[8:]
+                    break
+        if api_key != expected:
+            response = Response("Unauthorized", status_code=401)
+            await response(scope, receive, send)
+            return
     await sse_transport.handle_post_message(scope, receive, send)
 
 async def healthcheck(request: Request):
