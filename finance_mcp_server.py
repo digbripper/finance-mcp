@@ -496,6 +496,259 @@ FEDERAL_OFFICIALS: dict[str, dict] = {
 
 LDA_BASE = "https://lda.senate.gov/api/v1"
 
+# ─── LDA LD-203 contribution reports ─────────────────────────────────────────
+# LD-203 = semi-annual reports where every registered lobbyist discloses
+# every campaign contribution they made. This is the best way to find
+# who's lobbying a specific federal official — lobbyists who gave them money
+# are almost certainly also meeting with them.
+#
+# Strategy:
+# 1. Fetch LD-203 filings where recipient_name matches the official
+# 2. Filter client-side to contribution_items where honoree_name or payee_name matches
+# 3. Group by registrant firm — aggregate contribution amounts
+# 4. For each firm, pull their LD-2 quarterly filings to get active clients + issues
+# 5. Result: "Firm X gave $Y while lobbying for clients A, B on issues C, D"
+
+def lda_ld203_contributions_to(official_name: str,
+                                years: list[int] | None = None,
+                                limit_per_year: int = 200) -> list[dict]:
+    """
+    Fetch LD-203 filings mentioning this official, then filter to actual
+    contribution_items that reference them by name or committee.
+    Returns list of {registrant, lobbyist, honoree, payee, amount, date, year}.
+    """
+    last = official_name.strip().split()[-1].lower()
+
+    # Skip state/local officials — no federal LDA presence
+    if last in ("hochul", "adams", "james", "dinapoli", "mamdani", "cuomo",
+                "menin", "brewer", "rivera", "osse", "marte"):
+        log.info(f"LDA LD-203: {official_name} is state/local, skipping")
+        return []
+
+    if years is None:
+        years = [2025, 2024, 2023]
+
+    # Get known committee names to match against payee_name
+    official_info = FEDERAL_OFFICIALS.get(last, {})
+    committee_ids = official_info.get("fec_committees", [])
+    lda_search    = official_info.get("lda_search", official_name.strip().split()[-1])
+
+    all_items: list[dict] = []
+    seen_keys: set[str] = set()
+
+    for year in years:
+        try:
+            # recipient_name does a broad text search — we filter precisely client-side
+            resp = requests.get(f"{LDA_BASE}/contributions/",
+                params={
+                    "recipient_name": lda_search,
+                    "filing_year": year,
+                    "limit": limit_per_year,
+                },
+                timeout=12,
+                headers={"Accept": "application/json"})
+            resp.raise_for_status()
+            filings = resp.json().get("results", [])
+            log.info(f"LDA LD-203 {year}: {len(filings)} raw filings for {lda_search}")
+
+            for filing in filings:
+                registrant = filing.get("registrant") or {}
+                lobbyist   = filing.get("lobbyist") or {}
+                reg_name   = (registrant.get("name") or "").strip()
+                reg_id     = registrant.get("id")
+                lob_first  = (lobbyist.get("first_name") or "").strip()
+                lob_last   = (lobbyist.get("last_name") or "").strip()
+                lob_name   = f"{lob_first} {lob_last}".strip()
+                period     = filing.get("filing_period_display", "")
+
+                for item in (filing.get("contribution_items") or []):
+                    honoree = (item.get("honoree_name") or "").strip()
+                    payee   = (item.get("payee_name") or "").strip()
+
+                    # Accept if honoree name contains our search term
+                    # or if payee matches a known committee
+                    matched = lda_search.lower() in honoree.lower()
+                    if not matched and committee_ids:
+                        matched = any(cid.upper() in payee.upper() for cid in committee_ids)
+                    if not matched:
+                        # Fallback: last name in honoree
+                        matched = last in honoree.lower()
+
+                    if not matched:
+                        continue
+
+                    try:
+                        amount = float(item.get("amount") or 0)
+                    except (ValueError, TypeError):
+                        amount = 0.0
+
+                    key = f"{reg_name}|{lob_name}|{honoree}|{payee}|{year}"
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    all_items.append({
+                        "registrant_name": reg_name,
+                        "registrant_id":   reg_id,
+                        "lobbyist_name":   lob_name or reg_name,
+                        "honoree_name":    honoree,
+                        "payee_name":      payee,
+                        "amount":          amount,
+                        "date":            item.get("date") or "",
+                        "period":          period,
+                        "year":            year,
+                        "contribution_type": item.get("contribution_type_display", "FECA"),
+                    })
+
+        except Exception as e:
+            log.warning(f"LDA LD-203 error {year}: {e}")
+
+    log.info(f"LDA LD-203: {len(all_items)} contribution items targeting {official_name}")
+    return all_items
+
+
+def lda_registrant_clients(registrant_id: int, year: int = 2024) -> list[dict]:
+    """
+    For a lobbying firm (by registrant_id), get their active LD-2 clients
+    and the issues they're lobbying on. Returns list of {client, issues}.
+    """
+    try:
+        resp = requests.get(f"{LDA_BASE}/filings/",
+            params={
+                "registrant_id": registrant_id,
+                "filing_year":   year,
+                "filing_type":   "Q1,Q2,Q3,Q4",
+                "limit":         20,
+            },
+            timeout=10,
+            headers={"Accept": "application/json"})
+        resp.raise_for_status()
+        filings = resp.json().get("results", [])
+
+        # Dedupe clients with their issues
+        clients: dict[str, set[str]] = {}
+        for f in filings:
+            client_name = ((f.get("client") or {}).get("name") or "").strip()
+            if not client_name:
+                continue
+            if client_name not in clients:
+                clients[client_name] = set()
+            for act in (f.get("lobbying_activities") or []):
+                issue = act.get("general_issue_code_display")
+                if issue:
+                    clients[client_name].add(issue)
+
+        return [{"client": c, "issues": ", ".join(sorted(issues))}
+                for c, issues in clients.items()]
+
+    except Exception as e:
+        log.warning(f"LDA registrant clients error: {e}")
+        return []
+
+
+def build_federal_lobbying_profile(contribution_items: list[dict],
+                                   index: dict, keys: list[str],
+                                   subject_id: str | None,
+                                   person_name: str,
+                                   findings: dict):
+    """
+    Group LD-203 items by registrant firm, enrich with their LD-2 clients,
+    cross-reference against Pythia contacts, write relationships.
+    Populates findings["federal_lobbied_by"] in place.
+    """
+    if not contribution_items:
+        return
+
+    # Group by registrant firm
+    firms: dict[str, dict] = {}
+    for item in contribution_items:
+        reg = item["registrant_name"]
+        if reg not in firms:
+            firms[reg] = {
+                "registrant_name": reg,
+                "registrant_id":   item["registrant_id"],
+                "total_amount":    0.0,
+                "contributions":   [],
+                "lobbyists":       set(),
+                "years":           set(),
+            }
+        firms[reg]["total_amount"]  += item["amount"]
+        firms[reg]["lobbyists"].add(item["lobbyist_name"])
+        firms[reg]["years"].add(str(item["year"]))
+        firms[reg]["contributions"].append({
+            "lobbyist":   item["lobbyist_name"],
+            "honoree":    item["honoree_name"],
+            "payee":      item["payee_name"],
+            "amount":     item["amount"],
+            "date":       item["date"],
+            "period":     item["period"],
+            "type":       item["contribution_type"],
+        })
+
+    # For each firm, get their active clients (in parallel for speed)
+    import concurrent.futures as _cf
+    most_recent_year = max((item["year"] for item in contribution_items), default=2024)
+
+    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+        client_futures = {
+            reg: pool.submit(lda_registrant_clients, data["registrant_id"], most_recent_year)
+            for reg, data in firms.items()
+            if data["registrant_id"]
+        }
+
+    for reg, data in sorted(firms.items(), key=lambda x: -x[1]["total_amount"]):
+        clients = client_futures.get(reg)
+        client_list = clients.result() if clients else []
+
+        entry = {
+            "registrant": reg,
+            "total_amount": data["total_amount"],
+            "years": sorted(data["years"]),
+            "lobbyists": sorted(data["lobbyists"]),
+            "contributions": sorted(data["contributions"], key=lambda x: -x["amount"])[:5],
+            "active_clients": client_list[:10],
+            "registrant_in_db": False,
+            "registrant_person_id": None,
+            "source": "Federal LDA LD-203",
+        }
+
+        # Match individual lobbyist names against contacts
+        for lob in data["lobbyists"]:
+            if not lob:
+                continue
+            lm, _ = best_match(lob, index, keys)
+            if lm:
+                entry["registrant_in_db"]    = True
+                entry["registrant_person_id"] = lm["id"]
+                entry["registrant_db_name"]   = lm["_display"]
+                write_finance_note(lm["id"],
+                    f"[LDA LD-203 {sorted(data['years'])[-1]}] Made contributions to {person_name}'s campaign "
+                    f"while registered lobbyist at {reg}")
+                if subject_id:
+                    if write_relationship(lm["id"], subject_id, "Lobbyist",
+                            f"LD-203 contributor to {person_name} ({sorted(data['years'])[-1]})",
+                            f"${data['total_amount']:,.0f} total | {reg} | Federal LDA"):
+                        findings["new_connections_written"] += 1
+                break  # one match per firm is enough
+
+        findings["federal_lobbied_by"].append(entry)
+
+
+def lda_lobbying_targeting(official_name: str,
+                            years: list[int] | None = None,
+                            limit: int = 50) -> list[dict]:
+    """
+    Thin wrapper kept for backward compatibility.
+    Now returns LD-203 contribution items (not LD-2 filings).
+    """
+    return lda_ld203_contributions_to(official_name, years)
+
+
+def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
+    """Kept for find_financial_path backward compat — pass through."""
+    return filings
+
+
 # ─── FEC improvements — committee-based donor lookup ─────────────────────────
 
 def fec_get_committees(candidate_name: str) -> list[str]:
@@ -993,56 +1246,12 @@ def enrich_person(person_name: str) -> dict:
             findings["nys_lobbied_by"].append(entry)
 
 
-        # ── 4d. Federal LDA lobbying targeting this official ─────────────────
-        lda_filings = f_fed_lobby.result() or []
-        lda_deduped = _dedupe_lda_filings(lda_filings)
-        log.info(f"Federal LDA deduped: {len(lda_deduped)} unique registrant/client pairs")
-
-        for item in lda_deduped[:30]:
-            entry = {
-                "registrant": item["registrant_name"],
-                "client": item["client_name"],
-                "year": item["year"],
-                "filing_type": item["filing_type"],
-                "income": item["income"],
-                "expenses": item["expenses"],
-                "issues": item["issues"],
-                "government_entities": item["government_entities"],
-                "lobbyist_names": item["lobbyist_names"],
-                "registrant_in_db": False,
-                "client_in_db": False,
-                "source": "Federal LDA",
-            }
-
-            # Match individual lobbyists against contacts
-            for lname in item["lobbyist_names"]:
-                lm, _ = best_match(lname, index, keys)
-                if lm:
-                    entry["registrant_in_db"] = True
-                    entry["registrant_person_id"] = lm["id"]
-                    entry["registrant_db_name"] = lm["_display"]
-                    write_finance_note(lm["id"],
-                        f"[Federal LDA {item['year']}] Lobbied on behalf of {item['client_name']}")
-                    if subject_id:
-                        if write_relationship(lm["id"], subject_id, "Lobbyist",
-                                f"Federal lobbyist for {item['client_name']} ({item['year']})",
-                                f"Income: ${item['income']:,.0f} | Issues: {item['issues'][:100]}"):
-                            findings["new_connections_written"] += 1
-                    break
-
-            # Match client against contacts
-            cm, _ = best_match(item["client_name"], index, keys)
-            if cm:
-                entry["client_in_db"] = True
-                entry["client_person_id"] = cm["id"]
-                entry["client_db_name"] = cm["_display"]
-                if subject_id:
-                    if write_relationship(cm["id"], subject_id, "Lobbying Client",
-                            f"Federal lobbying client targeting {person_name} ({item['year']})",
-                            f"Registrant: {item['registrant_name']} | Income: ${item['income']:,.0f}"):
-                        findings["new_connections_written"] += 1
-
-            findings["federal_lobbied_by"].append(entry)
+        # ── 4d. Federal LDA LD-203 — lobbyists who contributed to this official ───
+        lda_items = f_fed_lobby.result() or []
+        log.info(f"Federal LDA LD-203: {len(lda_items)} contribution items for {person_name}")
+        build_federal_lobbying_profile(
+            lda_items, index, keys, subject_id, person_name, findings
+        )
 
         # Did this person/org hire lobbyists?
         client_rows = nyc_lobbying_by_client(person_name)
@@ -1126,8 +1335,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         b_lobbied      = {r["client"] for r in fb.get("lobbied_by", [])}
         a_lobbied_nys  = {r["client"] for r in fa.get("nys_lobbied_by", [])}
         b_lobbied_nys  = {r["client"] for r in fb.get("nys_lobbied_by", [])}
-        a_lobbied_fed  = {r["client"] for r in fa.get("federal_lobbied_by", [])}
-        b_lobbied_fed  = {r["client"] for r in fb.get("federal_lobbied_by", [])}
+        a_lobbied_fed  = {r["registrant"] for r in fa.get("federal_lobbied_by", [])}
+        b_lobbied_fed  = {r["registrant"] for r in fb.get("federal_lobbied_by", [])}
 
         # B lobbied A (B appears in A's lobbied_by list)
         b_lobbied_a_nyc = [r for r in fa.get("lobbied_by", [])
@@ -1144,15 +1353,15 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                            if normalize(r.get("client","")) == normalize(arguments["person_a"])
                            or normalize(r.get("lobbyist","")) == normalize(arguments["person_a"])]
 
-        # Federal: did either person appear as lobbyist in the other's federal filings?
+        # Federal LD-203: did either person appear as lobbyist in the other's profile?
         b_lobbied_a_fed = [r for r in fa.get("federal_lobbied_by", [])
-                           if normalize(r.get("client","")) == normalize(arguments["person_b"])
+                           if normalize(r.get("registrant","")) == normalize(arguments["person_b"])
                            or any(normalize(l) == normalize(arguments["person_b"])
-                                  for l in r.get("lobbyist_names", []))]
+                                  for l in r.get("lobbyists", []))]
         a_lobbied_b_fed = [r for r in fb.get("federal_lobbied_by", [])
-                           if normalize(r.get("client","")) == normalize(arguments["person_a"])
+                           if normalize(r.get("registrant","")) == normalize(arguments["person_a"])
                            or any(normalize(l) == normalize(arguments["person_a"])
-                                  for l in r.get("lobbyist_names", []))]
+                                  for l in r.get("lobbyists", []))]
 
         result = {
             "person_a": arguments["person_a"],
@@ -1172,7 +1381,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             # Federal LDA connections
             "b_lobbied_a_federal": b_lobbied_a_fed,
             "a_lobbied_b_federal": a_lobbied_b_fed,
-            "shared_federal_lobbying_clients": list(a_lobbied_fed & b_lobbied_fed),
+            "shared_federal_lobbying_registrants": list(a_lobbied_fed & b_lobbied_fed),
         }
         return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
