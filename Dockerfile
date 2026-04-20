@@ -12,6 +12,9 @@ COPY finance_mcp_server.py .
 # Copy the BOE CSV — only the CSV, not the giant zip files
 COPY nys_boe_data/parsed_contributions.csv nys_boe_data/
 
+# Copy LDA registrants for in-memory cross-reference
+COPY lda_registrants.csv .
+
 # Railway injects PORT at runtime
 ENV PORT=8000
 
