@@ -1018,15 +1018,19 @@ def lda_lookup_registrant(employer_name: str) -> dict | None:
             _lda_registrant_cache[key] = None
             return None
 
-        # Pick the best match — prefer exact or near-exact name
+        # Require a real name overlap — reject garbage/stale registrants
         best = None
         for r in results:
-            rname = (r.get("name") or "").upper()
-            if search in rname or rname in search:
+            rname = (r.get("name") or "").upper().strip()
+            # At least 4 consecutive chars of search must appear in registrant name
+            # or registrant name must appear in search
+            if len(search) >= 4 and (search[:6] in rname or rname[:6] in search):
                 best = r
                 break
         if not best:
-            best = results[0]  # fallback to first result
+            # No meaningful match found — don't return a false positive
+            _lda_registrant_cache[key] = None
+            return None
 
         result = {
             "registrant_id":   best.get("id"),
