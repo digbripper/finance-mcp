@@ -975,6 +975,140 @@ def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
 
     return sorted(seen.values(), key=lambda x: -(x["income"] + x["expenses"]))
 
+
+# ─── LDA registrant cross-reference ──────────────────────────────────────────
+
+# Module-level cache: employer name -> LDA registrant result
+# Avoids redundant API calls when multiple donors share the same employer
+_lda_registrant_cache: dict[str, dict | None] = {}
+
+def lda_lookup_registrant(employer_name: str) -> dict | None:
+    """
+    Check if an employer name is a registered LDA lobbying firm.
+    Returns registrant dict with id and name, or None if not found.
+    Uses in-memory cache to avoid duplicate calls.
+    """
+    if not employer_name or len(employer_name) < 4:
+        return None
+
+    key = employer_name.upper().strip()
+    if key in _lda_registrant_cache:
+        return _lda_registrant_cache[key]
+
+    # Strip common legal suffixes to improve matching
+    search = key
+    for suffix in (" LLC", " LLP", " INC", " CORP", " LP", " PC", " PLLC",
+                   ", LLC", ", LLP", ", INC", ", CORP", " CO.", " & CO"):
+        search = search.replace(suffix, "")
+    search = search.strip().rstrip(",").strip()
+
+    if len(search) < 4:
+        _lda_registrant_cache[key] = None
+        return None
+
+    try:
+        resp = requests.get(f"{LDA_BASE}/registrants/",
+            params={"name": search, "limit": 3},
+            timeout=8,
+            headers={"Accept": "application/json"})
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+
+        if not results:
+            _lda_registrant_cache[key] = None
+            return None
+
+        # Pick the best match — prefer exact or near-exact name
+        best = None
+        for r in results:
+            rname = (r.get("name") or "").upper()
+            if search in rname or rname in search:
+                best = r
+                break
+        if not best:
+            best = results[0]  # fallback to first result
+
+        result = {
+            "registrant_id":   best.get("id"),
+            "registrant_name": (best.get("name") or "").strip(),
+            "description":     (best.get("description") or "").strip(),
+        }
+        _lda_registrant_cache[key] = result
+        return result
+
+    except Exception as e:
+        log.debug(f"LDA registrant lookup failed for {employer_name!r}: {e}")
+        _lda_registrant_cache[key] = None
+        return None
+
+
+def lda_enrich_donors(donor_rows: list[dict]) -> list[dict]:
+    """
+    For a list of FEC donor dicts (each with an 'employer' field),
+    cross-reference each employer against the LDA registrants database.
+    Enriches in-place and also fetches active clients for matched firms.
+    Returns enriched list sorted by amount, lobbyist-linked donors first.
+    """
+    if not donor_rows:
+        return donor_rows
+
+    import concurrent.futures as _cf
+
+    # Step 1: dedupe employers and look up all in parallel
+    unique_employers = list({
+        d.get("employer", "").strip()
+        for d in donor_rows
+        if d.get("employer", "").strip()
+    })
+
+    with _cf.ThreadPoolExecutor(max_workers=10) as pool:
+        reg_futures = {
+            emp: pool.submit(lda_lookup_registrant, emp)
+            for emp in unique_employers
+        }
+
+    employer_to_registrant = {
+        emp: fut.result()
+        for emp, fut in reg_futures.items()
+    }
+
+    # Step 2: for matched registrants, fetch their active clients in parallel
+    matched_registrants = {
+        emp: reg for emp, reg in employer_to_registrant.items()
+        if reg and reg.get("registrant_id")
+    }
+
+    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+        client_futures = {
+            emp: pool.submit(lda_registrant_clients,
+                             reg["registrant_id"], 2024)
+            for emp, reg in matched_registrants.items()
+        }
+
+    employer_to_clients = {
+        emp: fut.result()
+        for emp, fut in client_futures.items()
+    }
+
+    # Step 3: annotate donor rows
+    for donor in donor_rows:
+        emp = donor.get("employer", "").strip()
+        reg = employer_to_registrant.get(emp)
+        if reg:
+            donor["is_lda_registrant"]    = True
+            donor["lda_registrant_name"]  = reg["registrant_name"]
+            donor["lda_registrant_id"]    = reg["registrant_id"]
+            donor["lda_firm_description"] = reg.get("description", "")
+            donor["lda_active_clients"]   = employer_to_clients.get(emp, [])[:8]
+        else:
+            donor["is_lda_registrant"]   = False
+            donor["lda_active_clients"]  = []
+
+    # Sort: LDA-matched donors first, then by amount descending
+    return sorted(donor_rows,
+                  key=lambda d: (not d.get("is_lda_registrant", False),
+                                 -d.get("amount", 0)))
+
 # ─── Core enrichment ──────────────────────────────────────────────────────────
 
 def enrich_person(person_name: str) -> dict:
@@ -1080,32 +1214,47 @@ def enrich_person(person_name: str) -> dict:
 
     # ── Federal FEC donors — who gave to this person's campaign committees ────
     fec_donor_rows = f_fec_donors.result() or []
-    log.info(f"FEC donors: {len(fec_donor_rows)} unique contributors")
+    log.info(f"FEC donors: {len(fec_donor_rows)} unique contributors — enriching with LDA cross-ref...")
+
+    # Cross-reference each donor's employer against LDA registrants database.
+    # Lobbyist-linked donors bubble to the top; each gets active client list.
+    fec_donor_rows = lda_enrich_donors(fec_donor_rows)
+
     for donor in fec_donor_rows[:50]:
         dname = donor.get("contributor_name", "").strip()
         if not dname:
             continue
         dc, _ = best_match(dname, index, keys)
         entry = {
-            "contributor_name": dname,
-            "employer": donor.get("employer", ""),
-            "occupation": donor.get("occupation", ""),
-            "state": donor.get("state", ""),
-            "amount": donor.get("total_amount", 0.0),
-            "latest_date": donor.get("latest_date", ""),
-            "in_db": bool(dc),
-            "person_id": dc["id"] if dc else None,
-            "db_name": dc["_display"] if dc else None,
-            "orgs": dc.get("orgs", "") if dc else "",
-            "source": "FEC",
+            "contributor_name":   dname,
+            "employer":           donor.get("employer", ""),
+            "occupation":         donor.get("occupation", ""),
+            "state":              donor.get("state", ""),
+            "amount":             donor.get("total_amount", 0.0),
+            "latest_date":        donor.get("latest_date", ""),
+            "in_db":              bool(dc),
+            "person_id":          dc["id"] if dc else None,
+            "db_name":            dc["_display"] if dc else None,
+            "orgs":               dc.get("orgs", "") if dc else "",
+            "source":             "FEC",
+            # LDA cross-reference fields
+            "is_lda_registrant":  donor.get("is_lda_registrant", False),
+            "lda_registrant_name":donor.get("lda_registrant_name", ""),
+            "lda_firm_description":donor.get("lda_firm_description", ""),
+            "lda_active_clients": donor.get("lda_active_clients", []),
         }
         findings["federal_donors"].append(entry)
         if dc and subject_id:
+            rel_note = f"${donor.get('total_amount',0):,.0f} | {donor.get('employer','')}"
+            if donor.get("is_lda_registrant"):
+                rel_note += f" [LDA: {donor.get('lda_registrant_name','')}]"
             write_finance_note(dc["id"],
-                f"[FEC] Donated ${donor['total_amount']:,.0f} to {person_name}'s campaign committee")
+                f"[FEC] Donated ${donor.get('total_amount',0):,.0f} to {person_name}'s campaign committee"
+                + (f" — employer is registered LDA lobbyist: {donor.get('lda_registrant_name','')}"
+                   if donor.get("is_lda_registrant") else ""))
             if write_relationship(dc["id"], subject_id, "Campaign Donor",
                     f"Donated to {person_name} (FEC)",
-                    f"${donor['total_amount']:,.0f} | {donor.get('employer','')}"):
+                    rel_note):
                 findings["new_connections_written"] += 1
 
     # 3. Co-donors
