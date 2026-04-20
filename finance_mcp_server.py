@@ -483,8 +483,8 @@ FEDERAL_OFFICIALS: dict[str, dict] = {
     "schumer":    {"fec_id": "S8NY00082",
                    "fec_committees": ["C00346312"],  # Friends of Schumer
                    "lda_search": "Schumer"},
-    "gillibrand": {"fec_id": "S4NY00145",
-                   "fec_committees": [],
+    "gillibrand": {"fec_id": "S0NY00410",
+                   "fec_committees": ["C00413914"],  # Gillibrand for Senate
                    "lda_search": "Gillibrand"},
     "jeffries":   {"fec_id": "H2NY08135",
                    "fec_committees": [],
@@ -1030,6 +1030,12 @@ def _load_lda_registrants():
         os.path.join(os.getcwd(), "lda_registrants.csv"),
         "/app/lda_registrants.csv",
     ]
+    # List /app contents so we can see what Railway actually deployed
+    try:
+        app_files = sorted(os.listdir("/app"))
+        log.info(f"Files in /app: {app_files}")
+    except Exception as e:
+        log.info(f"Could not list /app: {e}")
     log.info(f"LDA CSV search paths: {_candidates}")
     csv_path = None
     for _candidate in _candidates:
