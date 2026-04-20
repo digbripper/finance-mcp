@@ -468,89 +468,152 @@ def _dedupe_nys_lobbying(rows: list[dict]) -> list[dict]:
     return sorted(seen.values(), key=lambda x: -x["compensation"])
 
 
-# ─── Federal LDA Lobbying (lda.senate.gov/api/v1) ────────────────────────────
-# LD-2 quarterly activity reports. Each filing covers one registrant+client pair
-# per quarter. lobbying_activities[] lists issue areas and individual lobbyists.
-# government_entities[] within each activity lists the agencies/bodies contacted.
-# No API key required for anonymous access.
+
+# ─── Federal officials lookup table ─────────────────────────────────────────
+# Maps last name -> FEC candidate ID, committee IDs, LDA search term
+# Add entries here as needed for frequent federal contacts.
+
+FEDERAL_OFFICIALS: dict[str, dict] = {
+    "schumer":    {"fec_id": "S8NY00082",
+                   "fec_committees": ["C00346312"],  # Friends of Schumer
+                   "lda_search": "Schumer"},
+    "gillibrand": {"fec_id": "S4NY00145",
+                   "fec_committees": [],
+                   "lda_search": "Gillibrand"},
+    "jeffries":   {"fec_id": "H2NY08135",
+                   "fec_committees": [],
+                   "lda_search": "Jeffries"},
+    "ocasio":     {"fec_id": "H8NY14107",
+                   "fec_committees": [],
+                   "lda_search": "Ocasio-Cortez"},
+    "nadler":     {"fec_id": "H0NY17033",
+                   "fec_committees": [],
+                   "lda_search": "Nadler"},
+    "meeks":      {"fec_id": "H8NY06084",
+                   "fec_committees": [],
+                   "lda_search": "Meeks"},
+}
 
 LDA_BASE = "https://lda.senate.gov/api/v1"
 
-# Map well-known officials to the government entity names as they appear in LDA data.
-# LDA uses standardized entity names from a constants list.
-LDA_OFFICIAL_ENTITIES: dict[str, list[str]] = {
-    "schumer":   ["Senate", "U.S. Senate", "Senate Majority Leader"],
-    "gillibrand":["Senate"],
-    "jeffries":  ["House of Representatives", "U.S. House of Representatives"],
-    "ocasio":    ["House of Representatives"],
-    "nadler":    ["House of Representatives"],
-    "meeks":     ["House of Representatives"],
-    "bowman":    ["House of Representatives"],
-    "torres":    ["House of Representatives"],
-    "hochul":    [],  # state-level; skip federal LDA
-    "adams":     [],  # city-level; skip federal LDA
-}
+# ─── FEC improvements — committee-based donor lookup ─────────────────────────
 
-def lda_lobbying_by_registrant(registrant_name: str,
-                                years: list[int] | None = None,
-                                limit: int = 50) -> list[dict]:
-    """Search LDA filings by registrant (lobbying firm) name."""
-    if years is None:
-        years = [2025, 2024]
-    all_filings: list[dict] = []
-    for year in years:
-        try:
-            resp = requests.get(f"{LDA_BASE}/filings/",
-                params={"registrant_name": registrant_name,
-                        "filing_year": year, "filing_type": "Q1,Q2,Q3,Q4",
-                        "limit": limit},
-                timeout=12,
-                headers={"Accept": "application/json"})
-            resp.raise_for_status()
-            all_filings.extend(resp.json().get("results", []))
-        except Exception as e:
-            log.warning(f"LDA registrant search error {year}: {e}")
-    return all_filings
+def fec_get_committees(candidate_name: str) -> list[str]:
+    """
+    Return FEC committee IDs for a candidate.
+    First checks FEDERAL_OFFICIALS table, then falls back to API search.
+    """
+    last = candidate_name.strip().split()[-1].lower()
+    official = FEDERAL_OFFICIALS.get(last)
 
-def lda_lobbying_by_client(client_name: str,
-                            years: list[int] | None = None,
-                            limit: int = 50) -> list[dict]:
-    """Search LDA filings by client name."""
-    if years is None:
-        years = [2025, 2024]
-    all_filings: list[dict] = []
-    for year in years:
+    # Use hardcoded committees if available and non-empty
+    if official and official.get("fec_committees"):
+        return official["fec_committees"]
+
+    # Try to find via API search
+    fec_key = _cfg("FEC_API_KEY", "DEMO_KEY")
+    candidate_id = official.get("fec_id") if official else None
+
+    if not candidate_id:
+        # Search by name
         try:
-            resp = requests.get(f"{LDA_BASE}/filings/",
-                params={"client_name": client_name,
-                        "filing_year": year, "filing_type": "Q1,Q2,Q3,Q4",
-                        "limit": limit},
-                timeout=12,
-                headers={"Accept": "application/json"})
+            resp = requests.get(f"{FEC_BASE}/candidates/search/",
+                params={"api_key": fec_key, "q": candidate_name, "office": "S,H", "state": "NY", "per_page": 3},
+                timeout=10)
             resp.raise_for_status()
-            all_filings.extend(resp.json().get("results", []))
+            results = resp.json().get("results", [])
+            if results:
+                candidate_id = results[0]["candidate_id"]
         except Exception as e:
-            log.warning(f"LDA client search error {year}: {e}")
-    return all_filings
+            log.warning(f"FEC candidate search error: {e}")
+            return []
+
+    if not candidate_id:
+        return []
+
+    try:
+        resp = requests.get(f"{FEC_BASE}/committees/",
+            params={"api_key": fec_key, "candidate_id": candidate_id, "per_page": 10},
+            timeout=10)
+        resp.raise_for_status()
+        return [c["committee_id"] for c in resp.json().get("results", [])]
+    except Exception as e:
+        log.warning(f"FEC committees lookup error: {e}")
+        return []
+
+def fec_top_donors(candidate_name: str, limit: int = 100) -> list[dict]:
+    """
+    Get top donors to a federal candidate by querying their FEC committees directly.
+    Much more reliable than the name-based search in fec_donations_to().
+    """
+    fec_key = _cfg("FEC_API_KEY", "DEMO_KEY")
+    committee_ids = fec_get_committees(candidate_name)
+
+    if not committee_ids:
+        log.warning(f"FEC: no committees found for {candidate_name}")
+        return []
+
+    all_donors: list[dict] = []
+    for committee_id in committee_ids[:3]:  # cap at 3 committees
+        try:
+            resp = requests.get(f"{FEC_BASE}/schedules/schedule_a/",
+                params={
+                    "api_key": fec_key,
+                    "committee_id": committee_id,
+                    "sort": "-contribution_receipt_amount",
+                    "sort_hide_null": True,
+                    "per_page": min(limit, 100),
+                    "is_individual": True,
+                },
+                timeout=15)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            log.info(f"FEC committee {committee_id}: {len(results)} donors")
+            all_donors.extend(results)
+        except Exception as e:
+            log.warning(f"FEC schedule_a error for {committee_id}: {e}")
+
+    # Dedupe by contributor name, sum amounts
+    donor_map: dict[str, dict] = {}
+    for row in all_donors:
+        name = (row.get("contributor_name") or "").strip()
+        if not name:
+            continue
+        if name not in donor_map:
+            donor_map[name] = {
+                "contributor_name": name,
+                "employer": (row.get("contributor_employer") or "").strip(),
+                "occupation": (row.get("contributor_occupation") or "").strip(),
+                "state": (row.get("contributor_state") or "").strip(),
+                "total_amount": 0.0,
+                "latest_date": "",
+            }
+        donor_map[name]["total_amount"] += float(row.get("contribution_receipt_amount") or 0)
+        date = row.get("contribution_receipt_date") or ""
+        if date > donor_map[name]["latest_date"]:
+            donor_map[name]["latest_date"] = date
+
+    return sorted(donor_map.values(), key=lambda x: -x["total_amount"])
+
+# ─── Federal LDA Lobbying — who lobbied this official ────────────────────────
 
 def lda_lobbying_targeting(official_name: str,
                             years: list[int] | None = None,
                             limit: int = 50) -> list[dict]:
     """
-    Find federal LDA filings where a lobbyist name OR registrant/client name
-    matches the official. Also searches by client_name for federal legislators
-    (who sometimes appear as clients of their own PAC lobbyists).
-
-    For state/local officials (Hochul, Adams, etc.) returns [] immediately.
+    Find federal LDA filings mentioning this official in specific_lobbying_issues.
+    Uses the FEDERAL_OFFICIALS table to get the right search term.
+    Skips state/local officials (Hochul, Adams) that don't appear in LDA.
     """
     last = official_name.strip().split()[-1].lower()
-    first_words = official_name.strip().split()
+    official = FEDERAL_OFFICIALS.get(last)
 
-    # Skip state/local officials — they don't appear in federal LDA
-    aliases = LDA_OFFICIAL_ENTITIES.get(last)
-    if aliases is not None and len(aliases) == 0:
+    # State/local officials: no LDA presence
+    if last in ("hochul", "adams", "james", "dinapoli", "mamdani", "cuomo"):
         log.info(f"LDA: {official_name} is state/local, skipping")
         return []
+
+    search_term = official["lda_search"] if official else official_name.strip().split()[-1]
 
     if years is None:
         years = [2025, 2024]
@@ -559,29 +622,27 @@ def lda_lobbying_targeting(official_name: str,
     seen_uuids: set[str] = set()
 
     for year in years:
-        # Search by lobbyist last name — catches cases where the person IS a lobbyist
-        # Search by registrant name — catches their firm
-        # Both are fast indexed lookups on the LDA side
-        searches = [
-            {"lobbyist_name": last, "filing_year": year, "limit": limit},
-            {"registrant_name": " ".join(first_words[:2]) if len(first_words) >= 2 else last,
-             "filing_year": year, "limit": limit},
-        ]
-        for params in searches:
-            try:
-                resp = requests.get(f"{LDA_BASE}/filings/",
-                    params=params, timeout=10,
-                    headers={"Accept": "application/json"})
-                resp.raise_for_status()
-                for f in resp.json().get("results", []):
-                    uid = f.get("filing_uuid") or f.get("id") or ""
-                    if uid and uid not in seen_uuids:
-                        seen_uuids.add(uid)
-                        all_filings.append(f)
-            except Exception as e:
-                log.warning(f"LDA search error ({params}): {e}")
+        try:
+            resp = requests.get(f"{LDA_BASE}/filings/",
+                params={
+                    "specific_lobbying_issues": search_term,
+                    "filing_year": year,
+                    "filing_type": "Q1,Q2,Q3,Q4",
+                    "limit": limit,
+                },
+                timeout=12,
+                headers={"Accept": "application/json"})
+            resp.raise_for_status()
+            for f in resp.json().get("results", []):
+                uid = f.get("filing_uuid") or str(f.get("id") or "")
+                if uid and uid not in seen_uuids:
+                    seen_uuids.add(uid)
+                    all_filings.append(f)
+            log.info(f"LDA {year}: {len(resp.json().get('results',[]))} filings for {search_term}")
+        except Exception as e:
+            log.warning(f"LDA targeting error {year}/{search_term}: {e}")
 
-    log.info(f"LDA: {len(all_filings)} filings found for {official_name}")
+    log.info(f"LDA total: {len(all_filings)} filings for {official_name}")
     return all_filings
 
 def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
@@ -589,12 +650,11 @@ def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
     seen: dict[str, dict] = {}
     for f in filings:
         registrant = (f.get("registrant") or {}).get("name", "")
-        client = (f.get("client") or {}).get("name", "")
-        year = str(f.get("filing_year", ""))
-        key = f"{registrant}|{client}|{year}"
+        client     = (f.get("client") or {}).get("name", "")
+        year       = str(f.get("filing_year", ""))
+        key        = f"{registrant}|{client}|{year}"
 
         if key not in seen:
-            # Collect all issue areas and lobbyist names across activities
             issues: set[str] = set()
             lobbyist_names: list[str] = []
             entities: set[str] = set()
@@ -610,17 +670,16 @@ def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
                 for ent in (act.get("government_entities") or []):
                     if ent.get("name"):
                         entities.add(ent["name"])
-
             seen[key] = {
-                "registrant_name":  registrant,
-                "client_name":      client,
-                "year":             year,
-                "filing_type":      f.get("filing_type_display", ""),
-                "income":           float(f.get("income") or 0),
-                "expenses":         float(f.get("expenses") or 0),
-                "issues":           ", ".join(sorted(issues))[:300],
-                "lobbyist_names":   list(set(lobbyist_names))[:10],
-                "government_entities": list(entities)[:10],
+                "registrant_name":    registrant,
+                "client_name":        client,
+                "year":               year,
+                "filing_type":        f.get("filing_type_display", ""),
+                "income":             float(f.get("income") or 0),
+                "expenses":           float(f.get("expenses") or 0),
+                "issues":             ", ".join(sorted(issues))[:300],
+                "lobbyist_names":     list(set(lobbyist_names))[:10],
+                "government_entities":list(entities)[:10],
             }
         else:
             seen[key]["income"]   += float(f.get("income") or 0)
@@ -648,6 +707,7 @@ def enrich_person(person_name: str) -> dict:
         "co_donors_in_db": [],
         "lobbied_by": [],
         "nys_lobbied_by": [],
+        "federal_donors": [],
         "federal_lobbied_by": [],
         "lobbying_clients_in_db": [],
         "new_connections_written": 0,
@@ -661,10 +721,11 @@ def enrich_person(person_name: str) -> dict:
         f_cfb_made  = pool.submit(cfb_donations_made, person_name)
         f_fec_made  = pool.submit(fec_donations_by, person_name)
         f_boe_made  = pool.submit(boe_donations_by, person_name)
-        f_nyc_lobby = pool.submit(nyc_lobbying_targets, person_name)
-        f_nys_lobby = pool.submit(nys_lobbying_targets, person_name)
-        # Federal LDA — only for federal officials; state/local officials return [] immediately
-        f_fed_lobby = pool.submit(lda_lobbying_targeting, person_name)
+        f_nyc_lobby  = pool.submit(nyc_lobbying_targets, person_name)
+        f_nys_lobby  = pool.submit(nys_lobbying_targets, person_name)
+        # Federal LDA + FEC donors — only meaningful for federal officials
+        f_fed_lobby  = pool.submit(lda_lobbying_targeting, person_name)
+        f_fec_donors = pool.submit(fec_top_donors, person_name)
 
     all_received = []
     for row in (f_cfb_recv.result() or []):
@@ -726,6 +787,37 @@ def enrich_person(person_name: str) -> dict:
             if write_relationship(subject_id, cc["id"], "Campaign Donor",
                     f"Donated to {cname}",
                     f"${info['amount']:,.0f} | Source: {info['source']} | {info['year']}"):
+                findings["new_connections_written"] += 1
+
+
+    # ── Federal FEC donors — who gave to this person's campaign committees ────
+    fec_donor_rows = f_fec_donors.result() or []
+    log.info(f"FEC donors: {len(fec_donor_rows)} unique contributors")
+    for donor in fec_donor_rows[:50]:
+        dname = donor.get("contributor_name", "").strip()
+        if not dname:
+            continue
+        dc, _ = best_match(dname, index, keys)
+        entry = {
+            "contributor_name": dname,
+            "employer": donor.get("employer", ""),
+            "occupation": donor.get("occupation", ""),
+            "state": donor.get("state", ""),
+            "amount": donor.get("total_amount", 0.0),
+            "latest_date": donor.get("latest_date", ""),
+            "in_db": bool(dc),
+            "person_id": dc["id"] if dc else None,
+            "db_name": dc["_display"] if dc else None,
+            "orgs": dc.get("orgs", "") if dc else "",
+            "source": "FEC",
+        }
+        findings["federal_donors"].append(entry)
+        if dc and subject_id:
+            write_finance_note(dc["id"],
+                f"[FEC] Donated ${donor['total_amount']:,.0f} to {person_name}'s campaign committee")
+            if write_relationship(dc["id"], subject_id, "Campaign Donor",
+                    f"Donated to {person_name} (FEC)",
+                    f"${donor['total_amount']:,.0f} | {donor.get('employer','')}"):
                 findings["new_connections_written"] += 1
 
     # 3. Co-donors
