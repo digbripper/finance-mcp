@@ -235,7 +235,13 @@ def fec_donations_to(candidate_name: str, limit: int = 50) -> list[dict]:
         params = {"api_key": key, "per_page": min(limit, 100), "contributor_state": "NY",
                   "min_amount": 500, "sort": "-contribution_receipt_amount", "sort_hide_null": True}
         if cands:
-            params["committee_id"] = cands[0].get("principal_committees", [{}])[0].get("id", "")
+            cid = cands[0].get("principal_committees", [{}])[0].get("id", "")
+            if cid:
+                params["committee_id"] = cid
+            else:
+                return []  # can't query without a committee_id
+        else:
+            return []
         resp = requests.get(f"{FEC_BASE}/schedules/schedule_a/", params=params, timeout=15)
         resp.raise_for_status()
         return resp.json().get("results", [])
@@ -976,17 +982,96 @@ def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
     return sorted(seen.values(), key=lambda x: -(x["income"] + x["expenses"]))
 
 
-# ─── LDA registrant cross-reference ──────────────────────────────────────────
+# ─── LDA registrant cross-reference (in-memory from bundled CSV) ─────────────
+# lda_registrants.csv is built by running lda_fetch.py locally and committing.
+# Format: id, name, description, city, state (17k+ rows, ~1MB)
 
-# Module-level cache: employer name -> LDA registrant result
-# Avoids redundant API calls when multiple donors share the same employer
+import re as _re_lda
+import csv as _csv_lda
+
+def _norm_lda(s: str) -> str:
+    """Strip punctuation, upper-case, collapse whitespace."""
+    return " ".join(_re_lda.sub(r"[^A-Z0-9 ]", " ", (s or "").upper()).split())
+
+def _words_lda(s: str) -> set[str]:
+    """Significant words (4+ chars) from a normalized string."""
+    return {w for w in _norm_lda(s).split() if len(w) >= 4}
+
+# Legal suffixes to strip before matching
+_LDA_SUFFIXES = (
+    " LLC", " LLP", " INC", " CORP", " LP", " PC", " PLLC", " PLCC",
+    " LTD", " CO", " PA", " NA", " PLC", " NPC", " LC", " DBA",
+)
+
+def _strip_suffixes(name: str) -> str:
+    n = name.upper().strip().rstrip(",").strip()
+    changed = True
+    while changed:
+        changed = False
+        for s in _LDA_SUFFIXES:
+            if n.endswith(s):
+                n = n[:-len(s)].strip().rstrip(",").strip()
+                changed = True
+    return n
+
+# Build in-memory index at startup: word -> list of registrant dicts
+# Each registrant has: id, name, description, city, state, _words (set)
+_LDA_REGISTRANT_INDEX: dict[str, list[dict]] = {}
+_LDA_REGISTRANT_LOADED = False
+
+def _load_lda_registrants():
+    global _LDA_REGISTRANT_LOADED
+    if _LDA_REGISTRANT_LOADED:
+        return
+
+    # Try multiple paths: next to the script, cwd, /app (Railway default)
+    for _candidate in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lda_registrants.csv"),
+        os.path.join(os.getcwd(), "lda_registrants.csv"),
+        "/app/lda_registrants.csv",
+    ]:
+        if os.path.exists(_candidate):
+            csv_path = _candidate
+            break
+    else:
+        log.warning("lda_registrants.csv not found in any expected path — LDA cross-reference disabled")
+        _LDA_REGISTRANT_LOADED = True
+        return
+
+    count = 0
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in _csv_lda.DictReader(f):
+            name = (row.get("name") or "").strip()
+            if not name:
+                continue
+            # Skip stale/terminated registrants (description looks like a date)
+            desc = (row.get("description") or "").strip()
+            if _re_lda.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", desc):
+                continue
+            words = _words_lda(_strip_suffixes(name))
+            entry = {
+                "registrant_id":   row.get("id", ""),
+                "registrant_name": name,
+                "description":     desc,
+                "city":            (row.get("city") or "").strip(),
+                "state":           (row.get("state") or "").strip(),
+                "_words":          words,
+            }
+            for word in words:
+                _LDA_REGISTRANT_INDEX.setdefault(word, []).append(entry)
+            count += 1
+
+    log.info(f"Loaded {count} LDA registrants into memory index")
+    _LDA_REGISTRANT_LOADED = True
+
+# Per-call cache to avoid repeated lookups for the same employer
 _lda_registrant_cache: dict[str, dict | None] = {}
 
 def lda_lookup_registrant(employer_name: str) -> dict | None:
     """
-    Check if an employer name is a registered LDA lobbying firm.
-    Returns registrant dict with id and name, or None if not found.
-    Uses in-memory cache to avoid duplicate calls.
+    Check if an employer name matches a registered LDA lobbying firm.
+    Uses bundled CSV + in-memory word index. No external API calls.
+    Returns registrant dict or None.
     """
     if not employer_name or len(employer_name) < 4:
         return None
@@ -995,68 +1080,55 @@ def lda_lookup_registrant(employer_name: str) -> dict | None:
     if key in _lda_registrant_cache:
         return _lda_registrant_cache[key]
 
-    # Strip common legal suffixes to improve matching
-    search = key
-    for suffix in (" LLC", " LLP", " INC", " CORP", " LP", " PC", " PLLC",
-                   ", LLC", ", LLP", ", INC", ", CORP", " CO.", " & CO"):
-        search = search.replace(suffix, "")
-    search = search.strip().rstrip(",").strip()
+    _load_lda_registrants()
 
-    if len(search) < 4:
+    query_words = _words_lda(_strip_suffixes(employer_name))
+    if not query_words:
         _lda_registrant_cache[key] = None
         return None
 
-    try:
-        resp = requests.get(f"{LDA_BASE}/registrants/",
-            params={"name": search, "limit": 3},
-            timeout=8,
-            headers={"Accept": "application/json"})
-        resp.raise_for_status()
-        results = resp.json().get("results", [])
+    # Find candidates that share at least one significant word
+    candidates: dict[str, dict] = {}  # registrant_id -> entry
+    for word in query_words:
+        for entry in _LDA_REGISTRANT_INDEX.get(word, []):
+            candidates[entry["registrant_id"]] = entry
 
-        if not results:
-            _lda_registrant_cache[key] = None
-            return None
-
-        # Require a real name overlap — reject garbage/stale registrants.
-        # Normalize both strings: remove punctuation, collapse whitespace.
-        import re as _re
-        def _norm(s: str) -> str:
-            return _re.sub(r"[^A-Z0-9 ]", " ", s.upper())
-
-        search_norm = " ".join(_norm(search).split())
-        # Build word set from search (skip short words)
-        search_words = {w for w in search_norm.split() if len(w) >= 4}
-
-        best = None
-        best_score = 0
-        for r in results:
-            rname_norm = " ".join(_norm(r.get("name") or "").split())
-            rname_words = {w for w in rname_norm.split() if len(w) >= 4}
-            # Score = number of significant words shared
-            shared = search_words & rname_words
-            score = len(shared)
-            if score > best_score:
-                best_score = score
-                best = r
-
-        if best_score == 0:
-            # No meaningful word overlap — reject as false positive
-            _lda_registrant_cache[key] = None
-            return None
-
-        result = {
-            "registrant_id":   best.get("id"),
-            "registrant_name": (best.get("name") or "").strip(),
-            "description":     (best.get("description") or "").strip(),
-        }
-        _lda_registrant_cache[key] = result
-        return result
-
-    except Exception as e:
-        log.debug(f"LDA registrant lookup failed for {employer_name!r}: {e}")
+    if not candidates:
         _lda_registrant_cache[key] = None
         return None
+
+    # Score each candidate by word overlap
+    best = None
+    best_score = 0
+    for entry in candidates.values():
+        shared = query_words & entry["_words"]
+        # Require overlap on at least 1 word, AND shared words must cover
+        # at least half of the shorter name's words (reduces false positives)
+        if not shared:
+            continue
+        min_len = min(len(query_words), len(entry["_words"]))
+        coverage = len(shared) / max(min_len, 1)
+        score = len(shared) + coverage  # weight both count and proportion
+        if score > best_score:
+            best_score = score
+            best = entry
+
+    # Require at least 0.5 coverage to avoid weak matches like
+    # "BLOOMBERG LP" matching "BLOOM INNOVATIONS" on just "BLOOM"
+    if best is None or best_score < 1.5:
+        _lda_registrant_cache[key] = None
+        return None
+
+    result = {
+        "registrant_id":   best["registrant_id"],
+        "registrant_name": best["registrant_name"],
+        "description":     best["description"],
+        "city":            best["city"],
+        "state":           best["state"],
+    }
+    _lda_registrant_cache[key] = result
+    log.debug(f"LDA match: {employer_name!r} -> {best['registrant_name']!r} (score={best_score:.1f})")
+    return result
 
 
 def lda_enrich_donors(donor_rows: list[dict]) -> list[dict]:
@@ -1155,7 +1227,11 @@ def enrich_person(person_name: str) -> dict:
     # 1. Who donated TO this person? — fetch all sources in parallel
     with _cf.ThreadPoolExecutor(max_workers=8) as pool:
         f_cfb_recv  = pool.submit(cfb_donations_received, person_name)
-        f_fec_recv  = pool.submit(fec_donations_to, person_name)
+        # Skip legacy fec_donations_to for officials in FEDERAL_OFFICIALS table
+        # (fec_top_donors handles them via committee ID; fec_donations_to would 422)
+        _last_lower = person_name.strip().split()[-1].lower()
+        _use_legacy_fec = _last_lower not in FEDERAL_OFFICIALS
+        f_fec_recv  = pool.submit(fec_donations_to, person_name) if _use_legacy_fec else pool.submit(lambda: [])
         f_boe_recv  = pool.submit(boe_donors_to, person_name)
         f_cfb_made  = pool.submit(cfb_donations_made, person_name)
         f_fec_made  = pool.submit(fec_donations_by, person_name)
@@ -1483,74 +1559,74 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     loop = asyncio.get_event_loop()
     log.info(f"Tool called: {name} args={arguments}")
-    if name == "lookup_finance_connections":
-        log.info(f"Finance lookup: {arguments['person_name']}")
-        findings = await loop.run_in_executor(None, enrich_person, arguments["person_name"])
-        return [types.TextContent(type="text", text=json.dumps(findings, indent=2, default=str))]
-    elif name == "find_financial_path":
-        log.info(f"Financial path: {arguments['person_a']} <-> {arguments['person_b']}")
-        fa, fb = await asyncio.gather(
-            loop.run_in_executor(None, enrich_person, arguments["person_a"]),
-            loop.run_in_executor(None, enrich_person, arguments["person_b"]),
-        )
-        a_cands = {r["candidate_name"] for r in fa.get("known_recipients_in_db", [])}
-        b_cands = {r["candidate_name"] for r in fb.get("known_recipients_in_db", [])}
+    try:
+        if name == "lookup_finance_connections":
+            log.info(f"Finance lookup: {arguments['person_name']}")
+            findings = await loop.run_in_executor(None, enrich_person, arguments["person_name"])
+            return [types.TextContent(type="text", text=json.dumps(findings, indent=2, default=str))]
 
-        # Shared lobbying: officials both people lobbied, or one lobbied the other
-        a_lobbied      = {r["client"] for r in fa.get("lobbied_by", [])}
-        b_lobbied      = {r["client"] for r in fb.get("lobbied_by", [])}
-        a_lobbied_nys  = {r["client"] for r in fa.get("nys_lobbied_by", [])}
-        b_lobbied_nys  = {r["client"] for r in fb.get("nys_lobbied_by", [])}
-        a_lobbied_fed  = {r["registrant"] for r in fa.get("federal_lobbied_by", [])}
-        b_lobbied_fed  = {r["registrant"] for r in fb.get("federal_lobbied_by", [])}
+        elif name == "find_financial_path":
+            log.info(f"Financial path: {arguments['person_a']} <-> {arguments['person_b']}")
+            fa, fb = await asyncio.gather(
+                loop.run_in_executor(None, enrich_person, arguments["person_a"]),
+                loop.run_in_executor(None, enrich_person, arguments["person_b"]),
+            )
+            a_cands = {r["candidate_name"] for r in fa.get("known_recipients_in_db", [])}
+            b_cands = {r["candidate_name"] for r in fb.get("known_recipients_in_db", [])}
 
-        # B lobbied A (B appears in A's lobbied_by list)
-        b_lobbied_a_nyc = [r for r in fa.get("lobbied_by", [])
-                           if normalize(r.get("client","")) == normalize(arguments["person_b"])
-                           or normalize(r.get("lobbyist","")) == normalize(arguments["person_b"])]
-        b_lobbied_a_nys = [r for r in fa.get("nys_lobbied_by", [])
-                           if normalize(r.get("client","")) == normalize(arguments["person_b"])
-                           or normalize(r.get("lobbyist","")) == normalize(arguments["person_b"])]
-        # A lobbied B
-        a_lobbied_b_nyc = [r for r in fb.get("lobbied_by", [])
-                           if normalize(r.get("client","")) == normalize(arguments["person_a"])
-                           or normalize(r.get("lobbyist","")) == normalize(arguments["person_a"])]
-        a_lobbied_b_nys = [r for r in fb.get("nys_lobbied_by", [])
-                           if normalize(r.get("client","")) == normalize(arguments["person_a"])
-                           or normalize(r.get("lobbyist","")) == normalize(arguments["person_a"])]
+            a_lobbied     = {r["client"] for r in fa.get("lobbied_by", [])}
+            b_lobbied     = {r["client"] for r in fb.get("lobbied_by", [])}
+            a_lobbied_nys = {r["client"] for r in fa.get("nys_lobbied_by", [])}
+            b_lobbied_nys = {r["client"] for r in fb.get("nys_lobbied_by", [])}
+            a_lobbied_fed = {r["registrant"] for r in fa.get("federal_lobbied_by", [])}
+            b_lobbied_fed = {r["registrant"] for r in fb.get("federal_lobbied_by", [])}
 
-        # Federal LD-203: did either person appear as lobbyist in the other's profile?
-        b_lobbied_a_fed = [r for r in fa.get("federal_lobbied_by", [])
-                           if normalize(r.get("registrant","")) == normalize(arguments["person_b"])
-                           or any(normalize(l) == normalize(arguments["person_b"])
-                                  for l in r.get("lobbyists", []))]
-        a_lobbied_b_fed = [r for r in fb.get("federal_lobbied_by", [])
-                           if normalize(r.get("registrant","")) == normalize(arguments["person_a"])
-                           or any(normalize(l) == normalize(arguments["person_a"])
-                                  for l in r.get("lobbyists", []))]
+            b_lobbied_a_nyc = [r for r in fa.get("lobbied_by", [])
+                               if normalize(r.get("client","")) == normalize(arguments["person_b"])
+                               or normalize(r.get("lobbyist","")) == normalize(arguments["person_b"])]
+            b_lobbied_a_nys = [r for r in fa.get("nys_lobbied_by", [])
+                               if normalize(r.get("client","")) == normalize(arguments["person_b"])
+                               or normalize(r.get("lobbyist","")) == normalize(arguments["person_b"])]
+            a_lobbied_b_nyc = [r for r in fb.get("lobbied_by", [])
+                               if normalize(r.get("client","")) == normalize(arguments["person_a"])
+                               or normalize(r.get("lobbyist","")) == normalize(arguments["person_a"])]
+            a_lobbied_b_nys = [r for r in fb.get("nys_lobbied_by", [])
+                               if normalize(r.get("client","")) == normalize(arguments["person_a"])
+                               or normalize(r.get("lobbyist","")) == normalize(arguments["person_a"])]
+            b_lobbied_a_fed = [r for r in fa.get("federal_lobbied_by", [])
+                               if normalize(r.get("registrant","")) == normalize(arguments["person_b"])
+                               or any(normalize(l) == normalize(arguments["person_b"])
+                                      for l in r.get("lobbyists", []))]
+            a_lobbied_b_fed = [r for r in fb.get("federal_lobbied_by", [])
+                               if normalize(r.get("registrant","")) == normalize(arguments["person_a"])
+                               or any(normalize(l) == normalize(arguments["person_a"])
+                                      for l in r.get("lobbyists", []))]
 
-        result = {
-            "person_a": arguments["person_a"],
-            "person_b": arguments["person_b"],
-            # Campaign finance connections
-            "shared_donation_targets": list(a_cands & b_cands),
-            "a_donated_to_b_allies": [r for r in fa.get("known_recipients_in_db", []) if r.get("in_db")],
-            "b_donated_to_a_allies": [r for r in fb.get("known_recipients_in_db", []) if r.get("in_db")],
-            # NYC lobbying connections
-            "b_lobbied_a_nyc": b_lobbied_a_nyc,
-            "a_lobbied_b_nyc": a_lobbied_b_nyc,
-            "shared_nyc_lobbying_clients": list(a_lobbied & b_lobbied),
-            # NYS lobbying connections
-            "b_lobbied_a_nys": b_lobbied_a_nys,
-            "a_lobbied_b_nys": a_lobbied_b_nys,
-            "shared_nys_lobbying_clients": list(a_lobbied_nys & b_lobbied_nys),
-            # Federal LDA connections
-            "b_lobbied_a_federal": b_lobbied_a_fed,
-            "a_lobbied_b_federal": a_lobbied_b_fed,
-            "shared_federal_lobbying_registrants": list(a_lobbied_fed & b_lobbied_fed),
-        }
-        return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-    return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+            result = {
+                "person_a": arguments["person_a"],
+                "person_b": arguments["person_b"],
+                "shared_donation_targets": list(a_cands & b_cands),
+                "a_donated_to_b_allies": [r for r in fa.get("known_recipients_in_db", []) if r.get("in_db")],
+                "b_donated_to_a_allies": [r for r in fb.get("known_recipients_in_db", []) if r.get("in_db")],
+                "b_lobbied_a_nyc": b_lobbied_a_nyc,
+                "a_lobbied_b_nyc": a_lobbied_b_nyc,
+                "shared_nyc_lobbying_clients": list(a_lobbied & b_lobbied),
+                "b_lobbied_a_nys": b_lobbied_a_nys,
+                "a_lobbied_b_nys": a_lobbied_b_nys,
+                "shared_nys_lobbying_clients": list(a_lobbied_nys & b_lobbied_nys),
+                "b_lobbied_a_federal": b_lobbied_a_fed,
+                "a_lobbied_b_federal": a_lobbied_b_fed,
+                "shared_federal_lobbying_registrants": list(a_lobbied_fed & b_lobbied_fed),
+            }
+            return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        else:
+            return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+
+    except Exception as e:
+        log.error(f"call_tool error in {name}: {e}", exc_info=True)
+        return [types.TextContent(type="text", text=json.dumps({"error": str(e)}, indent=2))]
+
 
 # ─── Starlette app ────────────────────────────────────────────────────────────
 
@@ -1609,6 +1685,8 @@ async def lifespan(app):
     log.info(f"MCP_API_KEY set:  {bool(os.environ.get('MCP_API_KEY'))}")
     log.info(f"FEC_API_KEY set:  {bool(os.environ.get('FEC_API_KEY'))}")
     _load_boe_csv()
+    # Eagerly load LDA registrants CSV so it's ready before first query
+    _load_lda_registrants()
     log.info("=== Ready ===")
     yield
 
