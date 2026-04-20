@@ -1025,18 +1025,29 @@ def _load_lda_registrants():
         return
 
     # Try multiple paths: next to the script, cwd, /app (Railway default)
-    for _candidate in [
+    _candidates = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "lda_registrants.csv"),
         os.path.join(os.getcwd(), "lda_registrants.csv"),
         "/app/lda_registrants.csv",
-    ]:
+    ]
+    log.info(f"LDA CSV search paths: {_candidates}")
+    csv_path = None
+    for _candidate in _candidates:
+        log.info(f"  checking {_candidate}: exists={os.path.exists(_candidate)}")
         if os.path.exists(_candidate):
             csv_path = _candidate
             break
-    else:
-        log.warning("lda_registrants.csv not found in any expected path — LDA cross-reference disabled")
-        _LDA_REGISTRANT_LOADED = True
-        return
+    if csv_path is None:
+        # Last resort: search the entire /app directory tree
+        import glob as _glob
+        matches = _glob.glob("/app/**/lda_registrants.csv", recursive=True) +                   _glob.glob("/home/**/ lda_registrants.csv", recursive=True)
+        log.info(f"  glob fallback found: {matches}")
+        if matches:
+            csv_path = matches[0]
+        else:
+            log.warning("lda_registrants.csv not found in any expected path — LDA cross-reference disabled")
+            _LDA_REGISTRANT_LOADED = True
+            return
 
     count = 0
     with open(csv_path, newline="", encoding="utf-8") as f:
