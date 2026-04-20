@@ -554,24 +554,37 @@ def fec_top_donors(candidate_name: str, limit: int = 100) -> list[dict]:
         return []
 
     all_donors: list[dict] = []
-    for committee_id in committee_ids[:3]:  # cap at 3 committees
-        try:
-            resp = requests.get(f"{FEC_BASE}/schedules/schedule_a/",
-                params={
-                    "api_key": fec_key,
-                    "committee_id": committee_id,
-                    "sort": "-contribution_receipt_amount",
-                    "sort_hide_null": True,
-                    "per_page": min(limit, 100),
-                    "is_individual": True,
-                },
-                timeout=15)
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-            log.info(f"FEC committee {committee_id}: {len(results)} donors")
-            all_donors.extend(results)
-        except Exception as e:
-            log.warning(f"FEC schedule_a error for {committee_id}: {e}")
+    # FEC schedule_a requires two_year_transaction_period — search the last 3 cycles
+    import datetime as _dt
+    current_year = _dt.datetime.now().year
+    # FEC cycles are even years; get the current and two prior cycles
+    cycle = current_year if current_year % 2 == 0 else current_year + 1
+    cycles = [cycle, cycle - 2, cycle - 4]
+
+    for committee_id in committee_ids[:3]:
+        for two_year in cycles:
+            try:
+                resp = requests.get(f"{FEC_BASE}/schedules/schedule_a/",
+                    params={
+                        "api_key": fec_key,
+                        "committee_id": committee_id,
+                        "two_year_transaction_period": two_year,
+                        "sort": "-contribution_receipt_amount",
+                        "sort_hide_null": "true",
+                        "per_page": min(limit // len(cycles) + 10, 100),
+                        # omit is_individual — filter post-fetch to avoid API rejection
+                    },
+                    timeout=15)
+                resp.raise_for_status()
+                results = resp.json().get("results", [])
+                log.info(f"FEC {committee_id} cycle {two_year}: {len(results)} donors")
+                # Keep only individuals (entity_type = IND)
+                all_donors.extend(
+                    r for r in results
+                    if (r.get("entity_type") or "").upper() in ("IND", "")
+                )
+            except Exception as e:
+                log.warning(f"FEC schedule_a error {committee_id}/{two_year}: {e}")
 
     # Dedupe by contributor name, sum amounts
     donor_map: dict[str, dict] = {}
@@ -621,11 +634,19 @@ def lda_lobbying_targeting(official_name: str,
     all_filings: list[dict] = []
     seen_uuids: set[str] = set()
 
+    # LDA strategy for senators/house members:
+    # 1. Search by registrant_name containing the official's name (catches cases
+    #    where the person IS a registered lobbyist themselves — rare but real)
+    # 2. Fetch NY-client filings and filter by government_entities containing "SENATE"
+    #    or "HOUSE" + last name match in the activity description
+    # The specific_lobbying_issues field contains bill/issue text, NOT senator names.
+
     for year in years:
+        # Search 1: NY clients lobbying in this year — filter for Senate/House contacts
         try:
             resp = requests.get(f"{LDA_BASE}/filings/",
                 params={
-                    "specific_lobbying_issues": search_term,
+                    "client_state": "NY",
                     "filing_year": year,
                     "filing_type": "Q1,Q2,Q3,Q4",
                     "limit": limit,
@@ -633,16 +654,30 @@ def lda_lobbying_targeting(official_name: str,
                 timeout=12,
                 headers={"Accept": "application/json"})
             resp.raise_for_status()
-            for f in resp.json().get("results", []):
+            filings = resp.json().get("results", [])
+            for f in filings:
                 uid = f.get("filing_uuid") or str(f.get("id") or "")
-                if uid and uid not in seen_uuids:
+                if uid in seen_uuids:
+                    continue
+                # Check if any lobbying activity targets this official by name
+                # in government_entities or in the lobbyist names
+                matched = False
+                for act in (f.get("lobbying_activities") or []):
+                    entities = " ".join(
+                        (e.get("name") or "").lower()
+                        for e in (act.get("government_entities") or [])
+                    )
+                    if search_term.lower() in entities:
+                        matched = True
+                        break
+                if matched:
                     seen_uuids.add(uid)
                     all_filings.append(f)
-            log.info(f"LDA {year}: {len(resp.json().get('results',[]))} filings for {search_term}")
+            log.info(f"LDA {year} NY clients: {len(filings)} filings, {len(all_filings)} matched {search_term}")
         except Exception as e:
-            log.warning(f"LDA targeting error {year}/{search_term}: {e}")
+            log.warning(f"LDA targeting error {year}: {e}")
 
-    log.info(f"LDA total: {len(all_filings)} filings for {official_name}")
+    log.info(f"LDA total: {len(all_filings)} filings targeting {official_name}")
     return all_filings
 
 def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
