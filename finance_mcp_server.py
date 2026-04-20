@@ -1018,17 +1018,30 @@ def lda_lookup_registrant(employer_name: str) -> dict | None:
             _lda_registrant_cache[key] = None
             return None
 
-        # Require a real name overlap — reject garbage/stale registrants
+        # Require a real name overlap — reject garbage/stale registrants.
+        # Normalize both strings: remove punctuation, collapse whitespace.
+        import re as _re
+        def _norm(s: str) -> str:
+            return _re.sub(r"[^A-Z0-9 ]", " ", s.upper())
+
+        search_norm = " ".join(_norm(search).split())
+        # Build word set from search (skip short words)
+        search_words = {w for w in search_norm.split() if len(w) >= 4}
+
         best = None
+        best_score = 0
         for r in results:
-            rname = (r.get("name") or "").upper().strip()
-            # At least 4 consecutive chars of search must appear in registrant name
-            # or registrant name must appear in search
-            if len(search) >= 4 and (search[:6] in rname or rname[:6] in search):
+            rname_norm = " ".join(_norm(r.get("name") or "").split())
+            rname_words = {w for w in rname_norm.split() if len(w) >= 4}
+            # Score = number of significant words shared
+            shared = search_words & rname_words
+            score = len(shared)
+            if score > best_score:
+                best_score = score
                 best = r
-                break
-        if not best:
-            # No meaningful match found — don't return a false positive
+
+        if best_score == 0:
+            # No meaningful word overlap — reject as false positive
             _lda_registrant_cache[key] = None
             return None
 
