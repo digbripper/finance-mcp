@@ -1215,6 +1215,118 @@ def lda_enrich_donors(donor_rows: list[dict]) -> list[dict]:
                   key=lambda d: (not d.get("is_lda_registrant", False),
                                  -d.get("amount", 0)))
 
+
+# ─── NYC Voter File (nyc_super_voters.csv) ────────────────────────────────────
+# 416k active NYC voters who voted in 4+ general elections.
+# Fields: SBOEID, LASTNAME, FIRSTNAME, DOB, PARTY, OTHER_PARTY,
+#         ADDRESS, CITY, ZIP, COUNTY_CODE, COUNTY_NAME,
+#         CD, SD, AD, REGDATE, STATUS, GE_VOTES, PRIMARY_VOTES, VOTER_SCORE
+#
+# Lookup strategy: name-based fuzzy match (last + first), with DOB tiebreak.
+# Index: last_name_norm -> list of voter dicts
+
+import csv as _vcsv
+
+_VOTER_INDEX: dict[str, list[dict]] = {}   # last_norm -> [voter_dicts]
+_VOTER_LOADED = False
+
+def _load_voter_file():
+    global _VOTER_LOADED
+    if _VOTER_LOADED:
+        return
+
+    for _candidate in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyc_super_voters.csv"),
+        os.path.join(os.getcwd(), "nyc_super_voters.csv"),
+        "/app/nyc_super_voters.csv",
+    ]:
+        if os.path.exists(_candidate):
+            csv_path = _candidate
+            break
+    else:
+        log.warning("nyc_super_voters.csv not found — voter file lookup disabled")
+        _VOTER_LOADED = True
+        return
+
+    count = 0
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in _vcsv.DictReader(f):
+            last = (row.get("LASTNAME") or "").strip().upper()
+            if not last:
+                continue
+            _VOTER_INDEX.setdefault(last, []).append({
+                "sboeid":        row.get("SBOEID", ""),
+                "last":          last,
+                "first":         (row.get("FIRSTNAME") or "").strip().upper(),
+                "dob":           row.get("DOB", ""),
+                "party":         row.get("PARTY", ""),
+                "address":       row.get("ADDRESS", ""),
+                "city":          row.get("CITY", ""),
+                "zip":           row.get("ZIP", ""),
+                "county":        row.get("COUNTY_NAME", ""),
+                "cd":            row.get("CD", ""),
+                "sd":            row.get("SD", ""),
+                "ad":            row.get("AD", ""),
+                "regdate":       row.get("REGDATE", ""),
+                "ge_votes":      int(row.get("GE_VOTES") or 0),
+                "primary_votes": int(row.get("PRIMARY_VOTES") or 0),
+                "voter_score":   int(row.get("VOTER_SCORE") or 0),
+            })
+            count += 1
+
+    log.info(f"Loaded {count:,} NYC super voters into memory index")
+    _VOTER_LOADED = True
+
+
+def lookup_voter(full_name: str, dob: str = "") -> dict | None:
+    """
+    Look up a person in the NYC super-voter file by name.
+    Optionally pass DOB (YYYYMMDD) to disambiguate common names.
+    Returns the best-matching voter record or None.
+    """
+    _load_voter_file()
+    if not _VOTER_INDEX:
+        return None
+
+    parts = full_name.strip().upper().split()
+    if not parts:
+        return None
+
+    last = parts[-1]
+    first = parts[0] if len(parts) >= 2 else ""
+
+    candidates = _VOTER_INDEX.get(last, [])
+    if not candidates:
+        return None
+
+    # Score each candidate
+    best, best_score = None, 0
+    for v in candidates:
+        score = 0
+        # Last name match (already filtered by index)
+        score += 10
+        # First name match
+        if first and v["first"].startswith(first[:3]):
+            score += 8
+            if v["first"] == first:
+                score += 4
+        # DOB match if provided
+        if dob and v["dob"] == dob:
+            score += 20
+        if score > best_score:
+            best_score = score
+            best = v
+
+    # Require at least last + partial first match
+    return best if best_score >= 18 else None
+
+
+PARTY_LABELS = {
+    "DEM": "Democrat", "REP": "Republican", "CON": "Conservative",
+    "WOR": "Working Families", "BLK": "No Party", "OTH": "Other",
+    "GRE": "Green", "LBT": "Libertarian", "IND": "Independence",
+}
+
 # ─── Core enrichment ──────────────────────────────────────────────────────────
 
 def enrich_person(person_name: str) -> dict:
@@ -1233,6 +1345,7 @@ def enrich_person(person_name: str) -> dict:
         "known_donors_in_db": [],
         "known_recipients_in_db": [],
         "co_donors_in_db": [],
+        "voter_profile": None,
         "lobbied_by": [],
         "nys_lobbied_by": [],
         "federal_donors": [],
@@ -1387,6 +1500,32 @@ def enrich_person(person_name: str) -> dict:
                             f"Co-donors to {top}", f"Both donated to {top} (auto-detected)"):
                         findings["new_connections_written"] += 1
 
+
+
+    # ── Voter file cross-reference ────────────────────────────────────────────
+    voter = lookup_voter(person_name)
+    if voter:
+        party_label = PARTY_LABELS.get(voter["party"], voter["party"])
+        findings["voter_profile"] = {
+            "registered_party":  party_label,
+            "party_code":        voter["party"],
+            "address":           voter["address"],
+            "city":              voter["city"],
+            "zip":               voter["zip"],
+            "county":            voter["county"],
+            "congressional_district": voter["cd"],
+            "state_senate_district":  voter["sd"],
+            "assembly_district":      voter["ad"],
+            "registered_since":  voter["regdate"],
+            "general_elections_voted": voter["ge_votes"],
+            "primaries_voted":   voter["primary_votes"],
+            "voter_score":       voter["voter_score"],
+            "sboeid":            voter["sboeid"],
+        }
+        log.info(f"Voter match for {person_name}: {party_label}, "
+                 f"score={voter['voter_score']}, GE={voter['ge_votes']}")
+    else:
+        log.info(f"No voter file match for {person_name}")
 
     # 4. Who lobbied THIS person? (NYC City Clerk eLobbyist data)
     try:
@@ -1702,8 +1841,9 @@ async def lifespan(app):
     log.info(f"MCP_API_KEY set:  {bool(os.environ.get('MCP_API_KEY'))}")
     log.info(f"FEC_API_KEY set:  {bool(os.environ.get('FEC_API_KEY'))}")
     _load_boe_csv()
-    # Eagerly load LDA registrants CSV so it's ready before first query
+    # Eagerly load LDA registrants CSV and voter file
     _load_lda_registrants()
+    _load_voter_file()
     log.info("=== Ready ===")
     yield
 

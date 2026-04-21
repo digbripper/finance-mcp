@@ -15,6 +15,9 @@ COPY nys_boe_data/parsed_contributions.csv nys_boe_data/
 # Copy LDA registrants for in-memory cross-reference
 COPY lda_registrants.csv .
 
+# Copy NYC super-voter file (416k active voters, 4+ GE votes)
+COPY nyc_super_voters.csv .
+
 # Railway injects PORT at runtime
 ENV PORT=8000
 
