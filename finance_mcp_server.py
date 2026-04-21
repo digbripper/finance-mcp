@@ -105,6 +105,48 @@ def boe_donations_by(donor_name: str, limit: int = 100) -> list[dict]:
                 break
     return results
 
+
+# ─── BOE donor name index (built lazily for fast voter cross-reference) ───────
+
+_boe_donor_index: dict[str, list[dict]] = {}  # lastname_upper -> [rows]
+_boe_index_built: bool = False
+
+def _build_boe_donor_index():
+    """Build a lastname-keyed index of BOE donor rows for fast lookup."""
+    global _boe_donor_index, _boe_index_built
+    if _boe_index_built:
+        return
+    _load_boe_csv()
+    for row in _boe_rows:
+        raw = (row.get("contributor_name") or "").strip().upper()
+        if not raw:
+            continue
+        # Handle "LAST, FIRST" and "FIRST LAST" formats
+        if "," in raw:
+            last = raw.split(",")[0].strip()
+        else:
+            parts = raw.split()
+            last = parts[-1] if parts else ""
+        if last:
+            _boe_donor_index.setdefault(last, []).append(row)
+    log.info(f"BOE donor index built: {len(_boe_donor_index):,} unique last names")
+    _boe_index_built = True
+
+def boe_donations_by_voter(lastname: str, firstname: str) -> list[dict]:
+    """Fast BOE lookup for a voter by last + first name."""
+    _build_boe_donor_index()
+    candidates = _boe_donor_index.get(lastname.upper(), [])
+    if not candidates:
+        return []
+    first_up = firstname.upper()
+    results = []
+    for row in candidates:
+        raw = (row.get("contributor_name") or "").strip().upper()
+        # Check first name appears in contributor string
+        if first_up[:4] in raw or raw.startswith(first_up[:4]):
+            results.append(row)
+    return results
+
 # ─── DB helpers ───────────────────────────────────────────────────────────────
 
 def get_db():
@@ -1216,116 +1258,239 @@ def lda_enrich_donors(donor_rows: list[dict]) -> list[dict]:
                                  -d.get("amount", 0)))
 
 
-# ─── NYC Voter File (nyc_super_voters.csv) ────────────────────────────────────
-# 416k active NYC voters who voted in 4+ general elections.
-# Fields: SBOEID, LASTNAME, FIRSTNAME, DOB, PARTY, OTHER_PARTY,
-#         ADDRESS, CITY, ZIP, COUNTY_CODE, COUNTY_NAME,
-#         CD, SD, AD, REGDATE, STATUS, GE_VOTES, PRIMARY_VOTES, VOTER_SCORE
-#
-# Lookup strategy: name-based fuzzy match (last + first), with DOB tiebreak.
-# Index: last_name_norm -> list of voter dicts
+# ─── NYC Voter File (nyc_voters.db — SQLite) ─────────────────────────────────
+# Full active NYC voter registry (~3.5M records) in a SQLite database.
+# Queried on demand via indexed name lookups — no memory overhead.
+# Built locally with build_voter_db.py and committed to the repo.
 
-import csv as _vcsv
+import sqlite3 as _sqlite3
+import threading as _threading
 
-_VOTER_INDEX: dict[str, list[dict]] = {}   # last_norm -> [voter_dicts]
-_VOTER_LOADED = False
-
-def _load_voter_file():
-    global _VOTER_LOADED
-    if _VOTER_LOADED:
-        return
-
-    for _candidate in [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyc_super_voters.csv"),
-        os.path.join(os.getcwd(), "nyc_super_voters.csv"),
-        "/app/nyc_super_voters.csv",
-    ]:
-        if os.path.exists(_candidate):
-            csv_path = _candidate
-            break
-    else:
-        log.warning("nyc_super_voters.csv not found — voter file lookup disabled")
-        _VOTER_LOADED = True
-        return
-
-    count = 0
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        for row in _vcsv.DictReader(f):
-            last = (row.get("LASTNAME") or "").strip().upper()
-            if not last:
-                continue
-            _VOTER_INDEX.setdefault(last, []).append({
-                "sboeid":        row.get("SBOEID", ""),
-                "last":          last,
-                "first":         (row.get("FIRSTNAME") or "").strip().upper(),
-                "dob":           row.get("DOB", ""),
-                "party":         row.get("PARTY", ""),
-                "address":       row.get("ADDRESS", ""),
-                "city":          row.get("CITY", ""),
-                "zip":           row.get("ZIP", ""),
-                "county":        row.get("COUNTY_NAME", ""),
-                "cd":            row.get("CD", ""),
-                "sd":            row.get("SD", ""),
-                "ad":            row.get("AD", ""),
-                "regdate":       row.get("REGDATE", ""),
-                "ge_votes":      int(row.get("GE_VOTES") or 0),
-                "primary_votes": int(row.get("PRIMARY_VOTES") or 0),
-                "voter_score":   int(row.get("VOTER_SCORE") or 0),
-            })
-            count += 1
-
-    log.info(f"Loaded {count:,} NYC super voters into memory index")
-    _VOTER_LOADED = True
-
-
-def lookup_voter(full_name: str, dob: str = "") -> dict | None:
-    """
-    Look up a person in the NYC super-voter file by name.
-    Optionally pass DOB (YYYYMMDD) to disambiguate common names.
-    Returns the best-matching voter record or None.
-    """
-    _load_voter_file()
-    if not _VOTER_INDEX:
-        return None
-
-    parts = full_name.strip().upper().split()
-    if not parts:
-        return None
-
-    last = parts[-1]
-    first = parts[0] if len(parts) >= 2 else ""
-
-    candidates = _VOTER_INDEX.get(last, [])
-    if not candidates:
-        return None
-
-    # Score each candidate
-    best, best_score = None, 0
-    for v in candidates:
-        score = 0
-        # Last name match (already filtered by index)
-        score += 10
-        # First name match
-        if first and v["first"].startswith(first[:3]):
-            score += 8
-            if v["first"] == first:
-                score += 4
-        # DOB match if provided
-        if dob and v["dob"] == dob:
-            score += 20
-        if score > best_score:
-            best_score = score
-            best = v
-
-    # Require at least last + partial first match
-    return best if best_score >= 18 else None
-
+_VOTER_DB_PATH: str | None = None
+_VOTER_DB_LOCK = _threading.Lock()
+_voter_db_conn: _sqlite3.Connection | None = None
 
 PARTY_LABELS = {
     "DEM": "Democrat", "REP": "Republican", "CON": "Conservative",
     "WOR": "Working Families", "BLK": "No Party", "OTH": "Other",
     "GRE": "Green", "LBT": "Libertarian", "IND": "Independence",
 }
+
+def _init_voter_db():
+    """Find and open the voter SQLite DB. Called once at startup."""
+    global _VOTER_DB_PATH, _voter_db_conn
+    for candidate in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyc_voters.db"),
+        os.path.join(os.getcwd(), "nyc_voters.db"),
+        "/app/nyc_voters.db",
+    ]:
+        if os.path.exists(candidate):
+            _VOTER_DB_PATH = candidate
+            # Open in read-only WAL mode; check_same_thread=False for ThreadPoolExecutor
+            _voter_db_conn = _sqlite3.connect(
+                f"file:{candidate}?mode=ro", uri=True,
+                check_same_thread=False
+            )
+            _voter_db_conn.row_factory = _sqlite3.Row
+            # Quick sanity check
+            count = _voter_db_conn.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
+            log.info(f"Voter DB loaded: {count:,} active NYC voters at {candidate}")
+            return
+    log.warning("nyc_voters.db not found — voter lookup disabled")
+
+
+def _load_voter_file():
+    """Compat shim — real init is _init_voter_db()."""
+    pass
+
+
+def lookup_voter(full_name: str, dob: str = "") -> dict | None:
+    """
+    Look up a person in the NYC voter DB by name.
+    Returns best-matching voter record dict or None.
+    Uses indexed SQL queries — fast even on 3.5M rows.
+    """
+    if _voter_db_conn is None:
+        return None
+
+    parts = full_name.strip().upper().split()
+    if not parts:
+        return None
+
+    last  = parts[-1]
+    first = parts[0] if len(parts) >= 2 else ""
+
+    try:
+        with _VOTER_DB_LOCK:
+            if dob:
+                # Exact match: last + first + DOB
+                row = _voter_db_conn.execute(
+                    "SELECT * FROM voters WHERE lastname=? AND firstname=? AND dob=? LIMIT 1",
+                    (last, first, dob)
+                ).fetchone()
+                if row:
+                    return dict(row)
+
+            # Fuzzy: last + first prefix (first 3 chars)
+            if first:
+                rows = _voter_db_conn.execute(
+                    "SELECT * FROM voters WHERE lastname=? AND firstname LIKE ? "
+                    "ORDER BY voter_score DESC LIMIT 5",
+                    (last, first[:3] + "%")
+                ).fetchall()
+            else:
+                rows = _voter_db_conn.execute(
+                    "SELECT * FROM voters WHERE lastname=? "
+                    "ORDER BY voter_score DESC LIMIT 5",
+                    (last,)
+                ).fetchall()
+
+            if not rows:
+                return None
+
+            # Among candidates, prefer exact first name match
+            for r in rows:
+                if r["firstname"] == first:
+                    return dict(r)
+            # Fallback: highest voter_score
+            return dict(rows[0])
+
+    except Exception as e:
+        log.warning(f"Voter DB lookup error for {full_name!r}: {e}")
+        return None
+
+
+
+# ─── Super voter finder ───────────────────────────────────────────────────────
+
+COUNTY_CODES = {
+    "manhattan": "31", "new york": "31", "ny": "31",
+    "brooklyn": "24", "kings": "24",
+    "queens": "41",
+    "bronx": "03",
+    "staten island": "43", "richmond": "43",
+}
+
+def find_super_voters(
+    county: str = "brooklyn",
+    min_voter_score: int = 10,
+    party: str = "",
+    assembly_district: str = "",
+    state_senate_district: str = "",
+    congressional_district: str = "",
+    cross_reference_finance: bool = True,
+    limit: int = 50,
+) -> list[dict]:
+    """
+    Query the voter DB for high-engagement voters in a given NYC county,
+    optionally filtered by party and district.
+    Cross-references each voter against BOE campaign finance data to find
+    those who are also significant donors.
+    """
+    if _voter_db_conn is None:
+        return [{"error": "Voter DB not loaded"}]
+
+    # Resolve county name to code
+    county_code = COUNTY_CODES.get(county.lower().strip())
+    if not county_code:
+        # Maybe they passed a code directly
+        county_code = county if county in COUNTY_CODES.values() else None
+    if not county_code:
+        return [{"error": f"Unknown county: {county}. Use: manhattan, brooklyn, queens, bronx, staten island"}]
+
+    # Build SQL query
+    sql = """
+        SELECT sboeid, lastname, firstname, dob, party, address, city, zip,
+               cd, sd, ad, regdate, ge_votes, primary_votes, voter_score
+        FROM voters
+        WHERE county_code = ? AND voter_score >= ?
+    """
+    params: list = [county_code, min_voter_score]
+
+    if party:
+        party_code = party.upper()[:3]
+        # Accept full names too
+        party_map = {"DEMOCRAT": "DEM", "DEMOCRATIC": "DEM", "REPUBLICAN": "REP",
+                     "WORKING FAMILIES": "WOR", "NO PARTY": "BLK", "INDEPENDENT": "BLK"}
+        party_code = party_map.get(party.upper(), party_code)
+        sql += " AND party = ?"
+        params.append(party_code)
+
+    if assembly_district:
+        sql += " AND ad = ?"
+        params.append(str(assembly_district).zfill(3) if len(str(assembly_district)) < 3 else str(assembly_district))
+
+    if state_senate_district:
+        sql += " AND sd = ?"
+        params.append(str(state_senate_district))
+
+    if congressional_district:
+        sql += " AND cd = ?"
+        params.append(str(congressional_district))
+
+    sql += " ORDER BY voter_score DESC LIMIT ?"
+    params.append(limit * 3 if cross_reference_finance else limit)  # fetch more if we'll filter
+
+    try:
+        with _VOTER_DB_LOCK:
+            rows = _voter_db_conn.execute(sql, params).fetchall()
+    except Exception as e:
+        log.error(f"find_super_voters DB error: {e}")
+        return [{"error": str(e)}]
+
+    log.info(f"find_super_voters: {len(rows)} voters from DB for {county} score>={min_voter_score}")
+
+    # Build results, optionally cross-referencing finance
+    if cross_reference_finance:
+        _build_boe_donor_index()
+
+    results = []
+    for v in rows:
+        party_label = PARTY_LABELS.get(v["party"], v["party"])
+        entry = {
+            "name": f"{v['firstname'].title()} {v['lastname'].title()}",
+            "lastname": v["lastname"],
+            "firstname": v["firstname"],
+            "party": party_label,
+            "party_code": v["party"],
+            "address": v["address"],
+            "city": v["city"],
+            "zip": v["zip"],
+            "assembly_district": v["ad"],
+            "state_senate_district": v["sd"],
+            "congressional_district": v["cd"],
+            "registered_since": v["regdate"],
+            "general_elections_voted": v["ge_votes"],
+            "primaries_voted": v["primary_votes"],
+            "voter_score": v["voter_score"],
+            "total_donated": 0.0,
+            "donation_count": 0,
+            "top_candidates": [],
+            "has_finance_history": False,
+        }
+
+        if cross_reference_finance:
+            donations = boe_donations_by_voter(v["lastname"], v["firstname"])
+            if donations:
+                total = sum(float(d.get("amount") or 0) for d in donations)
+                candidates = {}
+                for d in donations:
+                    cand = (d.get("candidate_name") or "").strip()
+                    if cand:
+                        candidates[cand] = candidates.get(cand, 0) + float(d.get("amount") or 0)
+                top = sorted(candidates.items(), key=lambda x: -x[1])[:5]
+                entry["total_donated"] = round(total, 2)
+                entry["donation_count"] = len(donations)
+                entry["top_candidates"] = [{"candidate": c, "amount": round(a, 2)} for c, a in top]
+                entry["has_finance_history"] = total > 0
+
+        results.append(entry)
+
+    # If cross-referencing, sort by those with finance history first, then by voter score
+    if cross_reference_finance:
+        results.sort(key=lambda x: (-x["total_donated"], -x["voter_score"]))
+
+    return results[:limit]
 
 # ─── Core enrichment ──────────────────────────────────────────────────────────
 
@@ -1694,6 +1859,34 @@ async def list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="find_super_voters",
+            description=(
+                "Find high-engagement NYC voters in a given county or district, "
+                "cross-referenced with campaign finance data to surface those who are "
+                "also significant donors. Useful for identifying politically active "
+                "individuals with financial influence. "
+                "Filter by county (manhattan/brooklyn/queens/bronx/staten island), "
+                "party (DEM/REP/WOR etc), assembly district, senate district, "
+                "congressional district, and minimum voter score. "
+                "Returns voters sorted by donation total, with their voting history, "
+                "party, address, districts, and top campaign contributions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "county":        {"type": "string", "description": "NYC county: manhattan, brooklyn, queens, bronx, or staten island"},
+                    "min_voter_score": {"type": "integer", "description": "Minimum voter score (GE + primary votes). Default 10."},
+                    "party":         {"type": "string", "description": "Party filter: DEM, REP, WOR, BLK, CON, etc. Optional."},
+                    "assembly_district": {"type": "string", "description": "Assembly district number. Optional."},
+                    "state_senate_district": {"type": "string", "description": "State senate district number. Optional."},
+                    "congressional_district": {"type": "string", "description": "Congressional district number. Optional."},
+                    "cross_reference_finance": {"type": "boolean", "description": "Cross-reference with BOE donation data. Default true."},
+                    "limit":         {"type": "integer", "description": "Max results to return. Default 50."},
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
             name="find_financial_path",
             description=(
                 "Find whether two people share financial/donor connections — "
@@ -1776,6 +1969,20 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             }
             return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
+        elif name == "find_super_voters":
+            log.info(f"find_super_voters: {arguments}")
+            results = await loop.run_in_executor(None, lambda: find_super_voters(
+                county=arguments.get("county", "brooklyn"),
+                min_voter_score=int(arguments.get("min_voter_score", 10)),
+                party=arguments.get("party", ""),
+                assembly_district=arguments.get("assembly_district", ""),
+                state_senate_district=arguments.get("state_senate_district", ""),
+                congressional_district=arguments.get("congressional_district", ""),
+                cross_reference_finance=bool(arguments.get("cross_reference_finance", True)),
+                limit=int(arguments.get("limit", 50)),
+            ))
+            return [types.TextContent(type="text", text=json.dumps(results, indent=2, default=str))]
+
         else:
             return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
 
@@ -1843,7 +2050,7 @@ async def lifespan(app):
     _load_boe_csv()
     # Eagerly load LDA registrants CSV and voter file
     _load_lda_registrants()
-    _load_voter_file()
+    _init_voter_db()
     log.info("=== Ready ===")
     yield
 
