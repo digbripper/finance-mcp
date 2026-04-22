@@ -1258,17 +1258,14 @@ def lda_enrich_donors(donor_rows: list[dict]) -> list[dict]:
                                  -d.get("amount", 0)))
 
 
-# ─── NYC Voter File (nyc_voters.db — SQLite) ─────────────────────────────────
-# Full active NYC voter registry (~3.5M records) in a SQLite database.
-# Queried on demand via indexed name lookups — no memory overhead.
-# Built locally with build_voter_db.py and committed to the repo.
+# ─── NYC Voter File (nyc_super_voters.csv — in-memory) ───────────────────────
+# 416k active NYC voters who voted in 4+ general elections.
+# 49MB CSV, loaded into memory at startup. Already deployed in Railway.
 
-import sqlite3 as _sqlite3
-import threading as _threading
+import csv as _vcsv
 
-_VOTER_DB_PATH: str | None = None
-_VOTER_DB_LOCK = _threading.Lock()
-_voter_db_conn: _sqlite3.Connection | None = None
+_VOTER_INDEX: dict[str, list[dict]] = {}   # LASTNAME -> [voter dicts]
+_VOTER_LOADED = False
 
 PARTY_LABELS = {
     "DEM": "Democrat", "REP": "Republican", "CON": "Conservative",
@@ -1276,39 +1273,74 @@ PARTY_LABELS = {
     "GRE": "Green", "LBT": "Libertarian", "IND": "Independence",
 }
 
+def _load_voter_file():
+    global _VOTER_LOADED
+    if _VOTER_LOADED:
+        return
+    for _candidate in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyc_super_voters.csv"),
+        os.path.join(os.getcwd(), "nyc_super_voters.csv"),
+        "/app/nyc_super_voters.csv",
+    ]:
+        if os.path.exists(_candidate):
+            csv_path = _candidate
+            break
+    else:
+        log.warning("nyc_super_voters.csv not found — voter lookup disabled")
+        _VOTER_LOADED = True
+        return
+    count = 0
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in _vcsv.DictReader(f):
+            last = (row.get("LASTNAME") or "").strip().upper()
+            if not last:
+                continue
+            _VOTER_INDEX.setdefault(last, []).append({
+                "sboeid":        row.get("SBOEID", ""),
+                "last":          last,
+                "first":         (row.get("FIRSTNAME") or "").strip().upper(),
+                "dob":           row.get("DOB", ""),
+                "party":         row.get("PARTY", ""),
+                "address":       row.get("ADDRESS", ""),
+                "city":          row.get("CITY", ""),
+                "zip":           row.get("ZIP", ""),
+                "county_code":   row.get("COUNTY_CODE", ""),
+                "county":        row.get("COUNTY_NAME", ""),
+                "cd":            row.get("CD", ""),
+                "sd":            row.get("SD", ""),
+                "ad":            row.get("AD", ""),
+                "regdate":       row.get("REGDATE", ""),
+                "ge_votes":      int(row.get("GE_VOTES") or 0),
+                "primary_votes": int(row.get("PRIMARY_VOTES") or 0),
+                "voter_score":   int(row.get("VOTER_SCORE") or 0),
+            })
+            count += 1
+    log.info(f"Loaded {count:,} NYC super voters into memory index")
+    _VOTER_LOADED = True
+
 VOTER_DB_RELEASE_URL = (
-    "https://github.com/digbripper/finance-mcp/releases/download"
-    "/v1.0-voter-db/nyc_voters.db"
+    "https://github.com/digbripper/finance-mcp"
+    "/releases/download/v1.0-voter-db/nyc_voters.db"
 )
 VOTER_DB_LOCAL_PATH = "/app/nyc_voters.db"
 
 def _is_real_sqlite(path: str) -> bool:
-    """Check that a file is a real SQLite DB, not an LFS pointer."""
     try:
         with open(path, "rb") as f:
-            header = f.read(16)
-        return header[:6] == b"SQLite"
+            return f.read(6) == b"SQLite"
     except Exception:
         return False
 
-def _download_voter_db():
-    """Download nyc_voters.db from GitHub Releases, using GITHUB_TOKEN if set."""
-    import urllib.request as _urllib
+def _download_voter_db() -> bool:
     path = VOTER_DB_LOCAL_PATH
     if os.path.exists(path) and _is_real_sqlite(path):
-        log.info(f"Voter DB already present at {path}")
+        log.info("Full voter DB already present")
         return True
-    log.info(f"Downloading voter DB from GitHub Releases (~1GB, please wait)...")
-    token = _cfg("GITHUB_TOKEN", "")
-    headers = {"User-Agent": "finance-mcp/1.0", "Accept": "application/octet-stream"}
-    if token:
-        headers["Authorization"] = f"token {token}"
-        log.info("Using GITHUB_TOKEN for authenticated download")
-    else:
-        log.warning("No GITHUB_TOKEN set — download may fail for private repos")
+    log.info("Downloading full voter DB from GitHub Releases (~1GB)...")
     try:
-        req = _urllib.Request(VOTER_DB_RELEASE_URL, headers=headers)
-        with _urllib.urlopen(req, timeout=300) as resp,              open(path, "wb") as out:
+        req = _urllib_req.Request(VOTER_DB_RELEASE_URL,
+                                  headers={"User-Agent": "finance-mcp/1.0"})
+        with _urllib_req.urlopen(req, timeout=300) as resp,              open(path, "wb") as out:
             downloaded = 0
             while True:
                 chunk = resp.read(1024 * 1024)
@@ -1325,49 +1357,21 @@ def _download_voter_db():
         return False
 
 def _init_voter_db():
-    """Find, download if needed, and open the voter SQLite DB."""
-    global _VOTER_DB_PATH, _voter_db_conn
-
-    # Check all candidate paths
-    candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyc_voters.db"),
-        os.path.join(os.getcwd(), "nyc_voters.db"),
-        "/app/nyc_voters.db",
-    ]
-
-    db_path = None
-    for candidate in candidates:
-        if os.path.exists(candidate) and _is_real_sqlite(candidate):
-            db_path = candidate
-            break
-        elif os.path.exists(candidate):
-            log.warning(f"{candidate} exists but is not a valid SQLite DB (LFS pointer?) — downloading real file")
-
-    # If not found or invalid, download it
-    if db_path is None:
-        if _download_voter_db():
-            db_path = VOTER_DB_LOCAL_PATH
-        else:
-            log.warning("Voter DB unavailable — voter lookup disabled")
-            return
-
-    try:
-        _VOTER_DB_PATH = db_path
-        _voter_db_conn = _sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True,
-            check_same_thread=False
-        )
-        _voter_db_conn.row_factory = _sqlite3.Row
-        count = _voter_db_conn.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
-        log.info(f"Voter DB loaded: {count:,} active NYC voters at {db_path}")
-    except Exception as e:
-        log.error(f"Failed to open voter DB at {db_path}: {e}")
-        _voter_db_conn = None
-
-
-def _load_voter_file():
-    """Compat shim — real init is _init_voter_db()."""
-    pass
+    """Load super voter CSV (always) + download/open full SQLite DB."""
+    global _voter_db_conn
+    _load_voter_file()  # always load CSV for find_super_voters
+    if _download_voter_db():
+        try:
+            _voter_db_conn = _sqlite3.connect(
+                f"file:{VOTER_DB_LOCAL_PATH}?mode=ro", uri=True,
+                check_same_thread=False
+            )
+            _voter_db_conn.row_factory = _sqlite3.Row
+            count = _voter_db_conn.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
+            log.info(f"Full voter DB loaded: {count:,} active NYC voters")
+        except Exception as e:
+            log.error(f"Failed to open voter DB: {e}")
+            _voter_db_conn = None
 
 
 def lookup_voter(full_name: str, dob: str = "") -> dict | None:
@@ -1448,87 +1452,69 @@ def find_super_voters(
     limit: int = 50,
 ) -> list[dict]:
     """
-    Query the voter DB for high-engagement voters in a given NYC county,
-    optionally filtered by party and district.
-    Cross-references each voter against BOE campaign finance data to find
-    those who are also significant donors.
+    Find high-engagement NYC voters using the in-memory super voter CSV index.
+    Filters by county, party, district, voter score. Cross-references BOE finance data.
     """
-    if _voter_db_conn is None:
-        return [{"error": "Voter DB not loaded"}]
+    _load_voter_file()
+    if not _VOTER_INDEX:
+        return [{"error": "Super voter index not loaded"}]
 
     # Resolve county name to code
     county_code = COUNTY_CODES.get(county.lower().strip())
     if not county_code:
-        # Maybe they passed a code directly
         county_code = county if county in COUNTY_CODES.values() else None
     if not county_code:
         return [{"error": f"Unknown county: {county}. Use: manhattan, brooklyn, queens, bronx, staten island"}]
 
-    # Build SQL query
-    sql = """
-        SELECT sboeid, lastname, firstname, dob, party, address, city, zip,
-               cd, sd, ad, regdate, ge_votes, primary_votes, voter_score
-        FROM voters
-        WHERE county_code = ? AND voter_score >= ?
-    """
-    params: list = [county_code, min_voter_score]
+    party_map = {"DEMOCRAT": "DEM", "DEMOCRATIC": "DEM", "REPUBLICAN": "REP",
+                 "WORKING FAMILIES": "WOR", "NO PARTY": "BLK", "INDEPENDENT": "BLK"}
+    party_code = party_map.get(party.upper(), party.upper()[:3]) if party else ""
 
-    if party:
-        party_code = party.upper()[:3]
-        # Accept full names too
-        party_map = {"DEMOCRAT": "DEM", "DEMOCRATIC": "DEM", "REPUBLICAN": "REP",
-                     "WORKING FAMILIES": "WOR", "NO PARTY": "BLK", "INDEPENDENT": "BLK"}
-        party_code = party_map.get(party.upper(), party_code)
-        sql += " AND party = ?"
-        params.append(party_code)
+    ad_str = str(assembly_district).lstrip("0") if assembly_district else ""
+    sd_str = str(state_senate_district).lstrip("0") if state_senate_district else ""
+    cd_str = str(congressional_district).lstrip("0") if congressional_district else ""
 
-    if assembly_district:
-        sql += " AND ad = ?"
-        params.append(str(assembly_district).zfill(3) if len(str(assembly_district)) < 3 else str(assembly_district))
+    fetch_limit = limit * 3 if cross_reference_finance else limit
+    rows = []
+    for voters_list in _VOTER_INDEX.values():
+        for v in voters_list:
+            if v.get("county_code") != county_code: continue
+            if v.get("voter_score", 0) < min_voter_score: continue
+            if party_code and v.get("party","") != party_code: continue
+            if ad_str and v.get("ad","").lstrip("0") != ad_str: continue
+            if sd_str and v.get("sd","").lstrip("0") != sd_str: continue
+            if cd_str and v.get("cd","").lstrip("0") != cd_str: continue
+            rows.append(v)
+            if len(rows) >= fetch_limit:
+                break
+        if len(rows) >= fetch_limit:
+            break
 
-    if state_senate_district:
-        sql += " AND sd = ?"
-        params.append(str(state_senate_district))
+    rows.sort(key=lambda x: -x.get("voter_score", 0))
+    log.info(f"find_super_voters: {len(rows)} voters for {county} score>={min_voter_score}")
 
-    if congressional_district:
-        sql += " AND cd = ?"
-        params.append(str(congressional_district))
-
-    sql += " ORDER BY voter_score DESC LIMIT ?"
-    params.append(limit * 3 if cross_reference_finance else limit)  # fetch more if we'll filter
-
-    try:
-        with _VOTER_DB_LOCK:
-            rows = _voter_db_conn.execute(sql, params).fetchall()
-    except Exception as e:
-        log.error(f"find_super_voters DB error: {e}")
-        return [{"error": str(e)}]
-
-    log.info(f"find_super_voters: {len(rows)} voters from DB for {county} score>={min_voter_score}")
-
-    # Build results, optionally cross-referencing finance
     if cross_reference_finance:
         _build_boe_donor_index()
 
     results = []
     for v in rows:
-        party_label = PARTY_LABELS.get(v["party"], v["party"])
+        party_label = PARTY_LABELS.get(v.get("party",""), v.get("party",""))
         entry = {
-            "name": f"{v['firstname'].title()} {v['lastname'].title()}",
-            "lastname": v["lastname"],
-            "firstname": v["firstname"],
+            "name": f"{(v.get('first') or '').title()} {(v.get('last') or '').title()}",
+            "lastname": v.get("last",""),
+            "firstname": v.get("first",""),
             "party": party_label,
-            "party_code": v["party"],
-            "address": v["address"],
-            "city": v["city"],
-            "zip": v["zip"],
-            "assembly_district": v["ad"],
-            "state_senate_district": v["sd"],
-            "congressional_district": v["cd"],
-            "registered_since": v["regdate"],
-            "general_elections_voted": v["ge_votes"],
-            "primaries_voted": v["primary_votes"],
-            "voter_score": v["voter_score"],
+            "party_code": v.get("party",""),
+            "address": v.get("address",""),
+            "city": v.get("city",""),
+            "zip": v.get("zip",""),
+            "assembly_district": v.get("ad",""),
+            "state_senate_district": v.get("sd",""),
+            "congressional_district": v.get("cd",""),
+            "registered_since": v.get("regdate",""),
+            "general_elections_voted": v.get("ge_votes",0),
+            "primaries_voted": v.get("primary_votes",0),
+            "voter_score": v.get("voter_score",0),
             "total_donated": 0.0,
             "donation_count": 0,
             "top_candidates": [],

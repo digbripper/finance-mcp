@@ -9,14 +9,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy server code
 COPY finance_mcp_server.py .
 
-# Copy the BOE CSV — only the CSV, not the giant zip files
+# Copy the BOE CSV
 COPY nys_boe_data/parsed_contributions.csv nys_boe_data/
 
 # Copy LDA registrants for in-memory cross-reference
 COPY lda_registrants.csv .
 
-# nyc_voters.db is downloaded at startup from GitHub Releases if not present
-# See VOTER_DB_RELEASE_URL in finance_mcp_server.py
+# Copy NYC super voters CSV (416k high-engagement voters, 49MB)
+# Powers find_super_voters tool — loaded into memory at startup
+COPY nyc_super_voters.csv .
+
+# Full voter DB (nyc_voters.db, 1GB) is downloaded from GitHub Releases
+# at startup if not already present — see VOTER_DB_RELEASE_URL in server code
 
 # Railway injects PORT at runtime
 ENV PORT=8000
