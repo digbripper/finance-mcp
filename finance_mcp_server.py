@@ -1263,6 +1263,9 @@ def lda_enrich_donors(donor_rows: list[dict]) -> list[dict]:
 # 49MB CSV, loaded into memory at startup. Already deployed in Railway.
 
 import csv as _vcsv
+import sqlite3 as _sqlite3
+import threading as _threading
+_VOTER_DB_LOCK = _threading.Lock()
 
 _VOTER_INDEX: dict[str, list[dict]] = {}   # LASTNAME -> [voter dicts]
 _VOTER_LOADED = False
@@ -1391,7 +1394,8 @@ def _init_voter_db():
 
     # Otherwise download in background so startup health check passes
     log.info("Voter DB not present — downloading in background thread...")
-    t = _threading.Thread(target=_background_download, daemon=True)
+    import threading as _th
+    t = _th.Thread(target=_background_download, daemon=True)
     t.start()
 
 
