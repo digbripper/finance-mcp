@@ -1358,22 +1358,41 @@ def _download_voter_db() -> bool:
         log.error(f"Failed to download voter DB: {e}")
         return False
 
-def _init_voter_db():
-    """Load super voter CSV (always) + download/open full SQLite DB."""
+def _open_voter_db():
+    """Open the SQLite voter DB once downloaded."""
     global _voter_db_conn
-    _load_voter_file()  # always load CSV for find_super_voters
+    try:
+        conn = _sqlite3.connect(
+            f"file:{VOTER_DB_LOCAL_PATH}?mode=ro", uri=True,
+            check_same_thread=False
+        )
+        conn.row_factory = _sqlite3.Row
+        count = conn.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
+        _voter_db_conn = conn
+        log.info(f"Full voter DB loaded: {count:,} active NYC voters")
+    except Exception as e:
+        log.error(f"Failed to open voter DB: {e}")
+
+def _background_download():
+    """Download voter DB in background — doesn't block server startup."""
     if _download_voter_db():
-        try:
-            _voter_db_conn = _sqlite3.connect(
-                f"file:{VOTER_DB_LOCAL_PATH}?mode=ro", uri=True,
-                check_same_thread=False
-            )
-            _voter_db_conn.row_factory = _sqlite3.Row
-            count = _voter_db_conn.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
-            log.info(f"Full voter DB loaded: {count:,} active NYC voters")
-        except Exception as e:
-            log.error(f"Failed to open voter DB: {e}")
-            _voter_db_conn = None
+        _open_voter_db()
+    else:
+        log.warning("Full voter DB unavailable — lookup_voter uses super voter CSV only")
+
+def _init_voter_db():
+    """Load super voter CSV immediately, then download full DB in background."""
+    _load_voter_file()  # always load CSV — fast, needed for find_super_voters
+
+    # If DB already present and valid, open it synchronously (fast path)
+    if os.path.exists(VOTER_DB_LOCAL_PATH) and _is_real_sqlite(VOTER_DB_LOCAL_PATH):
+        _open_voter_db()
+        return
+
+    # Otherwise download in background so startup health check passes
+    log.info("Voter DB not present — downloading in background thread...")
+    t = _threading.Thread(target=_background_download, daemon=True)
+    t.start()
 
 
 def lookup_voter(full_name: str, dob: str = "") -> dict | None:
