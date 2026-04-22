@@ -1337,7 +1337,8 @@ def _is_real_sqlite(path: str) -> bool:
 def _download_voter_db() -> bool:
     import urllib.request as _ur
     path = VOTER_DB_LOCAL_PATH
-    if os.path.exists(path) and _is_real_sqlite(path):
+    tmp_path = path + ".tmp"
+    if os.path.exists(path) and _is_real_sqlite(path) and os.path.getsize(path) > 900_000_000:
         log.info("Full voter DB already present")
         return True
     log.info("Downloading full voter DB from GitHub Releases (~1GB)...")
@@ -1345,7 +1346,7 @@ def _download_voter_db() -> bool:
         req = _ur.Request(VOTER_DB_RELEASE_URL,
                           headers={"User-Agent": "finance-mcp/1.0"})
         with _ur.urlopen(req, timeout=300) as resp, \
-             open(path, "wb") as out:
+             open(tmp_path, "wb") as out:
             downloaded = 0
             while True:
                 chunk = resp.read(1024 * 1024)
@@ -1355,10 +1356,14 @@ def _download_voter_db() -> bool:
                 downloaded += len(chunk)
                 if downloaded % (100 * 1024 * 1024) == 0:
                     log.info(f"  Downloaded {downloaded // (1024*1024)}MB...")
+        # Atomic rename only after full download
+        os.replace(tmp_path, path)
         log.info(f"Voter DB download complete ({downloaded // (1024*1024)}MB)")
         return True
     except Exception as e:
         log.error(f"Failed to download voter DB: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         return False
 
 def _open_voter_db():
@@ -1547,7 +1552,7 @@ def find_super_voters(
         }
 
         if cross_reference_finance:
-            donations = boe_donations_by_voter(v["lastname"], v["firstname"])
+            donations = boe_donations_by_voter(v.get("last",""), v.get("first",""))
             if donations:
                 total = sum(float(d.get("amount") or 0) for d in donations)
                 candidates = {}
