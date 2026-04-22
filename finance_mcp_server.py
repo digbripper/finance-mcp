@@ -1276,27 +1276,87 @@ PARTY_LABELS = {
     "GRE": "Green", "LBT": "Libertarian", "IND": "Independence",
 }
 
+VOTER_DB_RELEASE_URL = (
+    "https://github.com/digbripper/finance-mcp/releases/download"
+    "/v1.0-voter-db/nyc_voters.db"
+)
+VOTER_DB_LOCAL_PATH = "/app/nyc_voters.db"
+
+def _is_real_sqlite(path: str) -> bool:
+    """Check that a file is a real SQLite DB, not an LFS pointer."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+        return header[:6] == b"SQLite"
+    except Exception:
+        return False
+
+def _download_voter_db():
+    """Download nyc_voters.db from GitHub Releases if not present or is an LFS pointer."""
+    import urllib.request as _urllib
+    path = VOTER_DB_LOCAL_PATH
+    if os.path.exists(path) and _is_real_sqlite(path):
+        log.info(f"Voter DB already present at {path}")
+        return True
+    log.info(f"Downloading voter DB from GitHub Releases (~1GB, please wait)...")
+    try:
+        req = _urllib.Request(VOTER_DB_RELEASE_URL,
+                              headers={"User-Agent": "finance-mcp/1.0"})
+        with _urllib.urlopen(req, timeout=300) as resp,              open(path, "wb") as out:
+            downloaded = 0
+            while True:
+                chunk = resp.read(1024 * 1024)  # 1MB chunks
+                if not chunk:
+                    break
+                out.write(chunk)
+                downloaded += len(chunk)
+                if downloaded % (100 * 1024 * 1024) == 0:
+                    log.info(f"  Downloaded {downloaded // (1024*1024)}MB...")
+        log.info(f"Voter DB download complete ({downloaded // (1024*1024)}MB)")
+        return True
+    except Exception as e:
+        log.error(f"Failed to download voter DB: {e}")
+        return False
+
 def _init_voter_db():
-    """Find and open the voter SQLite DB. Called once at startup."""
+    """Find, download if needed, and open the voter SQLite DB."""
     global _VOTER_DB_PATH, _voter_db_conn
-    for candidate in [
+
+    # Check all candidate paths
+    candidates = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyc_voters.db"),
         os.path.join(os.getcwd(), "nyc_voters.db"),
         "/app/nyc_voters.db",
-    ]:
-        if os.path.exists(candidate):
-            _VOTER_DB_PATH = candidate
-            # Open in read-only WAL mode; check_same_thread=False for ThreadPoolExecutor
-            _voter_db_conn = _sqlite3.connect(
-                f"file:{candidate}?mode=ro", uri=True,
-                check_same_thread=False
-            )
-            _voter_db_conn.row_factory = _sqlite3.Row
-            # Quick sanity check
-            count = _voter_db_conn.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
-            log.info(f"Voter DB loaded: {count:,} active NYC voters at {candidate}")
+    ]
+
+    db_path = None
+    for candidate in candidates:
+        if os.path.exists(candidate) and _is_real_sqlite(candidate):
+            db_path = candidate
+            break
+        elif os.path.exists(candidate):
+            log.warning(f"{candidate} exists but is not a valid SQLite DB (LFS pointer?) — downloading real file")
+
+    # If not found or invalid, download it
+    if db_path is None:
+        if _download_voter_db():
+            db_path = VOTER_DB_LOCAL_PATH
+        else:
+            log.warning("Voter DB unavailable — voter lookup disabled")
             return
-    log.warning("nyc_voters.db not found — voter lookup disabled")
+
+    try:
+        _VOTER_DB_PATH = db_path
+        _voter_db_conn = _sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True,
+            check_same_thread=False
+        )
+        _voter_db_conn.row_factory = _sqlite3.Row
+        count = _voter_db_conn.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
+        log.info(f"Voter DB loaded: {count:,} active NYC voters at {db_path}")
+    except Exception as e:
+        log.error(f"Failed to open voter DB at {db_path}: {e}")
+        _voter_db_conn = None
 
 
 def _load_voter_file():
@@ -2051,6 +2111,7 @@ async def lifespan(app):
     # Eagerly load LDA registrants CSV and voter file
     _load_lda_registrants()
     _init_voter_db()
+    _build_boe_donor_index()  # pre-warm for find_super_voters
     log.info("=== Ready ===")
     yield
 

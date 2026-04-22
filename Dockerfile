@@ -15,8 +15,8 @@ COPY nys_boe_data/parsed_contributions.csv nys_boe_data/
 # Copy LDA registrants for in-memory cross-reference
 COPY lda_registrants.csv .
 
-# Copy NYC voter SQLite database
-COPY nyc_voters.db .
+# nyc_voters.db is downloaded at startup from GitHub Releases if not present
+# See VOTER_DB_RELEASE_URL in finance_mcp_server.py
 
 # Railway injects PORT at runtime
 ENV PORT=8000
