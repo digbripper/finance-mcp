@@ -1292,20 +1292,26 @@ def _is_real_sqlite(path: str) -> bool:
         return False
 
 def _download_voter_db():
-    """Download nyc_voters.db from GitHub Releases if not present or is an LFS pointer."""
+    """Download nyc_voters.db from GitHub Releases, using GITHUB_TOKEN if set."""
     import urllib.request as _urllib
     path = VOTER_DB_LOCAL_PATH
     if os.path.exists(path) and _is_real_sqlite(path):
         log.info(f"Voter DB already present at {path}")
         return True
     log.info(f"Downloading voter DB from GitHub Releases (~1GB, please wait)...")
+    token = _cfg("GITHUB_TOKEN", "")
+    headers = {"User-Agent": "finance-mcp/1.0", "Accept": "application/octet-stream"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+        log.info("Using GITHUB_TOKEN for authenticated download")
+    else:
+        log.warning("No GITHUB_TOKEN set — download may fail for private repos")
     try:
-        req = _urllib.Request(VOTER_DB_RELEASE_URL,
-                              headers={"User-Agent": "finance-mcp/1.0"})
+        req = _urllib.Request(VOTER_DB_RELEASE_URL, headers=headers)
         with _urllib.urlopen(req, timeout=300) as resp,              open(path, "wb") as out:
             downloaded = 0
             while True:
-                chunk = resp.read(1024 * 1024)  # 1MB chunks
+                chunk = resp.read(1024 * 1024)
                 if not chunk:
                     break
                 out.write(chunk)
