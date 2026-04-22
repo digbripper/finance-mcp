@@ -1332,15 +1332,17 @@ def _is_real_sqlite(path: str) -> bool:
         return False
 
 def _download_voter_db() -> bool:
+    import urllib.request as _ur
     path = VOTER_DB_LOCAL_PATH
     if os.path.exists(path) and _is_real_sqlite(path):
         log.info("Full voter DB already present")
         return True
     log.info("Downloading full voter DB from GitHub Releases (~1GB)...")
     try:
-        req = _urllib_req.Request(VOTER_DB_RELEASE_URL,
-                                  headers={"User-Agent": "finance-mcp/1.0"})
-        with _urllib_req.urlopen(req, timeout=300) as resp,              open(path, "wb") as out:
+        req = _ur.Request(VOTER_DB_RELEASE_URL,
+                          headers={"User-Agent": "finance-mcp/1.0"})
+        with _ur.urlopen(req, timeout=300) as resp, \
+             open(path, "wb") as out:
             downloaded = 0
             while True:
                 chunk = resp.read(1024 * 1024)
