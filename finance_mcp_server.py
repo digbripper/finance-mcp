@@ -311,6 +311,55 @@ def fec_donations_by(donor_name: str, limit: int = 50) -> list[dict]:
 
 # ─── NYC Lobbying (City Clerk eLobbyist, dataset fmf3-knd8) ──────────────────
 
+
+def _extract_role_for_name(targets_str: str, last_name: str,
+                            full_name: str = "") -> list[dict]:
+    """
+    Parse a semicolon-delimited lobbying targets string and extract the
+    role/agency context for each entry matching the given person.
+    Returns [{name_in_filing, role_in_filing, full_entry}].
+    e.g. "Borough President - Brooklyn Evan Thies" ->
+         {name: "Evan Thies", role: "Borough President - Brooklyn"}
+    """
+    import re as _re
+    results = []
+    entries = [e.strip() for e in targets_str.split(";") if e.strip()]
+    last_lower = last_name.lower()
+
+    for entry in entries:
+        if last_lower not in entry.lower():
+            continue
+        matched_name = ""
+        role = ""
+
+        if full_name:
+            parts = full_name.strip().split()
+            if len(parts) >= 2:
+                pattern = _re.compile(
+                    _re.escape(parts[0]) + r"\s+" + _re.escape(parts[-1]),
+                    _re.IGNORECASE
+                )
+                m = pattern.search(entry)
+                if m:
+                    role = entry[:m.start()].strip().rstrip(" -,").strip()
+                    matched_name = entry[m.start():].strip()
+
+        if not matched_name:
+            idx = entry.lower().rfind(last_lower)
+            if idx == -1:
+                continue
+            before_words = entry[:idx].strip().split()
+            first_name = before_words[-1] if before_words else ""
+            role = " ".join(before_words[:-1]).rstrip(" -,").strip() if before_words else ""
+            matched_name = f"{first_name} {last_name}".strip() if first_name else last_name
+
+        results.append({
+            "name_in_filing": matched_name,
+            "role_in_filing":  role or "Unknown",
+            "full_entry":      entry.strip(),
+        })
+    return results
+
 NYC_LOBBYING_ID = "fmf3-knd8"
 NYC_OPEN_DATA   = "https://data.cityofnewyork.us/resource"
 
@@ -369,12 +418,32 @@ def nyc_lobbying_by_client(client_name: str, year: str = "", limit: int = 100) -
         log.warning(f"NYC lobbying by client error: {e}")
         return []
 
-def _dedupe_lobbying(rows: list[dict]) -> list[dict]:
-    """Collapse multiple period filings into one entry per client+lobbyist+year."""
+def _dedupe_lobbying(rows: list[dict], subject_name: str = "") -> list[dict]:
+    """Collapse multiple period filings into one entry per client+lobbyist+year.
+    Extracts role/position context for the subject from the targets string."""
     seen: dict[str, dict] = {}
     for row in rows:
         key = f"{row.get('client_name','')}|{row.get('lobbyist_name','')}|{row.get('report_year','')}"
         if key not in seen:
+            # Extract how the subject is listed in this filing
+            subject_roles: list[dict] = []
+            if subject_name:
+                last = subject_name.strip().split()[-1]
+                for field in ["lobbyist_targets", "periodic_targets"]:
+                    val = row.get(field) or ""
+                    if val:
+                        matches = _extract_role_for_name(val, last, subject_name)
+                        subject_roles.extend(matches)
+                # Dedupe roles
+                seen_roles = set()
+                unique_roles = []
+                for r in subject_roles:
+                    k = r["role_in_filing"]
+                    if k not in seen_roles:
+                        seen_roles.add(k)
+                        unique_roles.append(r)
+                subject_roles = unique_roles
+
             seen[key] = {
                 "lobbyist_name":    (row.get("lobbyist_name") or "").strip(),
                 "client_name":      (row.get("client_name") or "").strip(),
@@ -384,6 +453,7 @@ def _dedupe_lobbying(rows: list[dict]) -> list[dict]:
                 "activities":       row.get("lobbyist_activities") or row.get("periodic_activities") or "",
                 "lobbyist_po":      (row.get("lobbyist_po") or "").strip(),
                 "client_po":        (row.get("client_po") or "").strip(),
+                "subject_roles":    subject_roles,   # how the subject is listed
             }
         try:
             seen[key]["compensation"] += float(row.get("compensation_total") or 0)
@@ -1679,11 +1749,19 @@ def get_person_profile(person_name: str) -> dict:
     # ── NYC lobbying targeting this person ────────────────────────────────────
     try:
         nyc_rows = nyc_lobbying_targets(person_name)
-        deduped = _dedupe_lobbying(nyc_rows)
+        deduped = _dedupe_lobbying(nyc_rows, person_name)
         profile["lobbied_by_nyc"] = [
-            {"lobbyist": r["lobbyist_name"], "client": r["client_name"],
-             "year": r["year"], "compensation": r["compensation"],
-             "activities": r["activities"][:150]}
+            {
+                "lobbyist": r["lobbyist_name"],
+                "client": r["client_name"],
+                "year": r["year"],
+                "compensation": r["compensation"],
+                "activities": r["activities"][:150] if r["activities"] else "",
+                "listed_as": "; ".join(
+                    x["role_in_filing"] for x in r.get("subject_roles", [])
+                    if x.get("role_in_filing") and x["role_in_filing"] != "Unknown"
+                ) or "Lobbying target",
+            }
             for r in deduped[:20]
         ]
     except Exception as e:
@@ -1910,10 +1988,16 @@ def enrich_person(person_name: str) -> dict:
         log.info(f"Processing NYC lobbying data for {person_name}...")
         lobby_rows = f_nyc_lobby.result() or []
         log.info(f"Got {len(lobby_rows)} raw NYC lobbying rows")
-        deduped_lobbying = _dedupe_lobbying(lobby_rows)
+        deduped_lobbying = _dedupe_lobbying(lobby_rows, person_name)
         log.info(f"Deduped to {len(deduped_lobbying)} unique client/lobbyist pairs")
 
         for item in deduped_lobbying[:50]:
+            # Summarize how subject is listed in this filing
+            roles = item.get("subject_roles", [])
+            role_summary = "; ".join(
+                r["role_in_filing"] for r in roles if r.get("role_in_filing") and r["role_in_filing"] != "Unknown"
+            ) if roles else ""
+
             entry = {
                 "lobbyist": item["lobbyist_name"],
                 "client": item["client_name"],
@@ -1921,6 +2005,8 @@ def enrich_person(person_name: str) -> dict:
                 "year": item["year"],
                 "compensation": item["compensation"],
                 "activities": item["activities"][:200] if item["activities"] else "",
+                "subject_listed_as": role_summary or "Lobbying target",
+                "subject_roles_detail": roles,
                 "lobbyist_in_db": False,
                 "client_in_db": False,
                 "lobbyist_person_id": None,
