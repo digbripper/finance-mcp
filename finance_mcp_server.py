@@ -1574,6 +1574,135 @@ def find_super_voters(
 
     return results[:limit]
 
+
+# ─── Person profile — works for anyone, Pythia or not ────────────────────────
+
+def get_person_profile(person_name: str) -> dict:
+    """
+    Build a full profile for any person by name.
+    Does NOT require them to be in the Pythia DB.
+    Pulls from: voter file, BOE donations, CFB donations, NYC/NYS lobbying,
+                FEC donors (if federal official), Pythia DB (if matched).
+    """
+    profile = {
+        "name": person_name,
+        "in_pythia": False,
+        "pythia_id": None,
+        "pythia_orgs": None,
+        "voter_profile": None,
+        "donations_made": [],        # campaigns they donated to
+        "donations_received": [],    # donors to them (if official)
+        "lobbied_by_nyc": [],
+        "lobbied_by_nys": [],
+        "boe_donor_summary": None,
+    }
+
+    # ── Voter file lookup ─────────────────────────────────────────────────────
+    voter = lookup_voter(person_name)
+    if voter:
+        party_label = PARTY_LABELS.get(
+            voter.get("party", voter.get("party_code", "")),
+            voter.get("party", voter.get("party_code", ""))
+        )
+        profile["voter_profile"] = {
+            "registered_party":        party_label,
+            "party_code":              voter.get("party", voter.get("party_code", "")),
+            "address":                 voter.get("address", ""),
+            "city":                    voter.get("city", ""),
+            "zip":                     voter.get("zip", ""),
+            "county":                  voter.get("county", voter.get("county_name", "")),
+            "congressional_district":  voter.get("cd", ""),
+            "state_senate_district":   voter.get("sd", ""),
+            "assembly_district":       voter.get("ad", ""),
+            "registered_since":        voter.get("regdate", ""),
+            "general_elections_voted": voter.get("ge_votes", voter.get("general_elections_voted", 0)),
+            "primaries_voted":         voter.get("primary_votes", voter.get("primaries_voted", 0)),
+            "voter_score":             voter.get("voter_score", 0),
+        }
+
+    # ── Pythia DB lookup ──────────────────────────────────────────────────────
+    try:
+        contacts = get_all_contacts()
+        index, keys = build_index(contacts)
+        subject, score = best_match(person_name, index, keys)
+        if subject and score >= 82:
+            profile["in_pythia"]    = True
+            profile["pythia_id"]    = subject["id"]
+            profile["pythia_orgs"]  = subject.get("orgs")
+            profile["pythia_name"]  = subject.get("_display")
+    except Exception as e:
+        log.warning(f"Pythia lookup failed for {person_name}: {e}")
+
+    # ── BOE donations MADE by this person ─────────────────────────────────────
+    try:
+        boe_rows = boe_donations_by(person_name)
+        if boe_rows:
+            rmap: dict[str, dict] = {}
+            for row in boe_rows:
+                c = (row.get("candidate_name") or "").strip()
+                if c:
+                    if c not in rmap:
+                        rmap[c] = {"amount": 0.0,
+                                   "year": row.get("election_year") or "",
+                                   "source": "NYS BOE"}
+                    rmap[c]["amount"] += float(row.get("amount") or 0)
+            profile["donations_made"] = sorted(
+                [{"candidate": c, **v} for c, v in rmap.items()],
+                key=lambda x: -x["amount"]
+            )
+            total = sum(r["amount"] for r in profile["donations_made"])
+            profile["boe_donor_summary"] = {
+                "total_donated": round(total, 2),
+                "num_candidates": len(rmap),
+                "source": "NYS BOE",
+            }
+    except Exception as e:
+        log.warning(f"BOE donations lookup failed: {e}")
+
+    # ── CFB donations MADE ────────────────────────────────────────────────────
+    try:
+        cfb_rows = cfb_donations_made(person_name)
+        for row in cfb_rows:
+            c = (row.get("candidate_name") or "").strip()
+            if c:
+                profile["donations_made"].append({
+                    "candidate": c,
+                    "amount": float(row.get("amount") or 0),
+                    "year": (row.get("date") or "")[:4],
+                    "source": "NYC CFB",
+                })
+        profile["donations_made"].sort(key=lambda x: -x["amount"])
+    except Exception as e:
+        log.warning(f"CFB donations lookup failed: {e}")
+
+    # ── NYC lobbying targeting this person ────────────────────────────────────
+    try:
+        nyc_rows = nyc_lobbying_targets(person_name)
+        deduped = _dedupe_lobbying(nyc_rows)
+        profile["lobbied_by_nyc"] = [
+            {"lobbyist": r["lobbyist_name"], "client": r["client_name"],
+             "year": r["year"], "compensation": r["compensation"],
+             "activities": r["activities"][:150]}
+            for r in deduped[:20]
+        ]
+    except Exception as e:
+        log.warning(f"NYC lobbying lookup failed: {e}")
+
+    # ── NYS lobbying targeting this person ────────────────────────────────────
+    try:
+        nys_rows = nys_lobbying_targets(person_name)
+        nys_deduped = _dedupe_nys_lobbying(nys_rows)
+        profile["lobbied_by_nys"] = [
+            {"lobbyist": r["lobbyist_name"], "client": r["client_name"],
+             "year": r["year"], "compensation": r["compensation"],
+             "subjects": r["subjects"][:150]}
+            for r in nys_deduped[:20]
+        ]
+    except Exception as e:
+        log.warning(f"NYS lobbying lookup failed: {e}")
+
+    return profile
+
 # ─── Core enrichment ──────────────────────────────────────────────────────────
 
 def enrich_person(person_name: str) -> dict:
@@ -1752,22 +1881,23 @@ def enrich_person(person_name: str) -> dict:
     # ── Voter file cross-reference ────────────────────────────────────────────
     voter = lookup_voter(person_name)
     if voter:
-        party_label = PARTY_LABELS.get(voter["party"], voter["party"])
+        party_code  = voter.get("party") or voter.get("party_code") or ""
+        party_label = PARTY_LABELS.get(party_code, party_code)
         findings["voter_profile"] = {
-            "registered_party":  party_label,
-            "party_code":        voter["party"],
-            "address":           voter["address"],
-            "city":              voter["city"],
-            "zip":               voter["zip"],
-            "county":            voter["county"],
-            "congressional_district": voter["cd"],
-            "state_senate_district":  voter["sd"],
-            "assembly_district":      voter["ad"],
-            "registered_since":  voter["regdate"],
-            "general_elections_voted": voter["ge_votes"],
-            "primaries_voted":   voter["primary_votes"],
-            "voter_score":       voter["voter_score"],
-            "sboeid":            voter["sboeid"],
+            "registered_party":       party_label,
+            "party_code":             party_code,
+            "address":                voter.get("address", ""),
+            "city":                   voter.get("city", ""),
+            "zip":                    voter.get("zip", ""),
+            "county":                 voter.get("county") or voter.get("county_name", ""),
+            "congressional_district": voter.get("cd", ""),
+            "state_senate_district":  voter.get("sd", ""),
+            "assembly_district":      voter.get("ad", ""),
+            "registered_since":       voter.get("regdate", ""),
+            "general_elections_voted":voter.get("ge_votes") or voter.get("general_elections_voted", 0),
+            "primaries_voted":        voter.get("primary_votes") or voter.get("primaries_voted", 0),
+            "voter_score":            voter.get("voter_score", 0),
+            "sboeid":                 voter.get("sboeid", ""),
         }
         log.info(f"Voter match for {person_name}: {party_label}, "
                  f"score={voter['voter_score']}, GE={voter['ge_votes']}")
@@ -1941,6 +2071,24 @@ async def list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="get_person_profile",
+            description=(
+                "Get a comprehensive profile for ANY person by name — they do NOT need to be "
+                "in the Pythia contacts database. Returns: voter registration (party, voting "
+                "history, districts), campaign donations they made (BOE + CFB), lobbying "
+                "activity targeting them (NYC + NYS), and Pythia DB match if one exists. "
+                "Use this when you want a full picture of someone's political engagement and "
+                "financial history without needing them to already be in the system."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "person_name": {"type": "string", "description": "Full name of the person"},
+                },
+                "required": ["person_name"]
+            }
+        ),
+        types.Tool(
             name="find_super_voters",
             description=(
                 "Find high-engagement NYC voters in a given county or district, "
@@ -2064,6 +2212,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 limit=int(arguments.get("limit", 50)),
             ))
             return [types.TextContent(type="text", text=json.dumps(results, indent=2, default=str))]
+
+        elif name == "get_person_profile":
+            log.info(f"get_person_profile: {arguments.get('person_name')}")
+            profile = await loop.run_in_executor(
+                None, get_person_profile, arguments["person_name"]
+            )
+            return [types.TextContent(type="text", text=json.dumps(profile, indent=2, default=str))]
 
         else:
             return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
