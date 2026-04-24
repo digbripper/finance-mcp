@@ -1269,6 +1269,7 @@ _VOTER_DB_LOCK = _threading.Lock()
 
 _VOTER_INDEX: dict[str, list[dict]] = {}   # LASTNAME -> [voter dicts]
 _VOTER_LOADED = False
+_voter_db_conn = None  # set by _init_voter_db once SQLite DB is ready
 
 PARTY_LABELS = {
     "DEM": "Democrat", "REP": "Republican", "CON": "Conservative",
