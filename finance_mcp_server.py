@@ -1668,8 +1668,18 @@ def get_person_profile(person_name: str) -> dict:
         "boe_donor_summary": None,
     }
 
+    # ── Fire all HTTP lookups in parallel ────────────────────────────────────
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=6) as _pool:
+        _f_voter    = _pool.submit(lookup_voter, person_name)
+        _f_boe_made = _pool.submit(boe_donations_by, person_name)
+        _f_cfb_made = _pool.submit(cfb_donations_made, person_name)
+        _f_nyc_lob  = _pool.submit(nyc_lobbying_targets, person_name)
+        _f_nys_lob  = _pool.submit(nys_lobbying_targets, person_name)
+        _f_contacts = _pool.submit(get_all_contacts)
+
     # ── Voter file lookup ─────────────────────────────────────────────────────
-    voter = lookup_voter(person_name)
+    voter = _f_voter.result()
     if voter:
         party_label = PARTY_LABELS.get(
             voter.get("party", voter.get("party_code", "")),
@@ -1693,7 +1703,7 @@ def get_person_profile(person_name: str) -> dict:
 
     # ── Pythia DB lookup ──────────────────────────────────────────────────────
     try:
-        contacts = get_all_contacts()
+        contacts = _f_contacts.result()
         index, keys = build_index(contacts)
         subject, score = best_match(person_name, index, keys)
         if subject and score >= 82:
@@ -1706,7 +1716,7 @@ def get_person_profile(person_name: str) -> dict:
 
     # ── BOE donations MADE by this person ─────────────────────────────────────
     try:
-        boe_rows = boe_donations_by(person_name)
+        boe_rows = _f_boe_made.result() or []
         if boe_rows:
             rmap: dict[str, dict] = {}
             for row in boe_rows:
@@ -1732,7 +1742,7 @@ def get_person_profile(person_name: str) -> dict:
 
     # ── CFB donations MADE ────────────────────────────────────────────────────
     try:
-        cfb_rows = cfb_donations_made(person_name)
+        cfb_rows = _f_cfb_made.result() or []
         for row in cfb_rows:
             c = (row.get("candidate_name") or "").strip()
             if c:
@@ -1748,7 +1758,7 @@ def get_person_profile(person_name: str) -> dict:
 
     # ── NYC lobbying targeting this person ────────────────────────────────────
     try:
-        nyc_rows = nyc_lobbying_targets(person_name)
+        nyc_rows = _f_nyc_lob.result() or []
         deduped = _dedupe_lobbying(nyc_rows, person_name)
         profile["lobbied_by_nyc"] = [
             {
@@ -1769,7 +1779,7 @@ def get_person_profile(person_name: str) -> dict:
 
     # ── NYS lobbying targeting this person ────────────────────────────────────
     try:
-        nys_rows = nys_lobbying_targets(person_name)
+        nys_rows = _f_nys_lob.result() or []
         nys_deduped = _dedupe_nys_lobbying(nys_rows)
         profile["lobbied_by_nys"] = [
             {"lobbyist": r["lobbyist_name"], "client": r["client_name"],
