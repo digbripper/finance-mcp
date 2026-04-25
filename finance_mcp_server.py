@@ -1354,25 +1354,57 @@ PARTY_LABELS = {
 _VOTER_TUPLES: list[tuple] = []
 
 def _load_voter_file():
-    """Load super voters CSV into compact tuple list — ~35MB vs 200MB for full dicts."""
+    """
+    Find or download the super voters CSV, then load into compact tuple index.
+    Downloads from GitHub Releases if not present or is an LFS pointer (<1MB).
+    """
     global _VOTER_LOADED, _SUPER_VOTERS_CSV_PATH, _VOTER_TUPLES
     if _VOTER_LOADED:
         return
+
+    # Find CSV — must be >1MB (LFS pointer files are ~130 bytes)
+    csv_path = None
     for _candidate in [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyc_super_voters.csv"),
         os.path.join(os.getcwd(), "nyc_super_voters.csv"),
-        "/app/nyc_super_voters.csv",
+        VOTER_CSV_LOCAL_PATH,
     ]:
-        if os.path.exists(_candidate):
-            _SUPER_VOTERS_CSV_PATH = _candidate
+        if os.path.exists(_candidate) and os.path.getsize(_candidate) > 1_000_000:
+            csv_path = _candidate
+            log.info(f"Super voters CSV found at {_candidate}")
             break
-    else:
-        log.warning("nyc_super_voters.csv not found")
-        _VOTER_LOADED = True
-        return
+        elif os.path.exists(_candidate):
+            log.warning(f"{_candidate} exists but is tiny ({os.path.getsize(_candidate)} bytes) — likely LFS pointer")
 
+    # Download from GitHub Releases if not found
+    if csv_path is None:
+        import urllib.request as _ur
+        log.info("Downloading super voters CSV from GitHub Releases (~138MB)...")
+        try:
+            req = _ur.Request(VOTER_CSV_RELEASE_URL,
+                              headers={"User-Agent": "finance-mcp/1.0"})
+            tmp = VOTER_CSV_LOCAL_PATH + ".tmp"
+            with _ur.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+                downloaded = 0
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    downloaded += len(chunk)
+            os.replace(tmp, VOTER_CSV_LOCAL_PATH)
+            log.info(f"CSV download complete ({downloaded // (1024*1024)}MB)")
+            csv_path = VOTER_CSV_LOCAL_PATH
+        except Exception as e:
+            log.error(f"Failed to download super voters CSV: {e}")
+            _VOTER_LOADED = True
+            return
+
+    _SUPER_VOTERS_CSV_PATH = csv_path
+
+    # Load into compact tuple index
     count = 0
-    with open(_SUPER_VOTERS_CSV_PATH, newline="", encoding="utf-8") as f:
+    with open(csv_path, newline="", encoding="utf-8") as f:
         for row in _vcsv.DictReader(f):
             _VOTER_TUPLES.append((
                 row.get("COUNTY_CODE",""),                     # 0
@@ -1397,11 +1429,18 @@ def _load_voter_file():
     log.info(f"Loaded {count:,} NYC super voters into compact index")
     _VOTER_LOADED = True
 
+
 VOTER_DB_RELEASE_URL = (
     "https://github.com/digbripper/finance-mcp"
     "/releases/download/v1.1-voter-db/nyc_voters.db"
 )
 VOTER_DB_LOCAL_PATH = "/app/nyc_voters.db"
+
+VOTER_CSV_RELEASE_URL = (
+    "https://github.com/digbripper/finance-mcp"
+    "/releases/download/v1.1-voter-db/nyc_super_voters.csv"
+)
+VOTER_CSV_LOCAL_PATH = "/app/nyc_super_voters.csv"
 
 def _is_real_sqlite(path: str) -> bool:
     try:
