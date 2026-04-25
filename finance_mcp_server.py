@@ -1348,9 +1348,14 @@ PARTY_LABELS = {
     "GRE": "Green", "LBT": "Libertarian", "IND": "Independence",
 }
 
+# Compact voter index: list of tuples for fast filtering
+# Fields: (county_code, party, ad, sd, cd, voter_score, last, first,
+#           dob, address, city, zip, regdate, ge_votes, primary_votes, sboeid)
+_VOTER_TUPLES: list[tuple] = []
+
 def _load_voter_file():
-    """Find the super voters CSV path — does NOT load into memory to save RAM."""
-    global _VOTER_LOADED, _SUPER_VOTERS_CSV_PATH
+    """Load super voters CSV into compact tuple list — ~35MB vs 200MB for full dicts."""
+    global _VOTER_LOADED, _SUPER_VOTERS_CSV_PATH, _VOTER_TUPLES
     if _VOTER_LOADED:
         return
     for _candidate in [
@@ -1360,10 +1365,35 @@ def _load_voter_file():
     ]:
         if os.path.exists(_candidate):
             _SUPER_VOTERS_CSV_PATH = _candidate
-            log.info(f"Super voters CSV ready at {_candidate} (disk streaming mode)")
             break
     else:
         log.warning("nyc_super_voters.csv not found")
+        _VOTER_LOADED = True
+        return
+
+    count = 0
+    with open(_SUPER_VOTERS_CSV_PATH, newline="", encoding="utf-8") as f:
+        for row in _vcsv.DictReader(f):
+            _VOTER_TUPLES.append((
+                row.get("COUNTY_CODE",""),          # 0
+                row.get("PARTY",""),                # 1
+                (row.get("AD","")).lstrip("0"),     # 2
+                (row.get("SD","")).lstrip("0"),     # 3
+                (row.get("CD","")).lstrip("0"),     # 4
+                int(row.get("VOTER_SCORE") or 0),  # 5
+                (row.get("LASTNAME") or "").strip().upper(),   # 6
+                (row.get("FIRSTNAME") or "").strip().upper(),  # 7
+                row.get("DOB",""),                  # 8
+                row.get("ADDRESS",""),              # 9
+                row.get("CITY",""),                 # 10
+                row.get("ZIP",""),                  # 11
+                row.get("REGDATE",""),              # 12
+                int(row.get("GE_VOTES") or 0),     # 13
+                int(row.get("PRIMARY_VOTES") or 0),# 14
+                row.get("SBOEID",""),               # 15
+            ))
+            count += 1
+    log.info(f"Loaded {count:,} NYC super voters into compact index")
     _VOTER_LOADED = True
 
 VOTER_DB_RELEASE_URL = (
@@ -1484,41 +1514,28 @@ def lookup_voter(full_name: str, dob: str = "") -> dict | None:
         except Exception as e:
             log.warning(f"Voter DB lookup error: {e}")
 
-    # ── CSV streaming fallback (416k super voters) ────────────────────────────
+    # ── Tuple index fallback (416k super voters, fast in-memory scan) ──────────
     _load_voter_file()
-    if not _SUPER_VOTERS_CSV_PATH:
+    if not _VOTER_TUPLES:
         return None
-    try:
-        best, best_score = None, 0
-        with open(_SUPER_VOTERS_CSV_PATH, newline="", encoding="utf-8") as f:
-            for row in _vcsv.DictReader(f):
-                if (row.get("LASTNAME") or "").strip().upper() != last:
-                    continue
-                score = 10
-                rfirst = (row.get("FIRSTNAME") or "").strip().upper()
-                if first:
-                    if rfirst == first:           score += 12
-                    elif rfirst.startswith(first[:3]): score += 6
-                if dob and row.get("DOB", "") == dob: score += 20
-                if score > best_score:
-                    best_score = score
-                    best = {
-                        "last": last, "first": rfirst,
-                        "dob": row.get("DOB",""), "party": row.get("PARTY",""),
-                        "address": row.get("ADDRESS",""), "city": row.get("CITY",""),
-                        "zip": row.get("ZIP",""), "county_code": row.get("COUNTY_CODE",""),
-                        "county": row.get("COUNTY_NAME",""),
-                        "cd": row.get("CD",""), "sd": row.get("SD",""), "ad": row.get("AD",""),
-                        "regdate": row.get("REGDATE",""),
-                        "ge_votes": int(row.get("GE_VOTES") or 0),
-                        "primary_votes": int(row.get("PRIMARY_VOTES") or 0),
-                        "voter_score": int(row.get("VOTER_SCORE") or 0),
-                        "sboeid": row.get("SBOEID",""),
-                    }
-        return best if best_score >= 16 else None
-    except Exception as e:
-        log.warning(f"CSV voter lookup error: {e}")
-        return None
+    best, best_score = None, 0
+    for t in _VOTER_TUPLES:
+        if t[6] != last:
+            continue
+        score = 10
+        if first:
+            if t[7] == first:              score += 12
+            elif t[7].startswith(first[:3]): score += 6
+        if dob and t[8] == dob:            score += 20
+        if score > best_score:
+            best_score = score
+            best = {"last": t[6], "first": t[7], "dob": t[8], "party": t[1],
+                    "address": t[9], "city": t[10], "zip": t[11],
+                    "county_code": t[0], "county": t[10],
+                    "cd": t[4], "sd": t[3], "ad": t[2], "regdate": t[12],
+                    "ge_votes": t[13], "primary_votes": t[14], "voter_score": t[5],
+                    "sboeid": t[15]}
+    return best if best_score >= 16 else None
 
 
 
@@ -1601,38 +1618,24 @@ def find_super_voters(
         except Exception as e:
             log.warning(f"find_super_voters SQLite error: {e}")
 
-    # ── CSV streaming fallback ────────────────────────────────────────────────
-    if not rows and _SUPER_VOTERS_CSV_PATH:
-        try:
-            with open(_SUPER_VOTERS_CSV_PATH, newline="", encoding="utf-8") as f:
-                for row in _vcsv.DictReader(f):
-                    if row.get("COUNTY_CODE","") != county_code: continue
-                    score = int(row.get("VOTER_SCORE") or 0)
-                    if score < min_voter_score: continue
-                    if party_code and row.get("PARTY","") != party_code: continue
-                    if ad_str and (row.get("AD","")).lstrip("0") != ad_str: continue
-                    if sd_str and (row.get("SD","")).lstrip("0") != sd_str: continue
-                    if cd_str and (row.get("CD","")).lstrip("0") != cd_str: continue
-                    rows.append({
-                        "last": (row.get("LASTNAME") or "").strip().upper(),
-                        "first": (row.get("FIRSTNAME") or "").strip().upper(),
-                        "dob": row.get("DOB",""), "party": row.get("PARTY",""),
-                        "address": row.get("ADDRESS",""), "city": row.get("CITY",""),
-                        "zip": row.get("ZIP",""), "county_code": row.get("COUNTY_CODE",""),
-                        "county": row.get("COUNTY_NAME",""),
-                        "cd": row.get("CD",""), "sd": row.get("SD",""), "ad": row.get("AD",""),
-                        "regdate": row.get("REGDATE",""),
-                        "ge_votes": int(row.get("GE_VOTES") or 0),
-                        "primary_votes": int(row.get("PRIMARY_VOTES") or 0),
-                        "voter_score": score,
-                    })
-                    if len(rows) >= fetch_limit:
-                        break
-            rows.sort(key=lambda x: -x.get("voter_score", 0))
-            log.info(f"find_super_voters (CSV): {len(rows)} rows for {county}")
-        except Exception as e:
-            log.warning(f"find_super_voters CSV error: {e}")
-            return [{"error": str(e)}]
+    # ── Tuple index fallback (in-memory, fast) ───────────────────────────────
+    if not rows and _VOTER_TUPLES:
+        for t in _VOTER_TUPLES:
+            if t[0] != county_code: continue
+            if t[5] < min_voter_score: continue
+            if party_code and t[1] != party_code: continue
+            if ad_str and t[2] != ad_str: continue
+            if sd_str and t[3] != sd_str: continue
+            if cd_str and t[4] != cd_str: continue
+            rows.append({"last": t[6], "first": t[7], "dob": t[8], "party": t[1],
+                         "address": t[9], "city": t[10], "zip": t[11],
+                         "county_code": t[0], "county": "",
+                         "cd": t[4], "sd": t[3], "ad": t[2], "regdate": t[12],
+                         "ge_votes": t[13], "primary_votes": t[14], "voter_score": t[5]})
+            if len(rows) >= fetch_limit:
+                break
+        rows.sort(key=lambda x: -x.get("voter_score", 0))
+        log.info(f"find_super_voters (tuple index): {len(rows)} rows for {county}")
 
     if not rows:
         return [{"error": "Voter data not yet available — SQLite DB is still downloading. Try again in a few minutes."}]
