@@ -1375,22 +1375,23 @@ def _load_voter_file():
     with open(_SUPER_VOTERS_CSV_PATH, newline="", encoding="utf-8") as f:
         for row in _vcsv.DictReader(f):
             _VOTER_TUPLES.append((
-                row.get("COUNTY_CODE",""),          # 0
-                row.get("PARTY",""),                # 1
-                (row.get("AD","")).lstrip("0"),     # 2
-                (row.get("SD","")).lstrip("0"),     # 3
-                (row.get("CD","")).lstrip("0"),     # 4
-                int(row.get("VOTER_SCORE") or 0),  # 5
+                row.get("COUNTY_CODE",""),                     # 0
+                row.get("PARTY",""),                           # 1
+                (row.get("AD","")).lstrip("0"),                # 2
+                (row.get("SD","")).lstrip("0"),                # 3
+                (row.get("CD","")).lstrip("0"),                # 4
+                int(row.get("VOTER_SCORE") or 0),             # 5
                 (row.get("LASTNAME") or "").strip().upper(),   # 6
                 (row.get("FIRSTNAME") or "").strip().upper(),  # 7
-                row.get("DOB",""),                  # 8
-                row.get("ADDRESS",""),              # 9
-                row.get("CITY",""),                 # 10
-                row.get("ZIP",""),                  # 11
-                row.get("REGDATE",""),              # 12
-                int(row.get("GE_VOTES") or 0),     # 13
-                int(row.get("PRIMARY_VOTES") or 0),# 14
-                row.get("SBOEID",""),               # 15
+                row.get("DOB",""),                             # 8
+                row.get("ADDRESS",""),                         # 9
+                row.get("CITY",""),                            # 10
+                row.get("ZIP",""),                             # 11
+                row.get("REGDATE",""),                         # 12
+                int(row.get("GE_VOTES") or 0),                # 13
+                int(row.get("PRIMARY_VOTES") or 0),           # 14
+                row.get("SBOEID",""),                          # 15
+                (row.get("COUNCIL_DISTRICT","")).lstrip("0"),  # 16
             ))
             count += 1
     log.info(f"Loaded {count:,} NYC super voters into compact index")
@@ -1398,7 +1399,7 @@ def _load_voter_file():
 
 VOTER_DB_RELEASE_URL = (
     "https://github.com/digbripper/finance-mcp"
-    "/releases/download/v1.0-voter-db/nyc_voters.db"
+    "/releases/download/v1.1-voter-db/nyc_voters.db"
 )
 VOTER_DB_LOCAL_PATH = "/app/nyc_voters.db"
 
@@ -1502,7 +1503,10 @@ def lookup_voter(full_name: str, dob: str = "") -> dict | None:
                     if row:
                         return dict(row)
                 rows = _voter_db_conn.execute(
-                    "SELECT * FROM voters WHERE lastname=? AND firstname LIKE ? "
+                    "SELECT sboeid,lastname,firstname,dob,party,address,city,zip,"
+                    "county_code,county_name,cd,sd,ad,council_district,regdate,"
+                    "ge_votes,primary_votes,voter_score,ge_years,primary_years "
+                    "FROM voters WHERE lastname=? AND firstname LIKE ? "
                     "ORDER BY voter_score DESC LIMIT 5",
                     (last, first[:3] + "%") if first else (last, "%")
                 ).fetchall()
@@ -1558,12 +1562,14 @@ def find_super_voters(
     assembly_district: str = "",
     state_senate_district: str = "",
     congressional_district: str = "",
+    council_district: str = "",
     cross_reference_finance: bool = True,
     limit: int = 50,
 ) -> list[dict]:
     """
     Find high-engagement NYC voters. Uses SQLite DB if available, streams CSV otherwise.
-    Filters by county, party, district, voter score. Cross-references BOE finance data.
+    Filters by county, party, assembly/senate/congressional/council district,
+    voter score. Cross-references BOE finance data.
     """
     _load_voter_file()
 
@@ -1578,9 +1584,10 @@ def find_super_voters(
                  "WORKING FAMILIES": "WOR", "NO PARTY": "BLK", "INDEPENDENT": "BLK"}
     party_code = party_map.get(party.upper(), party.upper()[:3]) if party else ""
 
-    ad_str = str(assembly_district).lstrip("0") if assembly_district else ""
-    sd_str = str(state_senate_district).lstrip("0") if state_senate_district else ""
-    cd_str = str(congressional_district).lstrip("0") if congressional_district else ""
+    ad_str  = str(assembly_district).lstrip("0") if assembly_district else ""
+    sd_str  = str(state_senate_district).lstrip("0") if state_senate_district else ""
+    cd_str  = str(congressional_district).lstrip("0") if congressional_district else ""
+    ccd_str = str(council_district).lstrip("0") if council_district else ""
 
     fetch_limit = limit * 3 if cross_reference_finance else limit
     rows = []
@@ -1589,7 +1596,8 @@ def find_super_voters(
     if _voter_db_conn is not None:
         try:
             sql = ("SELECT sboeid,lastname,firstname,dob,party,address,city,zip,"
-                   "county_code,county_name,cd,sd,ad,regdate,ge_votes,primary_votes,voter_score "
+                   "county_code,county_name,cd,sd,ad,council_district,regdate,"
+                   "ge_votes,primary_votes,voter_score,ge_years,primary_years "
                    "FROM voters WHERE county_code=? AND voter_score>=?")
             params: list = [county_code, min_voter_score]
             if party_code:
@@ -1600,6 +1608,8 @@ def find_super_voters(
                 sql += " AND CAST(LTRIM(sd,'0') AS TEXT)=?"; params.append(sd_str)
             if cd_str:
                 sql += " AND CAST(LTRIM(cd,'0') AS TEXT)=?"; params.append(cd_str)
+            if ccd_str:
+                sql += " AND CAST(LTRIM(council_district,'0') AS TEXT)=?"; params.append(ccd_str)
             sql += " ORDER BY voter_score DESC LIMIT ?"
             params.append(fetch_limit)
             with _VOTER_DB_LOCK:
@@ -1611,8 +1621,10 @@ def find_super_voters(
                     "address": r["address"], "city": r["city"], "zip": r["zip"],
                     "county_code": r["county_code"], "county": r.get("county_name",""),
                     "cd": r["cd"], "sd": r["sd"], "ad": r["ad"],
+                    "council_district": r.get("council_district",""),
                     "regdate": r["regdate"], "ge_votes": r["ge_votes"],
                     "primary_votes": r["primary_votes"], "voter_score": r["voter_score"],
+                    "ge_years": r.get("ge_years",""), "primary_years": r.get("primary_years",""),
                 })
             log.info(f"find_super_voters (SQLite): {len(rows)} rows for {county}")
         except Exception as e:
@@ -1627,11 +1639,15 @@ def find_super_voters(
             if ad_str and t[2] != ad_str: continue
             if sd_str and t[3] != sd_str: continue
             if cd_str and t[4] != cd_str: continue
+            if ccd_str and t[16] != ccd_str: continue
             rows.append({"last": t[6], "first": t[7], "dob": t[8], "party": t[1],
                          "address": t[9], "city": t[10], "zip": t[11],
                          "county_code": t[0], "county": "",
-                         "cd": t[4], "sd": t[3], "ad": t[2], "regdate": t[12],
-                         "ge_votes": t[13], "primary_votes": t[14], "voter_score": t[5]})
+                         "cd": t[4], "sd": t[3], "ad": t[2],
+                         "council_district": t[16] if len(t) > 16 else "",
+                         "regdate": t[12],
+                         "ge_votes": t[13], "primary_votes": t[14], "voter_score": t[5],
+                         "ge_years": "", "primary_years": ""})
             if len(rows) >= fetch_limit:
                 break
         rows.sort(key=lambda x: -x.get("voter_score", 0))
@@ -1662,10 +1678,13 @@ def find_super_voters(
             "assembly_district": v.get("ad",""),
             "state_senate_district": v.get("sd",""),
             "congressional_district": v.get("cd",""),
+            "council_district": v.get("council_district",""),
             "registered_since": v.get("regdate",""),
             "general_elections_voted": v.get("ge_votes",0),
             "primaries_voted": v.get("primary_votes",0),
             "voter_score": v.get("voter_score",0),
+            "ge_years": v.get("ge_years",""),
+            "primary_years": v.get("primary_years",""),
             "total_donated": 0.0,
             "donation_count": 0,
             "top_candidates": [],
@@ -2243,10 +2262,11 @@ async def list_tools() -> list[types.Tool]:
                 "also significant donors. Useful for identifying politically active "
                 "individuals with financial influence. "
                 "Filter by county (manhattan/brooklyn/queens/bronx/staten island), "
-                "party (DEM/REP/WOR etc), assembly district, senate district, "
-                "congressional district, and minimum voter score. "
-                "Returns voters sorted by donation total, with their voting history, "
-                "party, address, districts, and top campaign contributions."
+                "party (DEM/REP/WOR etc), assembly district, state senate district, "
+                "congressional district, NYC council district, and minimum voter score. "
+                "Returns voters sorted by donation total, with their voting history "
+                "(including exact years voted in generals and primaries), "
+                "party, address, all district assignments, and top campaign contributions."
             ),
             inputSchema={
                 "type": "object",
@@ -2257,6 +2277,7 @@ async def list_tools() -> list[types.Tool]:
                     "assembly_district": {"type": "string", "description": "Assembly district number. Optional."},
                     "state_senate_district": {"type": "string", "description": "State senate district number. Optional."},
                     "congressional_district": {"type": "string", "description": "Congressional district number. Optional."},
+                    "council_district": {"type": "string", "description": "NYC Council district number. Optional."},
                     "cross_reference_finance": {"type": "boolean", "description": "Cross-reference with BOE donation data. Default true."},
                     "limit":         {"type": "integer", "description": "Max results to return. Default 50."},
                 },
@@ -2355,6 +2376,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 assembly_district=arguments.get("assembly_district", ""),
                 state_senate_district=arguments.get("state_senate_district", ""),
                 congressional_district=arguments.get("congressional_district", ""),
+                council_district=arguments.get("council_district", ""),
                 cross_reference_finance=bool(arguments.get("cross_reference_finance", True)),
                 limit=int(arguments.get("limit", 50)),
             ))
