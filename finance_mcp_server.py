@@ -1484,10 +1484,15 @@ def _init_voter_db():
     """Load super voter CSV immediately, then download full DB in background."""
     _load_voter_file()  # always load CSV — fast, needed for find_super_voters
 
-    # If DB already present and valid, open it synchronously (fast path)
-    if os.path.exists(VOTER_DB_LOCAL_PATH) and _is_real_sqlite(VOTER_DB_LOCAL_PATH):
+    # If DB already present, valid, and has year columns — open synchronously (fast path)
+    if (os.path.exists(VOTER_DB_LOCAL_PATH) and _is_real_sqlite(VOTER_DB_LOCAL_PATH)
+            and _has_year_columns(VOTER_DB_LOCAL_PATH)):
         _open_voter_db()
         return
+    elif os.path.exists(VOTER_DB_LOCAL_PATH):
+        import os as _os
+        _os.remove(VOTER_DB_LOCAL_PATH)
+        log.info("Removed outdated voter DB (missing year columns) — will re-download")
 
     # Otherwise download in background so startup health check passes
     log.info("Voter DB not present — downloading in background thread...")
