@@ -1489,13 +1489,17 @@ def _init_voter_db():
             and _has_year_columns(VOTER_DB_LOCAL_PATH)):
         _open_voter_db()
         return
-    elif os.path.exists(VOTER_DB_LOCAL_PATH):
-        import os as _os
-        _os.remove(VOTER_DB_LOCAL_PATH)
-        log.info("Removed outdated voter DB (missing year columns) — will re-download")
 
-    # Otherwise download in background so startup health check passes
-    log.info("Voter DB not present — downloading in background thread...")
+    if os.path.exists(VOTER_DB_LOCAL_PATH) and _is_real_sqlite(VOTER_DB_LOCAL_PATH):
+        # Old DB exists but lacks year columns — open it now so queries use SQLite instead of
+        # the CSV tuple fallback. Background download will atomically replace it and call
+        # _open_voter_db() again to swap the connection to the schema-correct version.
+        log.info("Outdated voter DB (missing year columns) — opening for now, re-downloading in background...")
+        _open_voter_db()
+    else:
+        log.info("Voter DB not present or invalid — downloading in background thread...")
+
+    # Download in background — atomically replaces the file and re-opens the connection when done
     import threading as _th
     t = _th.Thread(target=_background_download, daemon=True)
     t.start()
@@ -1613,9 +1617,13 @@ def find_super_voters(
     # ── SQLite path ───────────────────────────────────────────────────────────
     global _voter_db_conn
     # If DB file is ready but connection not yet open, open it now
-    if _voter_db_conn is None and _is_real_sqlite(VOTER_DB_LOCAL_PATH) and _has_year_columns(VOTER_DB_LOCAL_PATH):
-        log.info("find_super_voters: opening voter DB on demand")
-        _open_voter_db()
+    # Open DB on demand if file exists but connection not yet set
+    if _voter_db_conn is None and os.path.exists(VOTER_DB_LOCAL_PATH):
+        if _is_real_sqlite(VOTER_DB_LOCAL_PATH):
+            log.info(f"find_super_voters: opening voter DB on demand (size={os.path.getsize(VOTER_DB_LOCAL_PATH):,})")
+            _open_voter_db()
+        else:
+            log.warning(f"find_super_voters: DB file exists but not valid SQLite (size={os.path.getsize(VOTER_DB_LOCAL_PATH)})")
     if _voter_db_conn is not None:
         try:
             sql = ("SELECT sboeid,lastname,firstname,dob,party,address,city,zip,"
@@ -1644,9 +1652,9 @@ def find_super_voters(
                     "cd": r["cd"], "sd": r["sd"], "ad": r["ad"],
                     "regdate": r["regdate"], "ge_votes": r["ge_votes"],
                     "primary_votes": r["primary_votes"], "voter_score": r["voter_score"],
-                    "ge_years": r["ge_years"] if "ge_years" in r.keys() else "",
-                    "primary_years": r["primary_years"] if "primary_years" in r.keys() else "",
-                    "off_year_years": r["off_year_years"] if "off_year_years" in r.keys() else "",
+                    "ge_years": dict(r).get("ge_years", ""),
+                    "primary_years": dict(r).get("primary_years", ""),
+                    "off_year_years": dict(r).get("off_year_years", ""),
                 })
             log.info(f"find_super_voters (SQLite): {len(rows)} rows for {county}")
         except Exception as e:
@@ -1688,7 +1696,7 @@ def find_super_voters(
                     bonus += RECENCY_BONUS[yr]
         return base + bonus * 0.5
     rows.sort(key=lambda x: -_recency_score(x))
-    log.info(f"find_super_voters: {len(rows)} voters for {county} score>={min_voter_score}")
+    log.info(f"find_super_voters: {len(rows)} voters for {county} score>={min_voter_score} | db_conn={_voter_db_conn is not None} | db_exists={os.path.exists(VOTER_DB_LOCAL_PATH)}")
 
     if cross_reference_finance:
         _build_boe_donor_index()
