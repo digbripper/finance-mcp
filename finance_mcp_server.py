@@ -1341,6 +1341,7 @@ _VOTER_INDEX: dict[str, list[dict]] = {}   # kept for compat but no longer popul
 _VOTER_LOADED = False
 _voter_db_conn = None  # set by _init_voter_db once SQLite DB is ready
 _SUPER_VOTERS_CSV_PATH: str | None = None  # path to CSV for disk-streaming queries
+_voter_db_download_thread = None  # background download thread; join() to wait for it
 
 PARTY_LABELS = {
     "DEM": "Democrat", "REP": "Republican", "CON": "Conservative",
@@ -1499,9 +1500,12 @@ def _init_voter_db():
     else:
         log.info("Voter DB not present or invalid — downloading in background thread...")
 
-    # Download in background — atomically replaces the file and re-opens the connection when done
+    # Download in background — atomically replaces the file and re-opens the connection when done.
+    # Save thread ref so find_super_voters can join() it rather than falling to CSV fallback.
+    global _voter_db_download_thread
     import threading as _th
     t = _th.Thread(target=_background_download, daemon=True)
+    _voter_db_download_thread = t
     t.start()
 
 
@@ -1616,8 +1620,17 @@ def find_super_voters(
 
     # ── SQLite path ───────────────────────────────────────────────────────────
     global _voter_db_conn
-    # If DB file is ready but connection not yet open, open it now
-    # Open DB on demand if file exists but connection not yet set
+    # If the background download thread is still running, join it so we don't
+    # race past it and fall to the CSV tuple fallback (which has no year columns).
+    # find_super_voters runs in a thread-pool executor so blocking here is safe.
+    if _voter_db_conn is None and _voter_db_download_thread is not None and _voter_db_download_thread.is_alive():
+        log.info("find_super_voters: voter DB still downloading — waiting up to 120s...")
+        import time as _time
+        _t0 = _time.time()
+        _voter_db_download_thread.join(timeout=120)
+        log.info(f"find_super_voters: download wait finished in {_time.time()-_t0:.1f}s, db_conn={_voter_db_conn is not None}")
+
+    # Open DB on demand if file exists but connection not yet set (covers restart after crash)
     if _voter_db_conn is None and os.path.exists(VOTER_DB_LOCAL_PATH):
         if _is_real_sqlite(VOTER_DB_LOCAL_PATH):
             log.info(f"find_super_voters: opening voter DB on demand (size={os.path.getsize(VOTER_DB_LOCAL_PATH):,})")
@@ -2455,6 +2468,7 @@ async def handle_sse(request: Request):
         request.scope, request.receive, request._send
     ) as streams:
         await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+    return Response()  # connect_sse managed the full response; return empty so Starlette doesn't raise TypeError
 
 # /messages/ must be a raw ASGI app — handle_post_message sends its own response
 # IMPORTANT: do NOT create a Request(scope, receive) here — it consumes the body,
