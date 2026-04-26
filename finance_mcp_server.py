@@ -1612,6 +1612,10 @@ def find_super_voters(
 
     # ── SQLite path ───────────────────────────────────────────────────────────
     global _voter_db_conn
+    # If DB file is ready but connection not yet open, open it now
+    if _voter_db_conn is None and _is_real_sqlite(VOTER_DB_LOCAL_PATH) and _has_year_columns(VOTER_DB_LOCAL_PATH):
+        log.info("find_super_voters: opening voter DB on demand")
+        _open_voter_db()
     if _voter_db_conn is not None:
         try:
             sql = ("SELECT sboeid,lastname,firstname,dob,party,address,city,zip,"
