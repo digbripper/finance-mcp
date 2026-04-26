@@ -1657,17 +1657,18 @@ def find_super_voters(
             with _VOTER_DB_LOCK:
                 db_rows = _voter_db_conn.execute(sql, params).fetchall()
             for r in db_rows:
+                rd = dict(r)  # convert once; sqlite3.Row has no .get()
                 rows.append({
-                    "last": r["lastname"], "first": r["firstname"],
-                    "dob": r["dob"], "party": r["party"],
-                    "address": r["address"], "city": r["city"], "zip": r["zip"],
-                    "county_code": r["county_code"], "county": r.get("county_name",""),
-                    "cd": r["cd"], "sd": r["sd"], "ad": r["ad"],
-                    "regdate": r["regdate"], "ge_votes": r["ge_votes"],
-                    "primary_votes": r["primary_votes"], "voter_score": r["voter_score"],
-                    "ge_years": dict(r).get("ge_years", ""),
-                    "primary_years": dict(r).get("primary_years", ""),
-                    "off_year_years": dict(r).get("off_year_years", ""),
+                    "last": rd.get("lastname", ""), "first": rd.get("firstname", ""),
+                    "dob": rd.get("dob", ""), "party": rd.get("party", ""),
+                    "address": rd.get("address", ""), "city": rd.get("city", ""), "zip": rd.get("zip", ""),
+                    "county_code": rd.get("county_code", ""), "county": rd.get("county_name", ""),
+                    "cd": rd.get("cd", ""), "sd": rd.get("sd", ""), "ad": rd.get("ad", ""),
+                    "regdate": rd.get("regdate", ""), "ge_votes": rd.get("ge_votes", 0),
+                    "primary_votes": rd.get("primary_votes", 0), "voter_score": rd.get("voter_score", 0),
+                    "ge_years": rd.get("ge_years", ""),
+                    "primary_years": rd.get("primary_years", ""),
+                    "off_year_years": rd.get("off_year_years", ""),
                 })
             log.info(f"find_super_voters (SQLite): {len(rows)} rows for {county}")
         except Exception as e:
