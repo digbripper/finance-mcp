@@ -1416,7 +1416,7 @@ def _download_voter_db() -> bool:
     import urllib.request as _ur
     path = VOTER_DB_LOCAL_PATH
     tmp_path = path + ".tmp"
-    if os.path.exists(path) and _is_real_sqlite(path) and os.path.getsize(path) > 900_000_000:
+    if os.path.exists(path) and _is_real_sqlite(path) and os.path.getsize(path) > 100_000_000:
         log.info("Full voter DB already present")
         return True
     log.info("Downloading full voter DB from GitHub Releases (~1GB)...")
