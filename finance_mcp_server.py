@@ -1391,6 +1391,9 @@ def _load_voter_file():
                 int(row.get("GE_VOTES") or 0),     # 13
                 int(row.get("PRIMARY_VOTES") or 0),# 14
                 row.get("SBOEID",""),               # 15
+                row.get("GE_YEARS",""),             # 16 e.g. "2025,2024,2023"
+                row.get("PRIMARY_YEARS",""),        # 17 e.g. "2024,2022"
+                row.get("OFF_YEAR_YEARS",""),       # 18 e.g. "2022,2019"
             ))
             count += 1
     log.info(f"Loaded {count:,} NYC super voters into compact index")
@@ -1548,7 +1551,10 @@ def lookup_voter(full_name: str, dob: str = "") -> dict | None:
                     "county_code": t[0], "county": t[10],
                     "cd": t[4], "sd": t[3], "ad": t[2], "regdate": t[12],
                     "ge_votes": t[13], "primary_votes": t[14], "voter_score": t[5],
-                    "sboeid": t[15]}
+                    "sboeid": t[15],
+                    "ge_years": t[16] if len(t) > 16 else "",
+                    "primary_years": t[17] if len(t) > 17 else "",
+                    "off_year_years": t[18] if len(t) > 18 else ""}
     return best if best_score >= 16 else None
 
 
@@ -1603,7 +1609,8 @@ def find_super_voters(
     if _voter_db_conn is not None:
         try:
             sql = ("SELECT sboeid,lastname,firstname,dob,party,address,city,zip,"
-                   "county_code,county_name,cd,sd,ad,regdate,ge_votes,primary_votes,voter_score "
+                   "county_code,county_name,cd,sd,ad,regdate,ge_votes,primary_votes,voter_score,"
+                   "ge_years,primary_years,off_year_years "
                    "FROM voters WHERE county_code=? AND voter_score>=?")
             params: list = [county_code, min_voter_score]
             if party_code:
@@ -1627,6 +1634,9 @@ def find_super_voters(
                     "cd": r["cd"], "sd": r["sd"], "ad": r["ad"],
                     "regdate": r["regdate"], "ge_votes": r["ge_votes"],
                     "primary_votes": r["primary_votes"], "voter_score": r["voter_score"],
+                    "ge_years": r["ge_years"] if "ge_years" in r.keys() else "",
+                    "primary_years": r["primary_years"] if "primary_years" in r.keys() else "",
+                    "off_year_years": r["off_year_years"] if "off_year_years" in r.keys() else "",
                 })
             log.info(f"find_super_voters (SQLite): {len(rows)} rows for {county}")
         except Exception as e:
@@ -1645,7 +1655,10 @@ def find_super_voters(
                          "address": t[9], "city": t[10], "zip": t[11],
                          "county_code": t[0], "county": "",
                          "cd": t[4], "sd": t[3], "ad": t[2], "regdate": t[12],
-                         "ge_votes": t[13], "primary_votes": t[14], "voter_score": t[5]})
+                         "ge_votes": t[13], "primary_votes": t[14], "voter_score": t[5],
+                         "ge_years": t[16] if len(t) > 16 else "",
+                         "primary_years": t[17] if len(t) > 17 else "",
+                         "off_year_years": t[18] if len(t) > 18 else ""})
             if len(rows) >= fetch_limit:
                 break
         rows.sort(key=lambda x: -x.get("voter_score", 0))
@@ -1654,7 +1667,17 @@ def find_super_voters(
     if not rows:
         return [{"error": "Voter data not yet available — SQLite DB is still downloading. Try again in a few minutes."}]
 
-    rows.sort(key=lambda x: -x.get("voter_score", 0))
+    RECENCY_BONUS = {"2025": 3, "2024": 2, "2023": 1}
+    def _recency_score(v):
+        base = v.get("voter_score", 0)
+        bonus = 0
+        for f in ("ge_years", "primary_years", "off_year_years"):
+            for yr in (v.get(f) or "").split(","):
+                yr = yr.strip()
+                if yr in RECENCY_BONUS:
+                    bonus += RECENCY_BONUS[yr]
+        return base + bonus * 0.5
+    rows.sort(key=lambda x: -_recency_score(x))
     log.info(f"find_super_voters: {len(rows)} voters for {county} score>={min_voter_score}")
 
     if cross_reference_finance:
@@ -1680,6 +1703,9 @@ def find_super_voters(
             "general_elections_voted": v.get("ge_votes",0),
             "primaries_voted": v.get("primary_votes",0),
             "voter_score": v.get("voter_score",0),
+            "ge_years": v.get("ge_years",""),
+            "primary_years": v.get("primary_years",""),
+            "off_year_years": v.get("off_year_years",""),
             "total_donated": 0.0,
             "donation_count": 0,
             "top_candidates": [],
@@ -2050,6 +2076,9 @@ def enrich_person(person_name: str) -> dict:
             "general_elections_voted":voter.get("ge_votes") or voter.get("general_elections_voted", 0),
             "primaries_voted":        voter.get("primary_votes") or voter.get("primaries_voted", 0),
             "voter_score":            voter.get("voter_score", 0),
+            "ge_years":               voter.get("ge_years", ""),
+            "primary_years":          voter.get("primary_years", ""),
+            "off_year_years":         voter.get("off_year_years", ""),
             "sboeid":                 voter.get("sboeid", ""),
         }
         log.info(f"Voter match for {person_name}: {party_label}, "
