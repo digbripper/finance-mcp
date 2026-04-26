@@ -1328,51 +1328,79 @@ def lda_enrich_donors(donor_rows: list[dict]) -> list[dict]:
                                  -d.get("amount", 0)))
 
 
-# ─── NYC Voter Data ──────────────────────────────────────────────────────────
-#
-# Two files downloaded from GitHub Releases at startup (background threads):
-#   nyc_super_voters.csv  — 750k voters, 2+ GE, used for find_super_voters CSV fallback
-#   nyc_voters.db         — 4.9M voters SQLite, used for all voter lookups
-#
-# MEMORY STRATEGY: NO in-memory voter index. Too large for Railway RAM.
-#   find_super_voters → SQLite indexed query (fast) | CSV line-scan fallback
-#   lookup_voter      → SQLite indexed query (fast) | CSV line-scan fallback
-#
-# Both downloads are background threads so health check passes in <5 seconds.
+# ─── NYC Voter File (nyc_super_voters.csv — in-memory) ───────────────────────
+# 416k active NYC voters who voted in 4+ general elections.
+# 49MB CSV, loaded into memory at startup. Already deployed in Railway.
 
 import csv as _vcsv
 import sqlite3 as _sqlite3
 import threading as _threading
-
 _VOTER_DB_LOCK = _threading.Lock()
-_voter_db_conn  = None   # opens once SQLite download completes
-_VOTER_INDEX    = {}     # kept for compat, never populated
-_VOTER_TUPLES   = []     # kept for compat, never populated
-_VOTER_LOADED   = False  # True once startup background tasks launched
+
+_VOTER_INDEX: dict[str, list[dict]] = {}   # kept for compat but no longer populated
+_VOTER_LOADED = False
+_voter_db_conn = None  # set by _init_voter_db once SQLite DB is ready
+_SUPER_VOTERS_CSV_PATH: str | None = None  # path to CSV for disk-streaming queries
 
 PARTY_LABELS = {
-    "DEM": "Democrat",  "REP": "Republican", "CON": "Conservative",
+    "DEM": "Democrat", "REP": "Republican", "CON": "Conservative",
     "WOR": "Working Families", "BLK": "No Party", "OTH": "Other",
-    "GRE": "Green",     "LBT": "Libertarian", "IND": "Independence",
+    "GRE": "Green", "LBT": "Libertarian", "IND": "Independence",
 }
 
-VOTER_DB_RELEASE_URL  = (
-    "https://github.com/digbripper/finance-mcp"
-    "/releases/download/v1.1-voter-db/nyc_voters.db"
-)
-VOTER_CSV_RELEASE_URL = (
-    "https://github.com/digbripper/finance-mcp"
-    "/releases/download/v1.1-voter-db/nyc_super_voters.csv"
-)
-VOTER_DB_LOCAL_PATH  = "/app/nyc_voters.db"
-VOTER_CSV_LOCAL_PATH = "/app/nyc_super_voters.csv"
+# Compact voter index: list of tuples for fast filtering
+# Fields: (county_code, party, ad, sd, cd, voter_score, last, first,
+#           dob, address, city, zip, regdate, ge_votes, primary_votes, sboeid)
+_VOTER_TUPLES: list[tuple] = []
 
-def _is_real_file(path: str, min_bytes: int = 1_000_000) -> bool:
-    """True if file exists and is large enough to be real (not an LFS pointer)."""
-    try:
-        return os.path.exists(path) and os.path.getsize(path) >= min_bytes
-    except Exception:
-        return False
+def _load_voter_file():
+    """Load super voters CSV into compact tuple list — ~35MB vs 200MB for full dicts."""
+    global _VOTER_LOADED, _SUPER_VOTERS_CSV_PATH, _VOTER_TUPLES
+    if _VOTER_LOADED:
+        return
+    for _candidate in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyc_super_voters.csv"),
+        os.path.join(os.getcwd(), "nyc_super_voters.csv"),
+        "/app/nyc_super_voters.csv",
+    ]:
+        if os.path.exists(_candidate):
+            _SUPER_VOTERS_CSV_PATH = _candidate
+            break
+    else:
+        log.warning("nyc_super_voters.csv not found")
+        _VOTER_LOADED = True
+        return
+
+    count = 0
+    with open(_SUPER_VOTERS_CSV_PATH, newline="", encoding="utf-8") as f:
+        for row in _vcsv.DictReader(f):
+            _VOTER_TUPLES.append((
+                row.get("COUNTY_CODE",""),          # 0
+                row.get("PARTY",""),                # 1
+                (row.get("AD","")).lstrip("0"),     # 2
+                (row.get("SD","")).lstrip("0"),     # 3
+                (row.get("CD","")).lstrip("0"),     # 4
+                int(row.get("VOTER_SCORE") or 0),  # 5
+                (row.get("LASTNAME") or "").strip().upper(),   # 6
+                (row.get("FIRSTNAME") or "").strip().upper(),  # 7
+                row.get("DOB",""),                  # 8
+                row.get("ADDRESS",""),              # 9
+                row.get("CITY",""),                 # 10
+                row.get("ZIP",""),                  # 11
+                row.get("REGDATE",""),              # 12
+                int(row.get("GE_VOTES") or 0),     # 13
+                int(row.get("PRIMARY_VOTES") or 0),# 14
+                row.get("SBOEID",""),               # 15
+            ))
+            count += 1
+    log.info(f"Loaded {count:,} NYC super voters into compact index")
+    _VOTER_LOADED = True
+
+VOTER_DB_RELEASE_URL = (
+    "https://github.com/digbripper/finance-mcp"
+    "/releases/download/v1.0-voter-db/nyc_voters.db"
+)
+VOTER_DB_LOCAL_PATH = "/app/nyc_voters.db"
 
 def _is_real_sqlite(path: str) -> bool:
     try:
@@ -1381,17 +1409,19 @@ def _is_real_sqlite(path: str) -> bool:
     except Exception:
         return False
 
-def _download_file(url: str, dest: str, label: str, min_size: int = 1_000_000) -> bool:
-    """Download a file from a URL to dest, using a .tmp file for atomic write."""
+def _download_voter_db() -> bool:
     import urllib.request as _ur
-    if _is_real_file(dest, min_size):
-        log.info(f"{label} already present at {dest}")
+    path = VOTER_DB_LOCAL_PATH
+    tmp_path = path + ".tmp"
+    if os.path.exists(path) and _is_real_sqlite(path) and os.path.getsize(path) > 900_000_000:
+        log.info("Full voter DB already present")
         return True
-    log.info(f"Downloading {label} from GitHub Releases...")
-    tmp = dest + ".tmp"
+    log.info("Downloading full voter DB from GitHub Releases (~1GB)...")
     try:
-        req = _ur.Request(url, headers={"User-Agent": "finance-mcp/1.0"})
-        with _ur.urlopen(req, timeout=300) as resp, open(tmp, "wb") as out:
+        req = _ur.Request(VOTER_DB_RELEASE_URL,
+                          headers={"User-Agent": "finance-mcp/1.0"})
+        with _ur.urlopen(req, timeout=300) as resp, \
+             open(tmp_path, "wb") as out:
             downloaded = 0
             while True:
                 chunk = resp.read(1024 * 1024)
@@ -1400,22 +1430,20 @@ def _download_file(url: str, dest: str, label: str, min_size: int = 1_000_000) -
                 out.write(chunk)
                 downloaded += len(chunk)
                 if downloaded % (100 * 1024 * 1024) == 0:
-                    log.info(f"  {label}: {downloaded // (1024*1024)}MB downloaded...")
-        os.replace(tmp, dest)
-        log.info(f"{label} download complete ({downloaded // (1024*1024)}MB)")
+                    log.info(f"  Downloaded {downloaded // (1024*1024)}MB...")
+        # Atomic rename only after full download
+        os.replace(tmp_path, path)
+        log.info(f"Voter DB download complete ({downloaded // (1024*1024)}MB)")
         return True
     except Exception as e:
-        log.error(f"Failed to download {label}: {e}")
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        log.error(f"Failed to download voter DB: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         return False
 
 def _open_voter_db():
-    """Open the SQLite voter DB (call after successful download)."""
+    """Open the SQLite voter DB once downloaded."""
     global _voter_db_conn
-    if not _is_real_sqlite(VOTER_DB_LOCAL_PATH):
-        log.error("Voter DB file is not valid SQLite")
-        return
     try:
         conn = _sqlite3.connect(
             f"file:{VOTER_DB_LOCAL_PATH}?mode=ro", uri=True,
@@ -1428,60 +1456,33 @@ def _open_voter_db():
     except Exception as e:
         log.error(f"Failed to open voter DB: {e}")
 
-def _background_voter_setup():
-    """
-    Background thread: download CSV then SQLite DB.
-    CSV is smaller (~138MB), downloads first so lookup_voter fallback works sooner.
-    """
-    # 1. CSV — used as fallback for lookup_voter line-scan
-    _download_file(VOTER_CSV_RELEASE_URL, VOTER_CSV_LOCAL_PATH,
-                   "super voters CSV", min_size=1_000_000)
-
-    # 2. SQLite DB — used for all indexed queries
-    if _download_file(VOTER_DB_RELEASE_URL, VOTER_DB_LOCAL_PATH,
-                      "full voter DB", min_size=900_000_000):
+def _background_download():
+    """Download voter DB in background — doesn't block server startup."""
+    if _download_voter_db():
         _open_voter_db()
     else:
-        log.warning("Full voter DB unavailable — lookup_voter uses CSV line-scan only")
-
-def _load_voter_file():
-    """Compat shim — actual setup is done by _init_voter_db background thread."""
-    pass
+        log.warning("Full voter DB unavailable — lookup_voter uses super voter CSV only")
 
 def _init_voter_db():
-    """
-    Launch background thread to download CSV + SQLite DB.
-    Returns immediately so health check passes in <5 seconds.
-    If DB already present and valid, opens it synchronously (fast path on redeploy).
-    """
-    global _VOTER_LOADED
-    _VOTER_LOADED = True
+    """Load super voter CSV immediately, then download full DB in background."""
+    _load_voter_file()  # always load CSV — fast, needed for find_super_voters
 
-    # Fast path: DB already on disk from previous deploy — open synchronously
-    if (_is_real_file(VOTER_DB_LOCAL_PATH, 900_000_000) and
-            _is_real_sqlite(VOTER_DB_LOCAL_PATH)):
-        log.info("Voter DB already on disk — opening synchronously")
+    # If DB already present and valid, open it synchronously (fast path)
+    if os.path.exists(VOTER_DB_LOCAL_PATH) and _is_real_sqlite(VOTER_DB_LOCAL_PATH):
         _open_voter_db()
-        # Still check CSV in background in case it needs update
-        if not _is_real_file(VOTER_CSV_LOCAL_PATH):
-            import threading as _th
-            _th.Thread(target=lambda: _download_file(
-                VOTER_CSV_RELEASE_URL, VOTER_CSV_LOCAL_PATH,
-                "super voters CSV"), daemon=True).start()
         return
 
-    # Slow path: download everything in background
-    log.info("Starting background voter data download (CSV + SQLite DB)...")
+    # Otherwise download in background so startup health check passes
+    log.info("Voter DB not present — downloading in background thread...")
     import threading as _th
-    t = _th.Thread(target=_background_voter_setup, daemon=True)
+    t = _th.Thread(target=_background_download, daemon=True)
     t.start()
 
 
 def lookup_voter(full_name: str, dob: str = "") -> dict | None:
     """
-    Look up any NYC registered voter by name.
-    SQLite first (full 4.9M DB), then CSV line-scan fallback (750k super voters).
-    No in-memory index — avoids OOM on Railway.
+    Look up a person in the NYC voter DB by name.
+    Uses SQLite if available, streams CSV as fallback.
     """
     parts = full_name.strip().upper().split()
     if not parts:
@@ -1489,7 +1490,7 @@ def lookup_voter(full_name: str, dob: str = "") -> dict | None:
     last  = parts[-1]
     first = parts[0] if len(parts) >= 2 else ""
 
-    # ── SQLite path ───────────────────────────────────────────────────────────
+    # ── SQLite path (full 4.9M voter DB) ─────────────────────────────────────
     if _voter_db_conn is not None:
         try:
             with _VOTER_DB_LOCK:
@@ -1501,10 +1502,7 @@ def lookup_voter(full_name: str, dob: str = "") -> dict | None:
                     if row:
                         return dict(row)
                 rows = _voter_db_conn.execute(
-                    "SELECT sboeid,lastname,firstname,dob,party,address,city,zip,"
-                    "county_code,county_name,cd,sd,ad,council_district,regdate,"
-                    "ge_votes,primary_votes,voter_score,ge_years,primary_years "
-                    "FROM voters WHERE lastname=? AND firstname LIKE ? "
+                    "SELECT * FROM voters WHERE lastname=? AND firstname LIKE ? "
                     "ORDER BY voter_score DESC LIMIT 5",
                     (last, first[:3] + "%") if first else (last, "%")
                 ).fetchall()
@@ -1516,50 +1514,32 @@ def lookup_voter(full_name: str, dob: str = "") -> dict | None:
         except Exception as e:
             log.warning(f"Voter DB lookup error: {e}")
 
-    # ── CSV line-scan fallback ────────────────────────────────────────────────
-    # Streams the CSV row by row — no RAM overhead, ~0.5s for 750k rows
-    if not _is_real_file(VOTER_CSV_LOCAL_PATH):
+    # ── Tuple index fallback (416k super voters, fast in-memory scan) ──────────
+    _load_voter_file()
+    if not _VOTER_TUPLES:
         return None
-    try:
-        best, best_score = None, 0
-        with open(VOTER_CSV_LOCAL_PATH, newline="", encoding="utf-8") as f:
-            for row in _vcsv.DictReader(f):
-                if (row.get("LASTNAME") or "").strip().upper() != last:
-                    continue
-                rfirst = (row.get("FIRSTNAME") or "").strip().upper()
-                score  = 10
-                if first:
-                    if rfirst == first:                score += 12
-                    elif rfirst.startswith(first[:3]): score += 6
-                if dob and row.get("DOB","") == dob:   score += 20
-                if score > best_score:
-                    best_score = score
-                    best = {
-                        "last":          last,
-                        "first":         rfirst,
-                        "dob":           row.get("DOB",""),
-                        "party":         row.get("PARTY",""),
-                        "address":       row.get("ADDRESS",""),
-                        "city":          row.get("CITY",""),
-                        "zip":           row.get("ZIP",""),
-                        "county_code":   row.get("COUNTY_CODE",""),
-                        "county":        row.get("COUNTY_NAME",""),
-                        "cd":            row.get("CD",""),
-                        "sd":            row.get("SD",""),
-                        "ad":            row.get("AD",""),
-                        "council_district": row.get("COUNCIL_DISTRICT",""),
-                        "regdate":       row.get("REGDATE",""),
-                        "ge_votes":      int(row.get("GE_VOTES") or 0),
-                        "primary_votes": int(row.get("PRIMARY_VOTES") or 0),
-                        "voter_score":   int(row.get("VOTER_SCORE") or 0),
-                        "ge_years":      row.get("GE_YEARS",""),
-                        "primary_years": row.get("PRIMARY_YEARS",""),
-                        "sboeid":        row.get("SBOEID",""),
-                    }
-        return best if best_score >= 16 else None
-    except Exception as e:
-        log.warning(f"CSV voter lookup error: {e}")
-        return None
+    best, best_score = None, 0
+    for t in _VOTER_TUPLES:
+        if t[6] != last:
+            continue
+        score = 10
+        if first:
+            if t[7] == first:              score += 12
+            elif t[7].startswith(first[:3]): score += 6
+        if dob and t[8] == dob:            score += 20
+        if score > best_score:
+            best_score = score
+            best = {"last": t[6], "first": t[7], "dob": t[8], "party": t[1],
+                    "address": t[9], "city": t[10], "zip": t[11],
+                    "county_code": t[0], "county": t[10],
+                    "cd": t[4], "sd": t[3], "ad": t[2], "regdate": t[12],
+                    "ge_votes": t[13], "primary_votes": t[14], "voter_score": t[5],
+                    "sboeid": t[15]}
+    return best if best_score >= 16 else None
+
+
+
+
 
 # ─── Super voter finder ───────────────────────────────────────────────────────
 
@@ -1578,14 +1558,12 @@ def find_super_voters(
     assembly_district: str = "",
     state_senate_district: str = "",
     congressional_district: str = "",
-    council_district: str = "",
     cross_reference_finance: bool = True,
     limit: int = 50,
 ) -> list[dict]:
     """
     Find high-engagement NYC voters. Uses SQLite DB if available, streams CSV otherwise.
-    Filters by county, party, assembly/senate/congressional/council district,
-    voter score. Cross-references BOE finance data.
+    Filters by county, party, district, voter score. Cross-references BOE finance data.
     """
     _load_voter_file()
 
@@ -1600,10 +1578,9 @@ def find_super_voters(
                  "WORKING FAMILIES": "WOR", "NO PARTY": "BLK", "INDEPENDENT": "BLK"}
     party_code = party_map.get(party.upper(), party.upper()[:3]) if party else ""
 
-    ad_str  = str(assembly_district).lstrip("0") if assembly_district else ""
-    sd_str  = str(state_senate_district).lstrip("0") if state_senate_district else ""
-    cd_str  = str(congressional_district).lstrip("0") if congressional_district else ""
-    ccd_str = str(council_district).lstrip("0") if council_district else ""
+    ad_str = str(assembly_district).lstrip("0") if assembly_district else ""
+    sd_str = str(state_senate_district).lstrip("0") if state_senate_district else ""
+    cd_str = str(congressional_district).lstrip("0") if congressional_district else ""
 
     fetch_limit = limit * 3 if cross_reference_finance else limit
     rows = []
@@ -1612,8 +1589,7 @@ def find_super_voters(
     if _voter_db_conn is not None:
         try:
             sql = ("SELECT sboeid,lastname,firstname,dob,party,address,city,zip,"
-                   "county_code,county_name,cd,sd,ad,council_district,regdate,"
-                   "ge_votes,primary_votes,voter_score,ge_years,primary_years "
+                   "county_code,county_name,cd,sd,ad,regdate,ge_votes,primary_votes,voter_score "
                    "FROM voters WHERE county_code=? AND voter_score>=?")
             params: list = [county_code, min_voter_score]
             if party_code:
@@ -1624,8 +1600,6 @@ def find_super_voters(
                 sql += " AND CAST(LTRIM(sd,'0') AS TEXT)=?"; params.append(sd_str)
             if cd_str:
                 sql += " AND CAST(LTRIM(cd,'0') AS TEXT)=?"; params.append(cd_str)
-            if ccd_str:
-                sql += " AND CAST(LTRIM(council_district,'0') AS TEXT)=?"; params.append(ccd_str)
             sql += " ORDER BY voter_score DESC LIMIT ?"
             params.append(fetch_limit)
             with _VOTER_DB_LOCK:
@@ -1637,56 +1611,34 @@ def find_super_voters(
                     "address": r["address"], "city": r["city"], "zip": r["zip"],
                     "county_code": r["county_code"], "county": r.get("county_name",""),
                     "cd": r["cd"], "sd": r["sd"], "ad": r["ad"],
-                    "council_district": r.get("council_district",""),
                     "regdate": r["regdate"], "ge_votes": r["ge_votes"],
                     "primary_votes": r["primary_votes"], "voter_score": r["voter_score"],
-                    "ge_years": r.get("ge_years",""), "primary_years": r.get("primary_years",""),
                 })
             log.info(f"find_super_voters (SQLite): {len(rows)} rows for {county}")
         except Exception as e:
             log.warning(f"find_super_voters SQLite error: {e}")
 
-    # ── CSV line-scan fallback ────────────────────────────────────────────────
-    # Only used if SQLite not yet loaded (first ~3 min after cold deploy)
-    # Streams CSV row-by-row — no RAM overhead
-    if not rows and _is_real_file(VOTER_CSV_LOCAL_PATH):
-        try:
-            with open(VOTER_CSV_LOCAL_PATH, newline="", encoding="utf-8") as f:
-                for row in _vcsv.DictReader(f):
-                    if row.get("COUNTY_CODE","") != county_code: continue
-                    score = int(row.get("VOTER_SCORE") or 0)
-                    if score < min_voter_score: continue
-                    if party_code and row.get("PARTY","") != party_code: continue
-                    if ad_str  and (row.get("AD","")).lstrip("0")               != ad_str:  continue
-                    if sd_str  and (row.get("SD","")).lstrip("0")               != sd_str:  continue
-                    if cd_str  and (row.get("CD","")).lstrip("0")               != cd_str:  continue
-                    if ccd_str and (row.get("COUNCIL_DISTRICT","")).lstrip("0") != ccd_str: continue
-                    rows.append({
-                        "last":  (row.get("LASTNAME") or "").strip().upper(),
-                        "first": (row.get("FIRSTNAME") or "").strip().upper(),
-                        "dob": row.get("DOB",""), "party": row.get("PARTY",""),
-                        "address": row.get("ADDRESS",""), "city": row.get("CITY",""),
-                        "zip": row.get("ZIP",""), "county_code": row.get("COUNTY_CODE",""),
-                        "county": row.get("COUNTY_NAME",""),
-                        "cd": row.get("CD",""), "sd": row.get("SD",""),
-                        "ad": row.get("AD",""),
-                        "council_district": row.get("COUNCIL_DISTRICT",""),
-                        "regdate": row.get("REGDATE",""),
-                        "ge_votes": int(row.get("GE_VOTES") or 0),
-                        "primary_votes": int(row.get("PRIMARY_VOTES") or 0),
-                        "voter_score": score,
-                        "ge_years": row.get("GE_YEARS",""),
-                        "primary_years": row.get("PRIMARY_YEARS",""),
-                    })
-                    if len(rows) >= fetch_limit:
-                        break
-            rows.sort(key=lambda x: -x.get("voter_score", 0))
-            log.info(f"find_super_voters (CSV scan): {len(rows)} rows for {county}")
-        except Exception as e:
-            log.warning(f"find_super_voters CSV scan error: {e}")
+    # ── Tuple index fallback (in-memory, fast) ───────────────────────────────
+    if not rows and _VOTER_TUPLES:
+        for t in _VOTER_TUPLES:
+            if t[0] != county_code: continue
+            if t[5] < min_voter_score: continue
+            if party_code and t[1] != party_code: continue
+            if ad_str and t[2] != ad_str: continue
+            if sd_str and t[3] != sd_str: continue
+            if cd_str and t[4] != cd_str: continue
+            rows.append({"last": t[6], "first": t[7], "dob": t[8], "party": t[1],
+                         "address": t[9], "city": t[10], "zip": t[11],
+                         "county_code": t[0], "county": "",
+                         "cd": t[4], "sd": t[3], "ad": t[2], "regdate": t[12],
+                         "ge_votes": t[13], "primary_votes": t[14], "voter_score": t[5]})
+            if len(rows) >= fetch_limit:
+                break
+        rows.sort(key=lambda x: -x.get("voter_score", 0))
+        log.info(f"find_super_voters (tuple index): {len(rows)} rows for {county}")
 
     if not rows:
-        return [{"error": "Voter data not yet available — still downloading. Try again in a few minutes."}]
+        return [{"error": "Voter data not yet available — SQLite DB is still downloading. Try again in a few minutes."}]
 
     rows.sort(key=lambda x: -x.get("voter_score", 0))
     log.info(f"find_super_voters: {len(rows)} voters for {county} score>={min_voter_score}")
@@ -1710,13 +1662,10 @@ def find_super_voters(
             "assembly_district": v.get("ad",""),
             "state_senate_district": v.get("sd",""),
             "congressional_district": v.get("cd",""),
-            "council_district": v.get("council_district",""),
             "registered_since": v.get("regdate",""),
             "general_elections_voted": v.get("ge_votes",0),
             "primaries_voted": v.get("primary_votes",0),
             "voter_score": v.get("voter_score",0),
-            "ge_years": v.get("ge_years",""),
-            "primary_years": v.get("primary_years",""),
             "total_donated": 0.0,
             "donation_count": 0,
             "top_candidates": [],
@@ -2294,11 +2243,10 @@ async def list_tools() -> list[types.Tool]:
                 "also significant donors. Useful for identifying politically active "
                 "individuals with financial influence. "
                 "Filter by county (manhattan/brooklyn/queens/bronx/staten island), "
-                "party (DEM/REP/WOR etc), assembly district, state senate district, "
-                "congressional district, NYC council district, and minimum voter score. "
-                "Returns voters sorted by donation total, with their voting history "
-                "(including exact years voted in generals and primaries), "
-                "party, address, all district assignments, and top campaign contributions."
+                "party (DEM/REP/WOR etc), assembly district, senate district, "
+                "congressional district, and minimum voter score. "
+                "Returns voters sorted by donation total, with their voting history, "
+                "party, address, districts, and top campaign contributions."
             ),
             inputSchema={
                 "type": "object",
@@ -2309,7 +2257,6 @@ async def list_tools() -> list[types.Tool]:
                     "assembly_district": {"type": "string", "description": "Assembly district number. Optional."},
                     "state_senate_district": {"type": "string", "description": "State senate district number. Optional."},
                     "congressional_district": {"type": "string", "description": "Congressional district number. Optional."},
-                    "council_district": {"type": "string", "description": "NYC Council district number. Optional."},
                     "cross_reference_finance": {"type": "boolean", "description": "Cross-reference with BOE donation data. Default true."},
                     "limit":         {"type": "integer", "description": "Max results to return. Default 50."},
                 },
@@ -2408,7 +2355,6 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 assembly_district=arguments.get("assembly_district", ""),
                 state_senate_district=arguments.get("state_senate_district", ""),
                 congressional_district=arguments.get("congressional_district", ""),
-                council_district=arguments.get("council_district", ""),
                 cross_reference_finance=bool(arguments.get("cross_reference_finance", True)),
                 limit=int(arguments.get("limit", 50)),
             ))
