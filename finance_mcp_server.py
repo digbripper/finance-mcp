@@ -1611,6 +1611,7 @@ def find_super_voters(
     rows = []
 
     # ── SQLite path ───────────────────────────────────────────────────────────
+    global _voter_db_conn
     if _voter_db_conn is not None:
         try:
             sql = ("SELECT sboeid,lastname,firstname,dob,party,address,city,zip,"
