@@ -1821,6 +1821,9 @@ def get_person_profile(person_name: str) -> dict:
             "general_elections_voted": voter.get("ge_votes", voter.get("general_elections_voted", 0)),
             "primaries_voted":         voter.get("primary_votes", voter.get("primaries_voted", 0)),
             "voter_score":             voter.get("voter_score", 0),
+            "ge_years":                voter.get("ge_years", ""),
+            "primary_years":           voter.get("primary_years", ""),
+            "off_year_years":          voter.get("off_year_years", ""),
         }
 
     # ── Pythia DB lookup ──────────────────────────────────────────────────────
