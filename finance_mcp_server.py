@@ -95,37 +95,14 @@ def boe_donations_by(donor_name: str, limit: int = 100) -> list[dict]:
     _load_boe_csv()
     if not _boe_rows:
         return []
-    parts = donor_name.strip().split()
-    if not parts:
-        return []
-    target_last  = parts[-1].upper()
-    target_first = parts[0].upper() if len(parts) >= 2 else ""
+    norm_target = normalize(donor_name)
     results = []
     for row in _boe_rows:
-        cname = (row.get("contributor_name") or "").strip().upper()
-        if not cname:
-            continue
-        # Parse contributor name — handle "LAST, FIRST" and "FIRST LAST" formats
-        if "," in cname:
-            c_parts = cname.split(",", 1)
-            c_last  = c_parts[0].strip()
-            c_first = c_parts[1].strip() if len(c_parts) > 1 else ""
-        else:
-            c_words = cname.split()
-            c_last  = c_words[-1] if c_words else ""
-            c_first = c_words[0] if len(c_words) >= 2 else ""
-        # Last name: require near-exact match (catches typos, not different names)
-        if fuzz.ratio(target_last, c_last) < 92:
-            continue
-        # First name: looser match (catches initials, nicknames, partial names)
-        if target_first and c_first:
-            if not (c_first.startswith(target_first[:2]) or
-                    target_first.startswith(c_first[:2]) or
-                    fuzz.ratio(target_first, c_first) >= 75):
-                continue
-        results.append(row)
-        if len(results) >= limit:
-            break
+        cname = (row.get("contributor_name") or "").strip()
+        if cname and fuzz.token_sort_ratio(normalize(cname), norm_target) >= MATCH_THRESHOLD:
+            results.append(row)
+            if len(results) >= limit:
+                break
     return results
 
 
@@ -1844,9 +1821,6 @@ def get_person_profile(person_name: str) -> dict:
             "general_elections_voted": voter.get("ge_votes", voter.get("general_elections_voted", 0)),
             "primaries_voted":         voter.get("primary_votes", voter.get("primaries_voted", 0)),
             "voter_score":             voter.get("voter_score", 0),
-            "ge_years":                voter.get("ge_years", ""),
-            "primary_years":           voter.get("primary_years", ""),
-            "off_year_years":          voter.get("off_year_years", ""),
         }
 
     # ── Pythia DB lookup ──────────────────────────────────────────────────────
@@ -1939,6 +1913,216 @@ def get_person_profile(person_name: str) -> dict:
         log.warning(f"NYS lobbying lookup failed: {e}")
 
     return profile
+
+
+# ─── Influential people finder ────────────────────────────────────────────────
+
+def find_influential_in_area(
+    zip_code: str = "",
+    borough: str = "",
+    assembly_district: str = "",
+    state_senate_district: str = "",
+    congressional_district: str = "",
+    min_tier: int = 2,
+    include_super_voters: bool = True,
+    include_unmatched_pythia: bool = True,
+    limit: int = 25,
+) -> list[dict]:
+    """
+    Find influential people in a geographic area by combining:
+    1. Pythia contacts at min_tier or better — voter file provides their home address/districts
+    2. High-scoring super voters in the area who may not be in Pythia
+
+    Returns merged list sorted by: influence tier, then voter score.
+    """
+    import concurrent.futures as _cf
+
+    # ── Step 1: Pull Pythia contacts at requested tier ────────────────────────
+    pythia_contacts = []
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT
+                        p.id::text, p.full_name, p.first_name, p.last_name,
+                        p.personal_address_line_1, p.personal_city,
+                        p.personal_postal_code,
+                        o.name  AS org_name,
+                        o.influence_tier,
+                        po.job_title
+                    FROM people_person p
+                    JOIN people_personorganization po ON po.person_id = p.id
+                    JOIN organizations_organization o  ON o.id = po.organization_id
+                    WHERE p.is_active = TRUE
+                      AND po.is_current = TRUE
+                      AND o.influence_tier <= %s
+                      AND o.influence_tier IS NOT NULL
+                      AND p.full_name IS NOT NULL
+                      AND p.full_name != ''
+                    ORDER BY o.influence_tier, p.full_name
+                """, (min_tier,))
+                pythia_contacts = [dict(r) for r in cur.fetchall()]
+        log.info(f"find_influential_in_area: {len(pythia_contacts)} Pythia contacts at tier<={min_tier}")
+    except Exception as e:
+        log.warning(f"Pythia contacts fetch error: {e}")
+
+    # ── Step 2: Voter-lookup each Pythia contact in parallel ──────────────────
+    def _lookup_with_context(contact):
+        name = contact.get("full_name", "").strip()
+        if not name:
+            return contact, None
+        voter = lookup_voter(name)
+        return contact, voter
+
+    pythia_with_voter = []
+    with _cf.ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_lookup_with_context, c): c for c in pythia_contacts}
+        for fut in _cf.as_completed(futures):
+            try:
+                contact, voter = fut.result()
+                pythia_with_voter.append((contact, voter))
+            except Exception:
+                pythia_with_voter.append((futures[fut], None))
+
+    # ── Step 3: Build district/zip filters ───────────────────────────────────
+    zip_f  = zip_code.strip()
+    ad_f   = str(assembly_district).lstrip("0") if assembly_district else ""
+    sd_f   = str(state_senate_district).lstrip("0") if state_senate_district else ""
+    cd_f   = str(congressional_district).lstrip("0") if congressional_district else ""
+    bor_f  = borough.lower().strip()
+
+    BOROUGH_COUNTIES = {
+        "manhattan": "31", "new york": "31",
+        "brooklyn": "24",  "kings": "24",
+        "queens": "41",
+        "bronx": "03",
+        "staten island": "43", "richmond": "43",
+    }
+    county_f = BOROUGH_COUNTIES.get(bor_f, "")
+
+    def _voter_matches(voter: dict | None) -> bool:
+        """Check if a voter record matches the requested location filters."""
+        if not voter:
+            return False
+        if zip_f   and voter.get("zip","").strip()                   != zip_f:  return False
+        if county_f and voter.get("county_code","").strip()          != county_f: return False
+        if ad_f    and voter.get("ad","").lstrip("0")                != ad_f:   return False
+        if sd_f    and voter.get("sd","").lstrip("0")                != sd_f:   return False
+        if cd_f    and voter.get("cd","").lstrip("0")                != cd_f:   return False
+        return True
+
+    has_location_filter = any([zip_f, county_f, ad_f, sd_f, cd_f])
+
+    # ── Step 4: Build Pythia results ──────────────────────────────────────────
+    results = []
+    seen_names: set[str] = set()
+
+    for contact, voter in sorted(
+        pythia_with_voter,
+        key=lambda x: (x[0].get("influence_tier") or 99,
+                       -(x[1].get("voter_score", 0) if x[1] else 0))
+    ):
+        name = contact.get("full_name", "").strip()
+        if not name or name in seen_names:
+            continue
+
+        voter_matches = _voter_matches(voter)
+
+        # Include if: voter record matches filter, OR no location filter set,
+        # OR include_unmatched_pythia and this is a meaningful tier contact
+        if has_location_filter and not voter_matches:
+            if not include_unmatched_pythia:
+                continue
+            # For unmatched, only include Tier 1 — they're important regardless of address
+            if (contact.get("influence_tier") or 99) > 1:
+                continue
+
+        seen_names.add(name)
+        entry = {
+            "name":             name,
+            "source":           "pythia",
+            "influence_tier":   contact.get("influence_tier"),
+            "org":              contact.get("org_name", ""),
+            "job_title":        contact.get("job_title", ""),
+            "pythia_id":        contact.get("id"),
+            "in_pythia":        True,
+            "voter_score":      voter.get("voter_score", 0) if voter else None,
+            "ge_years":         voter.get("ge_years", "") if voter else "",
+            "primary_years":    voter.get("primary_years", "") if voter else "",
+            "party":            PARTY_LABELS.get(voter.get("party",""), voter.get("party","")) if voter else "",
+            "address":          voter.get("address","") if voter else contact.get("personal_address_line_1",""),
+            "zip":              voter.get("zip","") if voter else contact.get("personal_postal_code",""),
+            "city":             voter.get("city","") if voter else contact.get("personal_city",""),
+            "assembly_district":voter.get("ad","") if voter else "",
+            "state_senate_district": voter.get("sd","") if voter else "",
+            "congressional_district": voter.get("cd","") if voter else "",
+            "voter_matched":    bool(voter),
+            "address_source":   "voter_file" if voter else "pythia",
+        }
+        results.append(entry)
+
+    log.info(f"find_influential_in_area: {len(results)} Pythia matches after location filter")
+
+    # ── Step 5: Add super voters from the area not already in Pythia ─────────
+    if include_super_voters and has_location_filter:
+        voter_rows = find_super_voters(
+            county=borough or "brooklyn",
+            min_voter_score=10,
+            assembly_district=assembly_district,
+            state_senate_district=state_senate_district,
+            congressional_district=congressional_district,
+            cross_reference_finance=False,
+            limit=50,
+        )
+        # If zip filter, apply it to voter results
+        if zip_f:
+            voter_rows = [v for v in voter_rows if v.get("zip","").strip() == zip_f]
+
+        # Build a name set from Pythia results for deduplication
+        pythia_name_set = {normalize(r["name"]) for r in results}
+
+        for v in voter_rows:
+            if isinstance(v, dict) and "error" in v:
+                continue
+            vname = f"{(v.get('first') or '').title()} {(v.get('last') or '').title()}".strip()
+            if normalize(vname) in pythia_name_set:
+                continue
+            seen_names.add(vname)
+            results.append({
+                "name":             vname,
+                "source":           "voter_file",
+                "influence_tier":   None,
+                "org":              "",
+                "job_title":        "",
+                "pythia_id":        None,
+                "in_pythia":        False,
+                "voter_score":      v.get("voter_score", 0),
+                "ge_years":         v.get("ge_years", ""),
+                "primary_years":    v.get("primary_years", ""),
+                "party":            PARTY_LABELS.get(v.get("party",""), v.get("party","")),
+                "address":          v.get("address",""),
+                "zip":              v.get("zip",""),
+                "city":             v.get("city",""),
+                "assembly_district": v.get("ad",""),
+                "state_senate_district": v.get("sd",""),
+                "congressional_district": v.get("cd",""),
+                "voter_matched":    True,
+                "address_source":   "voter_file",
+            })
+
+    # ── Step 6: Final sort and trim ───────────────────────────────────────────
+    RECENCY = {"2025": 3, "2024": 2, "2023": 1}
+    def _score(r):
+        tier_score = 10 - (r.get("influence_tier") or 10)   # tier 1 = 9, tier 2 = 8, None = 0
+        voter_score = r.get("voter_score") or 0
+        bonus = sum(RECENCY.get(yr.strip(), 0)
+                    for f in ("ge_years","primary_years")
+                    for yr in (r.get(f) or "").split(",") if yr.strip())
+        return (tier_score * 100) + voter_score + bonus * 0.5
+
+    results.sort(key=lambda x: -_score(x))
+    log.info(f"find_influential_in_area: returning {min(limit, len(results))} of {len(results)} total")
+    return results[:limit]
 
 # ─── Core enrichment ──────────────────────────────────────────────────────────
 
@@ -2380,6 +2564,34 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["person_a", "person_b"]
             }
         ),
+        types.Tool(
+            name="find_influential_in_area",
+            description=(
+                "Find the most influential people in a specific geographic area by combining "
+                "Pythia contacts (ranked by influence tier) with high-engagement voters from "
+                "the voter file. Tier 1 and 2 Pythia contacts are looked up in the voter file "
+                "to get their home address and district assignments. Also surfaces high-scoring "
+                "super voters in the area who are not yet in Pythia. "
+                "Filter by zip code, borough, assembly district, state senate district, or "
+                "congressional district. Results ranked by influence tier first, then voter score. "
+                "Use when asked about influential people in a neighborhood, zip code, or district."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "zip_code":               {"type": "string", "description": "5-digit zip code. Optional."},
+                    "borough":                {"type": "string", "description": "NYC borough: manhattan, brooklyn, queens, bronx, staten island. Optional."},
+                    "assembly_district":      {"type": "string", "description": "Assembly district number. Optional."},
+                    "state_senate_district":  {"type": "string", "description": "State senate district number. Optional."},
+                    "congressional_district": {"type": "string", "description": "Congressional district number. Optional."},
+                    "min_tier":               {"type": "integer", "description": "Max influence tier to include (1=top only, 2=top two tiers, 3=all). Default 2."},
+                    "include_super_voters":   {"type": "boolean", "description": "Also include high-scoring voters not in Pythia. Default true."},
+                    "include_unmatched_pythia": {"type": "boolean", "description": "Include Tier 1 Pythia contacts even if not found in voter file. Default true."},
+                    "limit":                  {"type": "integer", "description": "Max results. Default 25."},
+                },
+                "required": []
+            }
+        ),
     ]
 
 @mcp_server.call_tool()
@@ -2467,6 +2679,21 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 None, get_person_profile, arguments["person_name"]
             )
             return [types.TextContent(type="text", text=json.dumps(profile, indent=2, default=str))]
+
+        elif name == "find_influential_in_area":
+            log.info(f"find_influential_in_area: {arguments}")
+            results = await loop.run_in_executor(None, lambda: find_influential_in_area(
+                zip_code=arguments.get("zip_code", ""),
+                borough=arguments.get("borough", ""),
+                assembly_district=arguments.get("assembly_district", ""),
+                state_senate_district=arguments.get("state_senate_district", ""),
+                congressional_district=arguments.get("congressional_district", ""),
+                min_tier=int(arguments.get("min_tier", 2)),
+                include_super_voters=bool(arguments.get("include_super_voters", True)),
+                include_unmatched_pythia=bool(arguments.get("include_unmatched_pythia", True)),
+                limit=int(arguments.get("limit", 25)),
+            ))
+            return [types.TextContent(type="text", text=json.dumps(results, indent=2, default=str))]
 
         else:
             return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
