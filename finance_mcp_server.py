@@ -95,14 +95,37 @@ def boe_donations_by(donor_name: str, limit: int = 100) -> list[dict]:
     _load_boe_csv()
     if not _boe_rows:
         return []
-    norm_target = normalize(donor_name)
+    parts = donor_name.strip().split()
+    if not parts:
+        return []
+    target_last  = parts[-1].upper()
+    target_first = parts[0].upper() if len(parts) >= 2 else ""
     results = []
     for row in _boe_rows:
-        cname = (row.get("contributor_name") or "").strip()
-        if cname and fuzz.token_sort_ratio(normalize(cname), norm_target) >= MATCH_THRESHOLD:
-            results.append(row)
-            if len(results) >= limit:
-                break
+        cname = (row.get("contributor_name") or "").strip().upper()
+        if not cname:
+            continue
+        # Parse contributor name — handle "LAST, FIRST" and "FIRST LAST" formats
+        if "," in cname:
+            c_parts = cname.split(",", 1)
+            c_last  = c_parts[0].strip()
+            c_first = c_parts[1].strip() if len(c_parts) > 1 else ""
+        else:
+            c_words = cname.split()
+            c_last  = c_words[-1] if c_words else ""
+            c_first = c_words[0] if len(c_words) >= 2 else ""
+        # Last name: require near-exact match (catches typos, not different names)
+        if fuzz.ratio(target_last, c_last) < 92:
+            continue
+        # First name: looser match (catches initials, nicknames, partial names)
+        if target_first and c_first:
+            if not (c_first.startswith(target_first[:2]) or
+                    target_first.startswith(c_first[:2]) or
+                    fuzz.ratio(target_first, c_first) >= 75):
+                continue
+        results.append(row)
+        if len(results) >= limit:
+            break
     return results
 
 
