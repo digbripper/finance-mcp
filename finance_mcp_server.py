@@ -233,6 +233,697 @@ def best_match(name: str, index: dict, keys: list[str]) -> tuple[Optional[dict],
         return None, 0.0
     return index[result[0]], result[1]
 
+# ─── Influence ranking — table setup & rollback ───────────────────────────────
+
+import math as _math
+
+# DDL for each object, in dependency order
+_INFLUENCE_DDL: list[tuple[str, str]] = [
+    ("_finance_migrations", """
+        CREATE TABLE IF NOT EXISTS _finance_migrations (
+            id              SERIAL PRIMARY KEY,
+            migration_name  VARCHAR(100) UNIQUE NOT NULL,
+            applied_at      TIMESTAMPTZ DEFAULT NOW(),
+            rollback_sql    TEXT NOT NULL
+        )
+    """),
+    ("people_voter_enrichment", """
+        CREATE TABLE IF NOT EXISTS people_voter_enrichment (
+            id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            person_id               UUID NOT NULL REFERENCES people_person(id) ON DELETE CASCADE,
+            sboeid                  VARCHAR(20),
+            party_code              VARCHAR(10),
+            party_label             VARCHAR(50),
+            voter_score             INTEGER DEFAULT 0,
+            ge_votes                INTEGER DEFAULT 0,
+            primary_votes           INTEGER DEFAULT 0,
+            ge_years                TEXT    DEFAULT '',
+            primary_years           TEXT    DEFAULT '',
+            off_year_years          TEXT    DEFAULT '',
+            assembly_district       VARCHAR(10),
+            state_senate_district   VARCHAR(10),
+            congressional_district  VARCHAR(10),
+            county_code             VARCHAR(5),
+            county_name             VARCHAR(50),
+            voter_address           VARCHAR(255),
+            voter_city              VARCHAR(100),
+            voter_zip               VARCHAR(10),
+            match_confidence        INTEGER DEFAULT 0,
+            matched_at              TIMESTAMPTZ DEFAULT NOW(),
+            updated_at              TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(person_id)
+        )
+    """),
+    ("idx_pve_zip",    "CREATE INDEX IF NOT EXISTS idx_pve_zip    ON people_voter_enrichment(voter_zip)"),
+    ("idx_pve_ad",     "CREATE INDEX IF NOT EXISTS idx_pve_ad     ON people_voter_enrichment(assembly_district)"),
+    ("idx_pve_sd",     "CREATE INDEX IF NOT EXISTS idx_pve_sd     ON people_voter_enrichment(state_senate_district)"),
+    ("idx_pve_cd",     "CREATE INDEX IF NOT EXISTS idx_pve_cd     ON people_voter_enrichment(congressional_district)"),
+    ("idx_pve_county", "CREATE INDEX IF NOT EXISTS idx_pve_county ON people_voter_enrichment(county_code)"),
+    ("people_influence_scores", """
+        CREATE TABLE IF NOT EXISTS people_influence_scores (
+            id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            person_id           UUID NOT NULL REFERENCES people_person(id) ON DELETE CASCADE,
+            institutional_score NUMERIC(5,2) DEFAULT 0,
+            financial_score     NUMERIC(5,2) DEFAULT 0,
+            lobbying_score      NUMERIC(5,2) DEFAULT 0,
+            network_score       NUMERIC(5,2) DEFAULT 0,
+            engagement_score    NUMERIC(5,2) DEFAULT 0,
+            composite_score     NUMERIC(5,2) DEFAULT 0,
+            component_breakdown JSONB,
+            algorithm_version   VARCHAR(20)  DEFAULT 'v1.0',
+            computed_at         TIMESTAMPTZ  DEFAULT NOW(),
+            UNIQUE(person_id)
+        )
+    """),
+    ("idx_pis_composite", "CREATE INDEX IF NOT EXISTS idx_pis_composite ON people_influence_scores(composite_score DESC)"),
+]
+
+_INFLUENCE_ROLLBACK_SQL = (
+    "DROP TABLE IF EXISTS people_influence_scores CASCADE; "
+    "DROP TABLE IF EXISTS people_voter_enrichment CASCADE; "
+    "DROP TABLE IF EXISTS _finance_migrations CASCADE;"
+)
+
+def setup_influence_tables() -> dict:
+    """
+    Create the three influence-ranking tables.
+    Safe to call multiple times — all statements use IF NOT EXISTS.
+    Returns a summary of what was done and what to do next.
+    """
+    with get_db() as conn:
+        for _name, ddl in _INFLUENCE_DDL:
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+            conn.commit()
+
+        # Record the migration so rollback SQL is always available in the DB
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO _finance_migrations (migration_name, rollback_sql)
+                VALUES ('001_influence_ranking_tables', %s)
+                ON CONFLICT (migration_name) DO NOTHING
+            """, (_INFLUENCE_ROLLBACK_SQL,))
+        conn.commit()
+
+    log.info("setup_influence_tables: all tables and indexes created")
+    return {
+        "status": "ok",
+        "tables_created": [
+            "_finance_migrations",
+            "people_voter_enrichment",
+            "people_influence_scores",
+        ],
+        "next_steps": [
+            "1. Call enrich_voter_data  — matches contacts to voter file",
+            "2. Call compute_influence_scores  — computes v1 scores",
+            "3. Call rank_influential_people  — query results with optional geo filter",
+        ],
+        "to_undo_everything": "Call rollback_influence_tables with confirm=true",
+    }
+
+
+def rollback_influence_tables() -> dict:
+    """
+    DROP all three influence-ranking tables and every row in them.
+    Does NOT touch any existing Pythia tables.
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_INFLUENCE_ROLLBACK_SQL)
+        conn.commit()
+    log.info("rollback_influence_tables: all influence tables dropped")
+    return {
+        "status": "ok",
+        "dropped": [
+            "people_influence_scores",
+            "people_voter_enrichment",
+            "_finance_migrations",
+        ],
+        "message": "All influence ranking data has been removed. Existing Pythia tables are untouched.",
+    }
+
+
+# ─── Influence ranking — voter enrichment ────────────────────────────────────
+
+def _tables_exist() -> tuple[bool, bool]:
+    """Return (voter_enrichment_exists, influence_scores_exists)."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_name IN ('people_voter_enrichment', 'people_influence_scores')
+            """)
+            found = {r["table_name"] for r in cur.fetchall()}
+    return ("people_voter_enrichment" in found, "people_influence_scores" in found)
+
+
+def enrich_voter_data_batch(limit: int = 0) -> dict:
+    """
+    Match every active Pythia contact to the NYC voter file by name.
+    Writes party, voter score, districts, and address into people_voter_enrichment.
+    Safe to re-run — uses INSERT … ON CONFLICT DO UPDATE (upsert).
+    """
+    ve_exists, _ = _tables_exist()
+    if not ve_exists:
+        return {"error": "Table people_voter_enrichment not found. Call setup_influence_tables first."}
+
+    contacts = get_all_contacts()
+    if limit and limit > 0:
+        contacts = contacts[:limit]
+
+    matched, unmatched, errors = 0, 0, 0
+    BATCH = 50  # commit every N upserts to avoid holding a huge transaction
+
+    with get_db() as conn:
+        batch_n = 0
+        for i, contact in enumerate(contacts):
+            pid  = contact.get("id", "")
+            name = (contact.get("full_name") or "").strip()
+            if not name or not pid:
+                continue
+
+            try:
+                voter = lookup_voter(name)
+
+                if voter:
+                    # Confidence: how well did the name match?
+                    v_first = (voter.get("firstname") or voter.get("first") or "").title()
+                    v_last  = (voter.get("lastname")  or voter.get("last")  or "").title()
+                    v_full  = f"{v_first} {v_last}".strip()
+                    conf    = int(fuzz.token_sort_ratio(normalize(name), normalize(v_full)))
+
+                    party_code = voter.get("party") or voter.get("party_code") or ""
+
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO people_voter_enrichment (
+                                person_id, sboeid, party_code, party_label,
+                                voter_score, ge_votes, primary_votes,
+                                ge_years, primary_years, off_year_years,
+                                assembly_district, state_senate_district, congressional_district,
+                                county_code, county_name,
+                                voter_address, voter_city, voter_zip,
+                                match_confidence, matched_at, updated_at
+                            ) VALUES (
+                                %s,%s,%s,%s, %s,%s,%s, %s,%s,%s,
+                                %s,%s,%s, %s,%s, %s,%s,%s, %s, NOW(),NOW()
+                            )
+                            ON CONFLICT (person_id) DO UPDATE SET
+                                sboeid                 = EXCLUDED.sboeid,
+                                party_code             = EXCLUDED.party_code,
+                                party_label            = EXCLUDED.party_label,
+                                voter_score            = EXCLUDED.voter_score,
+                                ge_votes               = EXCLUDED.ge_votes,
+                                primary_votes          = EXCLUDED.primary_votes,
+                                ge_years               = EXCLUDED.ge_years,
+                                primary_years          = EXCLUDED.primary_years,
+                                off_year_years         = EXCLUDED.off_year_years,
+                                assembly_district      = EXCLUDED.assembly_district,
+                                state_senate_district  = EXCLUDED.state_senate_district,
+                                congressional_district = EXCLUDED.congressional_district,
+                                county_code            = EXCLUDED.county_code,
+                                county_name            = EXCLUDED.county_name,
+                                voter_address          = EXCLUDED.voter_address,
+                                voter_city             = EXCLUDED.voter_city,
+                                voter_zip              = EXCLUDED.voter_zip,
+                                match_confidence       = EXCLUDED.match_confidence,
+                                updated_at             = NOW()
+                        """, (
+                            pid,
+                            voter.get("sboeid", "") or "",
+                            party_code,
+                            PARTY_LABELS.get(party_code, party_code),
+                            int(voter.get("voter_score", 0) or 0),
+                            int(voter.get("ge_votes", 0) or voter.get("general_elections_voted", 0) or 0),
+                            int(voter.get("primary_votes", 0) or voter.get("primaries_voted", 0) or 0),
+                            voter.get("ge_years", "")       or "",
+                            voter.get("primary_years", "")  or "",
+                            voter.get("off_year_years", "") or "",
+                            voter.get("ad", "") or voter.get("assembly_district", "")      or "",
+                            voter.get("sd", "") or voter.get("state_senate_district", "")  or "",
+                            voter.get("cd", "") or voter.get("congressional_district", "") or "",
+                            voter.get("county_code", "")  or "",
+                            voter.get("county_name", "") or voter.get("county", "") or "",
+                            voter.get("address", "") or "",
+                            voter.get("city", "")    or "",
+                            voter.get("zip", "")     or "",
+                            conf,
+                        ))
+                    matched  += 1
+                    batch_n  += 1
+                    if batch_n >= BATCH:
+                        conn.commit()
+                        batch_n = 0
+                        log.info(f"enrich_voter_data: {i+1}/{len(contacts)} processed, {matched} matched so far")
+                else:
+                    unmatched += 1
+
+            except Exception as e:
+                log.warning(f"enrich_voter_data error for {name!r}: {e}")
+                errors += 1
+
+        conn.commit()  # final commit for last partial batch
+
+    log.info(f"enrich_voter_data complete: matched={matched} unmatched={unmatched} errors={errors}")
+    return {
+        "status":          "ok",
+        "total_processed": len(contacts),
+        "matched":         matched,
+        "unmatched":       unmatched,
+        "errors":          errors,
+        "match_rate_pct":  round(matched / max(len(contacts), 1) * 100, 1),
+        "message": (
+            f"{matched} of {len(contacts)} contacts matched to the voter file. "
+            "Next step: call compute_influence_scores."
+        ),
+    }
+
+
+# ─── Influence ranking — v1 scoring ──────────────────────────────────────────
+
+def _parse_first_dollar(text: str) -> float:
+    """Extract the first $N,NNN amount from a string. Returns 0.0 if none found."""
+    m = re.search(r"\$([0-9,]+)", text or "")
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
+def compute_influence_scores_batch() -> dict:
+    """
+    Compute v1 influence scores for every active Pythia contact.
+    Five components:
+      institutional (35%) — org influence tier + role seniority
+      financial     (25%) — campaign donations given/received
+      lobbying      (20%) — being targeted by lobbyists
+      network       (15%) — total relationship connections
+      engagement    (5%)  — voter score / civic participation
+    Scores are written to people_influence_scores (upsert — safe to re-run).
+    """
+    _, pis_exists = _tables_exist()
+    if not pis_exists:
+        return {"error": "Table people_influence_scores not found. Call setup_influence_tables first."}
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+
+            # ── 1. Institutional data ──────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    p.id::text                                        AS person_id,
+                    p.full_name,
+                    MIN(o.influence_tier)                             AS best_tier,
+                    MAX(CASE WHEN rt.is_decision_maker THEN 1 ELSE 0 END) AS is_decision_maker,
+                    MAX(COALESCE(rt.seniority_level, 0))              AS max_seniority,
+                    COUNT(DISTINCT CASE WHEN o.influence_tier = 1 THEN o.id END) AS tier1_orgs
+                FROM people_person p
+                LEFT JOIN people_personorganization po
+                    ON po.person_id = p.id AND po.is_current = TRUE
+                LEFT JOIN organizations_organization o
+                    ON o.id = po.organization_id AND o.influence_tier IS NOT NULL
+                LEFT JOIN people_roletype rt
+                    ON rt.id = po.role_type_id
+                WHERE p.is_active = TRUE
+                GROUP BY p.id, p.full_name
+            """)
+            inst_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
+
+            # ── 2. Donations made (Campaign Donor, this person → someone) ──
+            cur.execute("""
+                SELECT
+                    from_person_id::text            AS person_id,
+                    COUNT(*)                         AS donation_count,
+                    COUNT(DISTINCT to_person_id)     AS unique_recipients,
+                    STRING_AGG(notes, '|||')          AS all_notes
+                FROM people_personrelationship
+                WHERE relationship_type = 'Campaign Donor' AND is_active = TRUE
+                GROUP BY from_person_id
+            """)
+            donor_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
+
+            # ── 3. Donations received (this person is the target/politician) ─
+            cur.execute("""
+                SELECT
+                    to_person_id::text              AS person_id,
+                    COUNT(DISTINCT from_person_id)   AS unique_donors
+                FROM people_personrelationship
+                WHERE relationship_type = 'Campaign Donor' AND is_active = TRUE
+                GROUP BY to_person_id
+            """)
+            recvd_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
+
+            # ── 4. Lobbying exposure (others lobbied THIS person) ──────────
+            cur.execute("""
+                SELECT
+                    to_person_id::text  AS person_id,
+                    COUNT(*)            AS lobbying_count,
+                    STRING_AGG(notes, '|||') AS all_notes
+                FROM people_personrelationship
+                WHERE relationship_type IN ('Lobbyist', 'Lobbying Client')
+                  AND is_active = TRUE
+                GROUP BY to_person_id
+            """)
+            lobby_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
+
+            # ── 5. Network (total connections, both directions) ────────────
+            cur.execute("""
+                SELECT person_id::text, COUNT(*) AS total_connections
+                FROM (
+                    SELECT from_person_id AS person_id
+                    FROM people_personrelationship WHERE is_active = TRUE
+                    UNION ALL
+                    SELECT to_person_id
+                    FROM people_personrelationship WHERE is_active = TRUE
+                ) all_sides
+                JOIN people_person p ON p.id = person_id AND p.is_active = TRUE
+                GROUP BY person_id
+            """)
+            net_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
+
+            # ── 6. Voter engagement ────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    person_id::text,
+                    voter_score,
+                    ge_votes,
+                    primary_votes
+                FROM people_voter_enrichment
+            """)
+            voter_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
+
+            # ── 7. All active people ───────────────────────────────────────
+            cur.execute("""
+                SELECT id::text AS person_id, full_name
+                FROM people_person WHERE is_active = TRUE
+            """)
+            all_people = list(cur.fetchall())
+
+        # ── Compute scores in Python ───────────────────────────────────────
+        WEIGHTS = dict(institutional=0.35, financial=0.25,
+                       lobbying=0.20, network=0.15, engagement=0.05)
+
+        scored = []
+        for person in all_people:
+            pid  = person["person_id"]
+            name = person["full_name"] or ""
+
+            inst  = inst_map.get(pid, {})
+            don   = donor_map.get(pid, {})
+            recv  = recvd_map.get(pid, {})
+            lob   = lobby_map.get(pid, {})
+            net   = net_map.get(pid, {})
+            vot   = voter_map.get(pid, {})
+
+            # -- Institutional score (0-100) ---------------------------------
+            tier      = inst.get("best_tier")
+            tier_base = {1: 80, 2: 50, 3: 25}.get(tier, 5) if tier else 5
+            seniority_bonus  = min(15, int(inst.get("max_seniority", 0) or 0) * 2)
+            decision_bonus   = 15 if inst.get("is_decision_maker") else 0
+            multi_tier1_bonus = min(10, max(0, int(inst.get("tier1_orgs", 0) or 0) - 1) * 5)
+            institutional_score = min(100.0, tier_base + seniority_bonus + decision_bonus + multi_tier1_bonus)
+
+            # -- Financial score (0-100) -------------------------------------
+            # Total donated — parse $ amounts out of relationship notes
+            total_donated = 0.0
+            raw_notes = don.get("all_notes") or ""
+            for chunk in raw_notes.split("|||"):
+                total_donated += _parse_first_dollar(chunk)
+
+            amount_score    = min(60.0, _math.log10(total_donated + 1) * 15)
+            breadth_score   = min(25.0, int(don.get("unique_recipients", 0) or 0) * 5)
+            recipient_score = min(15.0, int(recv.get("unique_donors", 0) or 0) * 2)
+            financial_score = min(100.0, amount_score + breadth_score + recipient_score)
+
+            # -- Lobbying score (0-100) -- being lobbied = decision power ----
+            total_comp = 0.0
+            lob_notes  = lob.get("all_notes") or ""
+            for chunk in lob_notes.split("|||"):
+                # Notes look like "Client: X | Compensation: $50,000"
+                m = re.search(r"Compensation:\s*\$([0-9,]+)", chunk)
+                if m:
+                    try:
+                        total_comp += float(m.group(1).replace(",", ""))
+                    except ValueError:
+                        pass
+                else:
+                    total_comp += _parse_first_dollar(chunk)
+
+            lob_count_score = min(50.0, int(lob.get("lobbying_count", 0) or 0) * 5)
+            lob_comp_score  = min(50.0, _math.log10(total_comp + 1) * 12) if total_comp > 0 else 0.0
+            lobbying_score  = min(100.0, lob_count_score + lob_comp_score)
+
+            # -- Network score (0-100) ---------------------------------------
+            total_conn  = int(net.get("total_connections", 0) or 0)
+            network_score = min(100.0, _math.log10(total_conn + 1) * 30) if total_conn > 0 else 0.0
+
+            # -- Engagement score (0-100) ------------------------------------
+            if vot:
+                vs       = int(vot.get("voter_score", 0)  or 0)
+                ge_v     = int(vot.get("ge_votes", 0)     or 0)
+                pri_v    = int(vot.get("primary_votes", 0) or 0)
+                vs_score  = min(50.0, (vs / 30.0) * 50.0)
+                ge_score  = min(25.0, ge_v  * 2.0)
+                pri_score = min(25.0, pri_v * 3.0)
+                engagement_score = min(100.0, vs_score + ge_score + pri_score)
+            else:
+                engagement_score = 0.0
+
+            # -- Composite with stacking bonus -------------------------------
+            base = (WEIGHTS["institutional"] * institutional_score
+                    + WEIGHTS["financial"]    * financial_score
+                    + WEIGHTS["lobbying"]     * lobbying_score
+                    + WEIGHTS["network"]      * network_score
+                    + WEIGHTS["engagement"]   * engagement_score)
+
+            strong = sum(1 for s in [institutional_score, financial_score,
+                                     lobbying_score, network_score] if s > 60)
+            stacking = 1.0 + 0.15 * max(0, strong - 1)
+            composite_score = min(100.0, base * stacking)
+
+            breakdown = {
+                "institutional":  round(institutional_score, 2),
+                "financial":      round(financial_score, 2),
+                "lobbying":       round(lobbying_score, 2),
+                "network":        round(network_score, 2),
+                "engagement":     round(engagement_score, 2),
+                "stacking_bonus": round(stacking, 3),
+                "raw": {
+                    "best_tier":         tier,
+                    "is_decision_maker": bool(inst.get("is_decision_maker")),
+                    "max_seniority":     int(inst.get("max_seniority", 0) or 0),
+                    "tier1_org_count":   int(inst.get("tier1_orgs", 0) or 0),
+                    "total_donated":     round(total_donated, 2),
+                    "donation_count":    int(don.get("donation_count", 0) or 0),
+                    "unique_recipients": int(don.get("unique_recipients", 0) or 0),
+                    "unique_donors_in":  int(recv.get("unique_donors", 0) or 0),
+                    "lobbying_filings":  int(lob.get("lobbying_count", 0) or 0),
+                    "total_lobby_comp":  round(total_comp, 2),
+                    "total_connections": total_conn,
+                    "voter_score":       int(vot.get("voter_score", 0) or 0) if vot else None,
+                },
+            }
+
+            scored.append({
+                "person_id":          pid,
+                "institutional_score": round(institutional_score, 2),
+                "financial_score":     round(financial_score, 2),
+                "lobbying_score":      round(lobbying_score, 2),
+                "network_score":       round(network_score, 2),
+                "engagement_score":    round(engagement_score, 2),
+                "composite_score":     round(composite_score, 2),
+                "breakdown":           breakdown,
+                "name":                name,
+            })
+
+        # ── Upsert scores into DB in batches ──────────────────────────────
+        BATCH = 100
+        with get_db() as wconn:
+            for i in range(0, len(scored), BATCH):
+                chunk = scored[i: i + BATCH]
+                with wconn.cursor() as cur:
+                    for r in chunk:
+                        cur.execute("""
+                            INSERT INTO people_influence_scores (
+                                person_id,
+                                institutional_score, financial_score, lobbying_score,
+                                network_score, engagement_score, composite_score,
+                                component_breakdown, algorithm_version, computed_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'v1.0', NOW())
+                            ON CONFLICT (person_id) DO UPDATE SET
+                                institutional_score = EXCLUDED.institutional_score,
+                                financial_score     = EXCLUDED.financial_score,
+                                lobbying_score      = EXCLUDED.lobbying_score,
+                                network_score       = EXCLUDED.network_score,
+                                engagement_score    = EXCLUDED.engagement_score,
+                                composite_score     = EXCLUDED.composite_score,
+                                component_breakdown = EXCLUDED.component_breakdown,
+                                algorithm_version   = EXCLUDED.algorithm_version,
+                                computed_at         = NOW()
+                        """, (
+                            r["person_id"],
+                            r["institutional_score"], r["financial_score"],
+                            r["lobbying_score"],      r["network_score"],
+                            r["engagement_score"],    r["composite_score"],
+                            json.dumps(r["breakdown"]),
+                        ))
+                wconn.commit()
+                log.info(f"compute_influence_scores: upserted {min(i+BATCH, len(scored))}/{len(scored)}")
+
+    top10 = sorted(scored, key=lambda x: -x["composite_score"])[:10]
+    log.info(f"compute_influence_scores complete: {len(scored)} contacts scored")
+    return {
+        "status":          "ok",
+        "contacts_scored": len(scored),
+        "algorithm":       "v1.0",
+        "weights":         WEIGHTS,
+        "top_10_preview":  [
+            {"name": r["name"], "composite": r["composite_score"],
+             "inst": r["institutional_score"], "fin": r["financial_score"],
+             "lob":  r["lobbying_score"],       "net": r["network_score"],
+             "eng":  r["engagement_score"]}
+            for r in top10
+        ],
+        "next_step": "Call rank_influential_people to query results with optional geographic filters.",
+    }
+
+
+# ─── Influence ranking — query ────────────────────────────────────────────────
+
+_BOROUGH_COUNTY = {
+    "manhattan": "31", "new york": "31",
+    "brooklyn":  "24", "kings":    "24",
+    "queens":    "41",
+    "bronx":     "03",
+    "staten island": "43", "richmond": "43",
+}
+
+def rank_influential_people(
+    zip_code: str               = "",
+    borough: str                = "",
+    assembly_district: str      = "",
+    state_senate_district: str  = "",
+    congressional_district: str = "",
+    limit: int                  = 25,
+    min_score: float            = 0.0,
+) -> list[dict]:
+    """
+    Query stored influence scores with optional geographic and score filters.
+    Geographic filters use voter-file addresses from people_voter_enrichment.
+    Returns ranked list, most influential first.
+    """
+    _, pis_exists = _tables_exist()
+    if not pis_exists:
+        return [{"error": "Table people_influence_scores not found. Run setup_influence_tables first."}]
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM people_influence_scores")
+            if (cur.fetchone() or {}).get("n", 0) == 0:
+                return [{"error": "No scores yet. Run compute_influence_scores first."}]
+
+    has_geo  = any([zip_code, borough, assembly_district,
+                    state_senate_district, congressional_district])
+    filters  = []
+    params: list = []
+
+    if zip_code:
+        filters.append("pve.voter_zip = %s")
+        params.append(zip_code.strip())
+    if borough:
+        cc = _BOROUGH_COUNTY.get(borough.lower().strip())
+        if cc:
+            filters.append("pve.county_code = %s")
+            params.append(cc)
+    if assembly_district:
+        filters.append("CAST(LTRIM(COALESCE(pve.assembly_district,'0'),'0') AS TEXT) = %s")
+        params.append(str(assembly_district).lstrip("0") or "0")
+    if state_senate_district:
+        filters.append("CAST(LTRIM(COALESCE(pve.state_senate_district,'0'),'0') AS TEXT) = %s")
+        params.append(str(state_senate_district).lstrip("0") or "0")
+    if congressional_district:
+        filters.append("CAST(LTRIM(COALESCE(pve.congressional_district,'0'),'0') AS TEXT) = %s")
+        params.append(str(congressional_district).lstrip("0") or "0")
+    if min_score > 0:
+        filters.append("pis.composite_score >= %s")
+        params.append(min_score)
+
+    # For geo queries use INNER JOIN so unmatched contacts are excluded.
+    # For citywide (no geo filter) use LEFT JOIN so everyone appears.
+    voter_join  = "JOIN" if has_geo else "LEFT JOIN"
+    where_extra = ("AND " + " AND ".join(filters)) if filters else ""
+
+    params.append(limit)
+
+    sql = f"""
+        WITH ranked AS (
+            SELECT
+                p.id::text                   AS person_id,
+                p.full_name,
+                pis.composite_score,
+                pis.institutional_score,
+                pis.financial_score,
+                pis.lobbying_score,
+                pis.network_score,
+                pis.engagement_score,
+                pis.component_breakdown::text AS breakdown_json,
+                pis.computed_at,
+                pve.voter_zip,
+                pve.assembly_district,
+                pve.state_senate_district,
+                pve.congressional_district,
+                pve.county_name,
+                pve.party_label,
+                pve.voter_score,
+                pve.voter_address,
+                pve.voter_city
+            FROM people_influence_scores pis
+            JOIN people_person p ON p.id = pis.person_id AND p.is_active = TRUE
+            {voter_join} people_voter_enrichment pve ON pve.person_id = pis.person_id
+            WHERE 1=1 {where_extra}
+            ORDER BY pis.composite_score DESC
+            LIMIT %s
+        )
+        SELECT
+            r.*,
+            STRING_AGG(DISTINCT o.name,     ', ' ORDER BY o.name) AS orgs,
+            MIN(o.influence_tier)                                   AS best_tier,
+            STRING_AGG(DISTINCT po.job_title, ', ')                 AS titles
+        FROM ranked r
+        LEFT JOIN people_personorganization po
+            ON po.person_id::text = r.person_id AND po.is_current = TRUE
+        LEFT JOIN organizations_organization o ON o.id = po.organization_id
+        GROUP BY
+            r.person_id, r.full_name, r.composite_score,
+            r.institutional_score, r.financial_score, r.lobbying_score,
+            r.network_score, r.engagement_score, r.breakdown_json,
+            r.computed_at, r.voter_zip, r.assembly_district,
+            r.state_senate_district, r.congressional_district,
+            r.county_name, r.party_label, r.voter_score,
+            r.voter_address, r.voter_city
+        ORDER BY r.composite_score DESC
+    """
+
+    results = []
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            for row in cur.fetchall():
+                d = dict(row)
+                # Parse JSON breakdown back to dict for clean output
+                if d.get("breakdown_json"):
+                    try:
+                        d["component_breakdown"] = json.loads(d["breakdown_json"])
+                    except Exception:
+                        d["component_breakdown"] = {}
+                    del d["breakdown_json"]
+                results.append(d)
+
+    return results
+
+
 # ─── Finance API calls ────────────────────────────────────────────────────────
 
 def cfb_donations_received(candidate_name: str, limit: int = 50) -> list[dict]:
@@ -2592,6 +3283,115 @@ async def list_tools() -> list[types.Tool]:
                 "required": []
             }
         ),
+        # ── Influence ranking tools ────────────────────────────────────────
+        types.Tool(
+            name="setup_influence_tables",
+            description=(
+                "One-time setup: creates the three database tables needed for influence scoring "
+                "(people_voter_enrichment, people_influence_scores, _finance_migrations). "
+                "Safe to call multiple times — uses IF NOT EXISTS. "
+                "Call this FIRST before running any other influence ranking tools. "
+                "To undo everything: call rollback_influence_tables with confirm=true."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="rollback_influence_tables",
+            description=(
+                "DESTRUCTIVE: drops all three influence ranking tables and all data in them. "
+                "Does NOT touch any existing Pythia tables (people_person, organizations_organization, etc.). "
+                "Requires confirm=true to prevent accidental execution."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true to execute. Anything else aborts with no changes."
+                    }
+                },
+                "required": ["confirm"],
+            },
+        ),
+        types.Tool(
+            name="enrich_voter_data",
+            description=(
+                "Match every active Pythia contact to the NYC voter file by name, then store "
+                "their party registration, voter score, assembly/senate/congressional districts, "
+                "and home address in people_voter_enrichment. "
+                "Safe to re-run — upserts on conflict. "
+                "Run setup_influence_tables first. "
+                "Use the optional limit parameter to test on a small batch before running on all contacts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max contacts to process. 0 or omit = all contacts (default)."
+                    }
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="compute_influence_scores",
+            description=(
+                "Compute v1 influence scores for every active Pythia contact and store results "
+                "in people_influence_scores. Five weighted components: "
+                "institutional authority (35%), financial influence (25%), "
+                "lobbying exposure (20%), network connections (15%), civic engagement (5%). "
+                "Safe to re-run — updates existing scores. "
+                "Run setup_influence_tables and enrich_voter_data first for best results. "
+                "Also run lookup_finance_connections on key contacts before scoring so "
+                "campaign finance and lobbying data is written to the database."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="rank_influential_people",
+            description=(
+                "Return a ranked list of the most influential people based on stored influence scores. "
+                "Filter by zip code, borough, assembly district, state senate district, or "
+                "congressional district. No filter = full citywide ranking. "
+                "Results include score breakdown, org affiliations, voter data, and district assignments. "
+                "Run compute_influence_scores first to populate scores."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "zip_code": {
+                        "type": "string",
+                        "description": "5-digit zip code — filters to people whose voter-file address is in this zip."
+                    },
+                    "borough": {
+                        "type": "string",
+                        "description": "manhattan, brooklyn, queens, bronx, or staten island."
+                    },
+                    "assembly_district": {
+                        "type": "string",
+                        "description": "Assembly district number (e.g. '73')."
+                    },
+                    "state_senate_district": {
+                        "type": "string",
+                        "description": "State senate district number."
+                    },
+                    "congressional_district": {
+                        "type": "string",
+                        "description": "Congressional district number."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return. Default 25."
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Minimum composite score (0-100). Default 0."
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 @mcp_server.call_tool()
@@ -2696,7 +3496,46 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             return [types.TextContent(type="text", text=json.dumps(results, indent=2, default=str))]
 
         else:
-            return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+            # ── Influence ranking tools ────────────────────────────────────
+            if name == "setup_influence_tables":
+                log.info("setup_influence_tables called")
+                result = await loop.run_in_executor(None, setup_influence_tables)
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "rollback_influence_tables":
+                if not arguments.get("confirm"):
+                    return [types.TextContent(type="text", text=json.dumps(
+                        {"error": "Aborted. Pass confirm=true to execute rollback."}))]
+                log.info("rollback_influence_tables called — dropping tables")
+                result = await loop.run_in_executor(None, rollback_influence_tables)
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "enrich_voter_data":
+                lim = int(arguments.get("limit", 0))
+                log.info(f"enrich_voter_data called, limit={lim}")
+                result = await loop.run_in_executor(None, lambda: enrich_voter_data_batch(lim))
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "compute_influence_scores":
+                log.info("compute_influence_scores called")
+                result = await loop.run_in_executor(None, compute_influence_scores_batch)
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+            elif name == "rank_influential_people":
+                log.info(f"rank_influential_people called: {arguments}")
+                result = await loop.run_in_executor(None, lambda: rank_influential_people(
+                    zip_code               = arguments.get("zip_code", ""),
+                    borough                = arguments.get("borough", ""),
+                    assembly_district      = arguments.get("assembly_district", ""),
+                    state_senate_district  = arguments.get("state_senate_district", ""),
+                    congressional_district = arguments.get("congressional_district", ""),
+                    limit                  = int(arguments.get("limit", 25)),
+                    min_score              = float(arguments.get("min_score", 0)),
+                ))
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+            else:
+                return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
 
     except Exception as e:
         log.error(f"call_tool error in {name}: {e}", exc_info=True)
