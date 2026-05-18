@@ -3557,14 +3557,37 @@ def _check_auth(request: Request) -> bool:
     provided = request.headers.get("x-api-key") or request.query_params.get("api_key", "")
     return provided == expected
 
+def _make_server() -> Server:
+    """
+    Create a FRESH Server instance for each SSE connection.
+
+    mcp.server.Server stores _client_params and initialization state as
+    instance variables. Calling .run() concurrently on the same instance
+    causes initialization state to be shared across connections — the first
+    connection's handshake completes the flag for all later connections,
+    so they never finish their own InitializeRequest/InitializedNotification
+    exchange and every tool call gets "Received request before initialization
+    was complete".
+
+    Solution: one Server instance per connection. The global mcp_server is
+    kept only to register the handler functions via decorators; each actual
+    SSE connection gets its own fresh copy.
+    """
+    s = Server("finance-enrichment")
+    s.list_tools()(list_tools)
+    s.call_tool()(call_tool)
+    return s
+
+
 async def handle_sse(request: Request):
     if not _check_auth(request):
         return Response("Unauthorized", status_code=401)
     log.info(f"SSE connection from {request.client}")
+    conn_server = _make_server()   # ← fresh instance, no shared init state
     async with sse_transport.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
-        await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+        await conn_server.run(streams[0], streams[1], conn_server.create_initialization_options())
     return Response()  # connect_sse managed the full response; return empty so Starlette doesn't raise TypeError
 
 # /messages/ must be a raw ASGI app — handle_post_message sends its own response
