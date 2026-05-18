@@ -724,36 +724,44 @@ def compute_influence_scores_batch() -> dict:
                 "breakdown":           breakdown,
             })
 
-        # ── Stage 4: upsert scores (same connection) ──────────────────────────
-        BATCH = 100
-        for i in range(0, len(scored), BATCH):
-            with conn.cursor() as cur:
-                for r in scored[i: i + BATCH]:
-                    cur.execute("""
-                        INSERT INTO people_influence_scores (
-                            person_id, institutional_score, financial_score, lobbying_score,
-                            network_score, engagement_score, composite_score,
-                            component_breakdown, algorithm_version, computed_at
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'v1.0',NOW())
-                        ON CONFLICT (person_id) DO UPDATE SET
-                            institutional_score = EXCLUDED.institutional_score,
-                            financial_score     = EXCLUDED.financial_score,
-                            lobbying_score      = EXCLUDED.lobbying_score,
-                            network_score       = EXCLUDED.network_score,
-                            engagement_score    = EXCLUDED.engagement_score,
-                            composite_score     = EXCLUDED.composite_score,
-                            component_breakdown = EXCLUDED.component_breakdown,
-                            algorithm_version   = EXCLUDED.algorithm_version,
-                            computed_at         = NOW()
-                    """, (
-                        r["person_id"],
-                        r["institutional_score"], r["financial_score"],
-                        r["lobbying_score"],      r["network_score"],
-                        r["engagement_score"],    r["composite_score"],
-                        json.dumps(r["breakdown"]),
-                    ))
-            conn.commit()
-            log.info(f"compute_influence_scores: upserted {min(i+BATCH, len(scored))}/{len(scored)}")
+        # ── Stage 4: bulk upsert all scores in one round trip ─────────────────────────
+        rows = [
+            (
+                r["person_id"],
+                r["institutional_score"], r["financial_score"],
+                r["lobbying_score"],      r["network_score"],
+                r["engagement_score"],    r["composite_score"],
+                json.dumps(r["breakdown"]),
+            )
+            for r in scored
+        ]
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO people_influence_scores (
+                    person_id,
+                    institutional_score, financial_score, lobbying_score,
+                    network_score, engagement_score, composite_score,
+                    component_breakdown, algorithm_version, computed_at
+                ) VALUES %s
+                ON CONFLICT (person_id) DO UPDATE SET
+                    institutional_score = EXCLUDED.institutional_score,
+                    financial_score     = EXCLUDED.financial_score,
+                    lobbying_score      = EXCLUDED.lobbying_score,
+                    network_score       = EXCLUDED.network_score,
+                    engagement_score    = EXCLUDED.engagement_score,
+                    composite_score     = EXCLUDED.composite_score,
+                    component_breakdown = EXCLUDED.component_breakdown,
+                    algorithm_version   = EXCLUDED.algorithm_version,
+                    computed_at         = NOW()
+                """,
+                rows,
+                template="(%s,%s,%s,%s,%s,%s,%s,%s,'v1.0',NOW())",
+                page_size=500,
+            )
+        conn.commit()
+        log.info(f"compute_influence_scores: bulk upserted {len(scored)} rows")
 
         top10 = sorted(scored, key=lambda x: -x["composite_score"])[:10]
         log.info(f"compute_influence_scores complete: {len(scored)} contacts scored")
