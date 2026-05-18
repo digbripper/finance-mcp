@@ -296,9 +296,29 @@ _INFLUENCE_DDL: list[tuple[str, str]] = [
         )
     """),
     ("idx_pis_composite", "CREATE INDEX IF NOT EXISTS idx_pis_composite ON people_influence_scores(composite_score DESC)"),
+    ("organizations_990_data", """
+        CREATE TABLE IF NOT EXISTS organizations_990_data (
+            id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            organization_id  UUID NOT NULL REFERENCES organizations_organization(id) ON DELETE CASCADE,
+            ein              VARCHAR(20),
+            legal_name       VARCHAR(500),
+            total_revenue    BIGINT,
+            total_assets     BIGINT,
+            total_expenses   BIGINT,
+            num_employees    INTEGER,
+            ntee_code        VARCHAR(20),
+            fiscal_year      INTEGER,
+            match_confidence INTEGER DEFAULT 0,
+            fetched_at       TIMESTAMPTZ DEFAULT NOW(),
+            updated_at       TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(organization_id)
+        )
+    """),
+    ("idx_990_revenue", "CREATE INDEX IF NOT EXISTS idx_990_revenue ON organizations_990_data(total_revenue DESC NULLS LAST)"),
 ]
 
 _INFLUENCE_ROLLBACK_SQL = (
+    "DROP TABLE IF EXISTS organizations_990_data CASCADE; "
     "DROP TABLE IF EXISTS people_influence_scores CASCADE; "
     "DROP TABLE IF EXISTS people_voter_enrichment CASCADE; "
     "DROP TABLE IF EXISTS _finance_migrations CASCADE;"
@@ -332,11 +352,13 @@ def setup_influence_tables() -> dict:
             "_finance_migrations",
             "people_voter_enrichment",
             "people_influence_scores",
+            "organizations_990_data",
         ],
         "next_steps": [
             "1. Call enrich_voter_data  — matches contacts to voter file",
-            "2. Call compute_influence_scores  — computes v1 scores",
-            "3. Call rank_influential_people  — query results with optional geo filter",
+            "2. Call fetch_990_data     — fetches IRS 990 revenue data for orgs",
+            "3. Call compute_influence_scores  — computes v1 scores",
+            "4. Call rank_influential_people  — query results with optional geo filter",
         ],
         "to_undo_everything": "Call rollback_influence_tables with confirm=true",
     }
@@ -634,6 +656,23 @@ def compute_influence_scores_batch() -> dict:
         except Exception:
             voter_map = {}  # table may be empty or not yet populated
 
+        # ── 990 revenue per person (best org they're currently at) ─────────
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT po.person_id::text, MAX(n.total_revenue) AS max_revenue
+                    FROM people_personorganization po
+                    JOIN organizations_990_data n ON n.organization_id = po.organization_id
+                    WHERE po.is_current = TRUE
+                      AND n.total_revenue IS NOT NULL
+                      AND n.total_revenue > 0
+                      AND n.match_confidence > 70
+                    GROUP BY po.person_id
+                """)
+                revenue_990_map = {r["person_id"]: int(r["max_revenue"]) for r in cur.fetchall()}
+        except Exception:
+            revenue_990_map = {}  # table may not exist yet
+
         with conn.cursor() as cur:
             cur.execute("SELECT id::text AS person_id, full_name FROM people_person WHERE is_active = TRUE")
             all_people = list(cur.fetchall())
@@ -653,12 +692,17 @@ def compute_influence_scores_batch() -> dict:
             net  = net_map.get(pid, {})
             vot  = voter_map.get(pid)
 
+            # ── Institutional score ────────────────────────────────────────
             tier      = inst.get("best_tier")
             tier_base = {1: 80, 2: 50, 3: 25}.get(tier, 5) if tier else 5
+            # 990 revenue-based score — takes precedence over manual tier if higher
+            revenue_990    = revenue_990_map.get(pid)
+            revenue_score  = _revenue_to_institutional_score(revenue_990)
+            institutional_base = max(float(tier_base), revenue_score)
             seniority_bonus   = min(15, int(inst.get("max_seniority", 0) or 0) * 2)
             decision_bonus    = 15 if inst.get("is_decision_maker") else 0
             multi_tier1_bonus = min(10, max(0, int(inst.get("tier1_orgs", 0) or 0) - 1) * 5)
-            institutional_score = min(100.0, tier_base + seniority_bonus + decision_bonus + multi_tier1_bonus)
+            institutional_score = min(100.0, institutional_base + seniority_bonus + decision_bonus + multi_tier1_bonus)
 
             total_donated = 0.0
             for chunk in (don.get("all_notes") or "").split("|||"):
@@ -705,6 +749,7 @@ def compute_influence_scores_batch() -> dict:
                 "raw": {
                     "best_tier":         tier,
                     "is_decision_maker": bool(inst.get("is_decision_maker")),
+                    "revenue_990":       revenue_990,
                     "total_donated":     round(total_donated, 2),
                     "donation_count":    int(don.get("donation_count", 0) or 0),
                     "unique_donors_in":  int(recv.get("unique_donors", 0) or 0),
@@ -926,6 +971,339 @@ def rank_influential_people(
                 results.append(d)
 
     return results
+
+
+# ─── IRS 990 data — ProPublica Nonprofit Explorer ────────────────────────────
+
+# Keywords that identify government or for-profit entities that don't file 990s.
+# These are skipped during 990 fetching to avoid wasted API calls.
+_GOVT_KEYWORDS = (
+    "u.s. senate", "us senate", "united states senate",
+    "u.s. house", "us house", "house of representatives",
+    "nyc ", "city of new york", "new york city",
+    "office of the mayor", "office of the new york city mayor",
+    "mayor's office", "borough president",
+    "city council", "city planning",
+    "state of new york", "nys ", "new york state",
+    "governor", "state comptroller", "attorney general",
+    "department of ", "dept. of ", "office of ",
+    "nypd", "fdny", "police department", "fire department",
+    "federal ", "congress", "white house",
+    "supreme court", "district court",
+)
+
+def _is_government_entity(org_name: str) -> bool:
+    """Return True if org is a government body or for-profit that won't have a 990."""
+    n = org_name.lower().strip()
+    return any(kw in n for kw in _GOVT_KEYWORDS)
+
+
+def _revenue_to_institutional_score(revenue: int | None) -> float:
+    """
+    Convert annual nonprofit revenue (from IRS 990) to an institutional score (0-100).
+    Uses a log-like scale so score differences between small orgs are meaningful.
+    """
+    if not revenue or revenue <= 0:
+        return 0.0
+    if revenue >= 1_000_000_000:   # $1B+
+        return 95.0
+    if revenue >= 500_000_000:     # $500M – $1B
+        return 88.0
+    if revenue >= 100_000_000:     # $100M – $500M
+        return 80.0
+    if revenue >= 50_000_000:      # $50M – $100M
+        return 70.0
+    if revenue >= 10_000_000:      # $10M – $50M
+        return 55.0
+    if revenue >= 5_000_000:       # $5M – $10M
+        return 40.0
+    if revenue >= 1_000_000:       # $1M – $5M
+        return 25.0
+    return 10.0
+
+
+def _search_propublica_990(org_name: str) -> dict | None:
+    """
+    Search ProPublica Nonprofit Explorer API for an organization and return
+    its most recent 990 filing data (revenue, assets, NTEE code, etc.).
+    Returns None if no confident match is found.
+    Makes at most 2 API calls: one search, one detail fetch.
+    """
+    if not org_name or not org_name.strip():
+        return None
+
+    # Strip legal suffixes that confuse the search
+    clean = org_name.strip()
+    for sfx in (", Inc.", ", Inc", ", LLC", ", Corp.", ", Corp",
+                " Foundation", " Institute", " Association"):
+        if clean.endswith(sfx):
+            clean = clean[: -len(sfx)].strip()
+
+    try:
+        # ── Search (NY state first, broader if needed) ─────────────────────
+        search_url = "https://projects.propublica.org/nonprofits/api/v2/search.json"
+        resp = requests.get(search_url, params={"q": clean, "state[id]": "NY"},
+                            timeout=15, headers={"User-Agent": "research/public-data"})
+        candidates = resp.json().get("organizations", []) if resp.ok else []
+
+        if not candidates:
+            resp2 = requests.get(search_url, params={"q": clean},
+                                 timeout=15, headers={"User-Agent": "research/public-data"})
+            candidates = resp2.json().get("organizations", []) if resp2.ok else []
+
+        if not candidates:
+            return None
+
+        # ── Fuzzy-match to pick best candidate ─────────────────────────────
+        best, best_score = None, 0
+        for c in candidates[:10]:
+            score = fuzz.token_sort_ratio(normalize(org_name), normalize(c.get("name", "")))
+            if score > best_score:
+                best_score, best = score, c
+
+        if best_score < 75 or not best:
+            return None
+
+        # ── Fetch detail for the matched EIN ───────────────────────────────
+        ein = str(best.get("ein", "")).replace("-", "").strip()
+        if not ein:
+            return None
+
+        import time as _time
+        _time.sleep(0.3)   # polite pause between search and detail call
+
+        det = requests.get(
+            f"https://projects.propublica.org/nonprofits/api/v2/organizations/{ein}.json",
+            timeout=15, headers={"User-Agent": "research/public-data"},
+        )
+        if not det.ok:
+            return None
+
+        data     = det.json()
+        org_info = data.get("organization", {})
+        filings  = [f for f in data.get("filings_with_data", [])
+                    if (f.get("totrevenue") or 0) > 0]
+
+        if not filings:
+            return None
+
+        latest = max(filings, key=lambda f: f.get("tax_prd_yr", 0))
+
+        return {
+            "ein":            ein,
+            "legal_name":     org_info.get("name") or best.get("name", ""),
+            "total_revenue":  int(latest.get("totrevenue", 0) or 0),
+            "total_assets":   int(latest.get("totassetsend", 0) or latest.get("totassets", 0) or 0),
+            "total_expenses": int(latest.get("totfuncexpns", 0) or 0),
+            "num_employees":  int(latest.get("totemploy", 0) or 0),
+            "ntee_code":      str(org_info.get("ntee_code") or best.get("ntee_code") or ""),
+            "fiscal_year":    int(latest.get("tax_prd_yr", 0) or 0),
+            "match_confidence": best_score,
+        }
+
+    except Exception as e:
+        log.warning(f"ProPublica 990 lookup error for {org_name!r}: {e}")
+        return None
+
+
+def fetch_990_data_batch(limit: int = 50, force: bool = False) -> dict:
+    """
+    Fetch IRS 990 data for Pythia organizations via ProPublica Nonprofit Explorer.
+    Stores annual revenue, assets, and NTEE category for each matched org in
+    organizations_990_data. This data is used by compute_influence_scores to
+    objectively weight institutional authority by org budget size.
+
+    By default processes only orgs with no existing 990 record (safe to re-run).
+    Set force=True to re-fetch already-processed orgs.
+    Limit defaults to 50 per call (~40-50s); run multiple times for full coverage.
+    Government entities and for-profits are automatically skipped.
+    """
+    # ── Check table exists ────────────────────────────────────────────────────
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'organizations_990_data' AND table_schema = 'public'
+            """)
+            if not cur.fetchone():
+                conn.close()
+                return {"error": "Table organizations_990_data not found. Run setup_influence_tables first."}
+        conn.close()
+    except Exception as e:
+        return {"error": f"DB connection error: {e}"}
+
+    # ── Load orgs to process ──────────────────────────────────────────────────
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            if force:
+                cur.execute("""
+                    SELECT id::text, name, industry
+                    FROM organizations_organization
+                    WHERE name IS NOT NULL AND name != ''
+                    ORDER BY influence_tier NULLS LAST, name
+                """)
+            else:
+                cur.execute("""
+                    SELECT o.id::text, o.name, o.industry
+                    FROM organizations_organization o
+                    WHERE o.name IS NOT NULL AND o.name != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM organizations_990_data n
+                          WHERE n.organization_id = o.id
+                      )
+                    ORDER BY o.influence_tier NULLS LAST, o.name
+                """)
+            orgs = list(cur.fetchall())
+        conn.close()
+    except Exception as e:
+        return {"error": f"Failed to load orgs: {e}"}
+
+    if limit and limit > 0:
+        orgs = orgs[:limit]
+
+    if not orgs:
+        return {
+            "status": "ok",
+            "message": "All organizations already have 990 data. Use force=true to re-fetch.",
+            "matched": 0, "skipped_government": 0, "no_match": 0, "errors": 0,
+            "remaining_unprocessed": 0,
+        }
+
+    matched, skipped_gov, no_match, errors = 0, 0, 0, 0
+
+    import time as _time
+
+    try:
+        conn = get_db()
+        for i, org in enumerate(orgs):
+            org_id   = org["id"]
+            org_name = (org["name"] or "").strip()
+
+            if not org_name:
+                no_match += 1
+                continue
+
+            # Skip government entities and for-profits
+            if _is_government_entity(org_name):
+                skipped_gov += 1
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO organizations_990_data
+                                (organization_id, match_confidence, fetched_at, updated_at)
+                            VALUES (%s, -1, NOW(), NOW())
+                            ON CONFLICT (organization_id) DO NOTHING
+                        """, (org_id,))
+                    conn.commit()
+                except Exception:
+                    pass
+                continue
+
+            # Search ProPublica (makes 1-2 HTTP calls)
+            result = _search_propublica_990(org_name)
+
+            try:
+                with conn.cursor() as cur:
+                    if result and result.get("total_revenue", 0) > 0:
+                        cur.execute("""
+                            INSERT INTO organizations_990_data (
+                                organization_id, ein, legal_name,
+                                total_revenue, total_assets, total_expenses,
+                                num_employees, ntee_code, fiscal_year,
+                                match_confidence, fetched_at, updated_at
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+                            ON CONFLICT (organization_id) DO UPDATE SET
+                                ein            = EXCLUDED.ein,
+                                legal_name     = EXCLUDED.legal_name,
+                                total_revenue  = EXCLUDED.total_revenue,
+                                total_assets   = EXCLUDED.total_assets,
+                                total_expenses = EXCLUDED.total_expenses,
+                                num_employees  = EXCLUDED.num_employees,
+                                ntee_code      = EXCLUDED.ntee_code,
+                                fiscal_year    = EXCLUDED.fiscal_year,
+                                match_confidence = EXCLUDED.match_confidence,
+                                updated_at     = NOW()
+                        """, (
+                            org_id,
+                            result["ein"],
+                            result["legal_name"],
+                            result["total_revenue"],
+                            result["total_assets"],
+                            result["total_expenses"],
+                            result["num_employees"],
+                            result["ntee_code"],
+                            result["fiscal_year"],
+                            result["match_confidence"],
+                        ))
+                        matched += 1
+                    else:
+                        # Record "tried but no match" to skip on future runs
+                        cur.execute("""
+                            INSERT INTO organizations_990_data
+                                (organization_id, match_confidence, fetched_at, updated_at)
+                            VALUES (%s, 0, NOW(), NOW())
+                            ON CONFLICT (organization_id) DO NOTHING
+                        """, (org_id,))
+                        no_match += 1
+                conn.commit()
+
+            except Exception as e:
+                log.warning(f"fetch_990_data DB write error for {org_name!r}: {e}")
+                errors += 1
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+            # Polite rate limiting — ~0.5s between orgs
+            if i < len(orgs) - 1:
+                _time.sleep(0.5)
+
+            if (i + 1) % 10 == 0:
+                log.info(f"fetch_990_data: {i+1}/{len(orgs)} processed, "
+                         f"matched={matched} skipped={skipped_gov} no_match={no_match}")
+
+    except Exception as e:
+        log.error(f"fetch_990_data_batch outer error: {e}", exc_info=True)
+        return {"error": str(e), "type": type(e).__name__, "matched_before_error": matched}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # Count how many orgs are still unprocessed
+    try:
+        c2 = get_db()
+        with c2.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM organizations_organization o
+                WHERE o.name IS NOT NULL AND o.name != ''
+                  AND NOT EXISTS (SELECT 1 FROM organizations_990_data n WHERE n.organization_id = o.id)
+            """)
+            remaining = int((c2.cursor() and cur.fetchone() or {}).get("n", 0))
+        c2.close()
+    except Exception:
+        remaining = -1
+
+    nonprofit_orgs = len(orgs) - skipped_gov
+    return {
+        "status":              "ok",
+        "total_processed":     len(orgs),
+        "matched":             matched,
+        "skipped_government":  skipped_gov,
+        "no_match_found":      no_match,
+        "errors":              errors,
+        "match_rate_pct":      round(matched / max(nonprofit_orgs, 1) * 100, 1),
+        "remaining_unprocessed": remaining,
+        "message": (
+            f"Matched {matched} orgs to 990 data. "
+            + (f"{remaining} orgs still unprocessed — run again to continue. " if remaining > 0 else "All orgs processed. ")
+            + "Run compute_influence_scores to update rankings."
+        ),
+    }
 
 
 # ─── Finance API calls ────────────────────────────────────────────────────────
@@ -3287,6 +3665,35 @@ async def list_tools() -> list[types.Tool]:
                 "required": []
             }
         ),
+        types.Tool(
+            name="fetch_990_data",
+            description=(
+                "Fetch IRS Form 990 data (annual revenue, total assets, NTEE category) for Pythia "
+                "organizations via the free ProPublica Nonprofit Explorer API. "
+                "Matched revenue data is used by compute_influence_scores to objectively weight "
+                "institutional authority by org budget size — replacing subjective manual tier "
+                "assignments for nonprofits. "
+                "Government entities (city agencies, elected officials) and for-profits are "
+                "automatically skipped. "
+                "Processes up to 50 orgs per call (~40-50 seconds); run multiple times until "
+                "remaining_unprocessed reaches 0. Safe to re-run — skips already-fetched orgs. "
+                "Run setup_influence_tables first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max orgs to process per call. Default 50. Reduce if calls time out.",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Re-fetch orgs that already have 990 data. Default false.",
+                    },
+                },
+                "required": [],
+            },
+        ),
         # ── Influence ranking tools ────────────────────────────────────────
         types.Tool(
             name="setup_influence_tables",
@@ -3512,6 +3919,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                         {"error": "Aborted. Pass confirm=true to execute rollback."}))]
                 log.info("rollback_influence_tables called — dropping tables")
                 result = await loop.run_in_executor(None, rollback_influence_tables)
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "fetch_990_data":
+                lim   = int(arguments.get("limit", 50))
+                force = bool(arguments.get("force", False))
+                log.info(f"fetch_990_data called, limit={lim}, force={force}")
+                result = await loop.run_in_executor(None, lambda: fetch_990_data_batch(lim, force))
                 return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
 
             elif name == "enrich_voter_data":
