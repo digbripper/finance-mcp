@@ -1283,7 +1283,8 @@ def fetch_990_data_batch(limit: int = 50, force: bool = False) -> dict:
                 WHERE o.name IS NOT NULL AND o.name != ''
                   AND NOT EXISTS (SELECT 1 FROM organizations_990_data n WHERE n.organization_id = o.id)
             """)
-            remaining = int((c2.cursor() and cur.fetchone() or {}).get("n", 0))
+            row = cur.fetchone()
+            remaining = int(row["n"]) if row else 0
         c2.close()
     except Exception:
         remaining = -1
@@ -1306,7 +1307,155 @@ def fetch_990_data_batch(limit: int = 50, force: bool = False) -> dict:
     }
 
 
-# ─── Finance API calls ────────────────────────────────────────────────────────
+# ─── 990 background fetch (runs inside Railway, immune to MCP session issues) ─
+
+import threading as _threading
+from datetime import datetime, timezone as _tz
+
+_990_bg_lock   = _threading.Lock()
+_990_bg_status: dict = {
+    "running":     False,
+    "started_at":  None,
+    "finished_at": None,
+    "processed":   0,
+    "matched":     0,
+    "skipped":     0,
+    "no_match":    0,
+    "errors":      0,
+    "remaining":   -1,
+    "last_error":  None,
+}
+
+
+def _fetch_990_background_worker() -> None:
+    """
+    Long-running background thread that exhausts all remaining orgs.
+    Calls fetch_990_data_batch(100) in a loop until nothing is left.
+    Runs inside the Railway process — no MCP connection required.
+    """
+    import time as _t
+    global _990_bg_status
+
+    _990_bg_status["started_at"]  = datetime.now(_tz.utc).isoformat()
+    _990_bg_status["finished_at"] = None
+    _990_bg_status["processed"]   = 0
+    _990_bg_status["matched"]     = 0
+    _990_bg_status["skipped"]     = 0
+    _990_bg_status["no_match"]    = 0
+    _990_bg_status["errors"]      = 0
+    _990_bg_status["remaining"]   = -1
+    _990_bg_status["last_error"]  = None
+
+    log.info("990 background worker started")
+    try:
+        while _990_bg_status["running"]:
+            result = fetch_990_data_batch(limit=100, force=False)
+
+            if result.get("error"):
+                _990_bg_status["last_error"] = result["error"]
+                log.error(f"990 bg worker batch error: {result['error']}")
+                break
+
+            _990_bg_status["processed"] += result.get("total_processed", 0)
+            _990_bg_status["matched"]   += result.get("matched", 0)
+            _990_bg_status["skipped"]   += result.get("skipped_government", 0)
+            _990_bg_status["no_match"]  += result.get("no_match_found", 0)
+            _990_bg_status["errors"]    += result.get("errors", 0)
+            _990_bg_status["remaining"]  = result.get("remaining_unprocessed", 0)
+
+            log.info(
+                f"990 bg worker: cumulative processed={_990_bg_status['processed']} "
+                f"matched={_990_bg_status['matched']} remaining={_990_bg_status['remaining']}"
+            )
+
+            if _990_bg_status["remaining"] == 0:
+                log.info("990 bg worker: all orgs processed — done")
+                break
+
+            _t.sleep(2)  # Brief pause between batches
+
+    except Exception as e:
+        log.error(f"990 background worker fatal error: {e}", exc_info=True)
+        _990_bg_status["last_error"] = str(e)
+    finally:
+        _990_bg_status["running"]     = False
+        _990_bg_status["finished_at"] = datetime.now(_tz.utc).isoformat()
+        log.info(f"990 background worker finished: {_990_bg_status}")
+
+
+def start_990_background_fetch() -> dict:
+    """
+    Start fetching IRS 990 data for ALL remaining orgs in a background thread.
+    Returns immediately — the fetch runs inside the Railway server process for
+    the next 15-25 minutes, completely independent of the MCP session.
+    Call get_990_fetch_status to monitor progress.
+    """
+    global _990_bg_status
+
+    with _990_bg_lock:
+        if _990_bg_status["running"]:
+            return {
+                "status":  "already_running",
+                "progress": dict(_990_bg_status),
+                "message": "Background fetch is already running. Call get_990_fetch_status to check progress.",
+            }
+
+        _990_bg_status["running"] = True
+        t = _threading.Thread(
+            target=_fetch_990_background_worker,
+            daemon=True,
+            name="fetch-990-bg",
+        )
+        t.start()
+
+    log.info("990 background fetch thread started")
+    return {
+        "status":  "started",
+        "message": (
+            "IRS 990 fetch running in the background inside Railway. "
+            "All remaining organizations will be processed over the next 15-25 minutes. "
+            "This is completely independent of the MCP session — no timeouts, no reconnection issues. "
+            "Call get_990_fetch_status to monitor progress, or check the database directly: "
+            "SELECT COUNT(*) FROM organizations_990_data WHERE total_revenue > 0"
+        ),
+    }
+
+
+def get_990_fetch_status() -> dict:
+    """Return current status of the background 990 fetch."""
+    status = dict(_990_bg_status)
+
+    # Also pull live counts from DB for accuracy
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                                   AS total_processed,
+                    COUNT(CASE WHEN total_revenue > 0 THEN 1 END)             AS matched,
+                    COUNT(CASE WHEN match_confidence = -1 THEN 1 END)         AS skipped_govt,
+                    COUNT(CASE WHEN match_confidence = 0  THEN 1 END)         AS no_match
+                FROM organizations_990_data
+            """)
+            row = cur.fetchone()
+            if row:
+                status["db_total_processed"] = int(row["total_processed"])
+                status["db_matched"]         = int(row["matched"])
+                status["db_skipped_govt"]    = int(row["skipped_govt"])
+                status["db_no_match"]        = int(row["no_match"])
+
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM organizations_organization o
+                WHERE o.name IS NOT NULL AND o.name != ''
+                  AND NOT EXISTS (SELECT 1 FROM organizations_990_data n WHERE n.organization_id = o.id)
+            """)
+            row2 = cur.fetchone()
+            status["db_remaining_unprocessed"] = int(row2["n"]) if row2 else -1
+        conn.close()
+    except Exception as e:
+        status["db_error"] = str(e)
+
+    return status
 
 def cfb_donations_received(candidate_name: str, limit: int = 50) -> list[dict]:
     last = candidate_name.strip().split()[-1]
@@ -3677,7 +3826,8 @@ async def list_tools() -> list[types.Tool]:
                 "automatically skipped. "
                 "Processes up to 50 orgs per call (~40-50 seconds); run multiple times until "
                 "remaining_unprocessed reaches 0. Safe to re-run — skips already-fetched orgs. "
-                "Run setup_influence_tables first."
+                "Run setup_influence_tables first. "
+                "For bulk processing without session timeouts, use start_990_background_fetch instead."
             ),
             inputSchema={
                 "type": "object",
@@ -3693,6 +3843,26 @@ async def list_tools() -> list[types.Tool]:
                 },
                 "required": [],
             },
+        ),
+        types.Tool(
+            name="start_990_background_fetch",
+            description=(
+                "Start fetching IRS 990 data for ALL remaining organizations in a background thread "
+                "running inside Railway. Returns immediately — no MCP session timeout possible. "
+                "The fetch runs for 15-25 minutes processing all remaining orgs in 100-org batches. "
+                "Use this instead of repeated fetch_990_data calls when MCP sessions are unstable. "
+                "Call get_990_fetch_status to monitor progress."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="get_990_fetch_status",
+            description=(
+                "Return the current status of the background 990 fetch, including live counts "
+                "from the database (total processed, matched, remaining). "
+                "Also works as a general 990 data coverage check even if no background fetch is running."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         # ── Influence ranking tools ────────────────────────────────────────
         types.Tool(
@@ -3927,6 +4097,16 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 log.info(f"fetch_990_data called, limit={lim}, force={force}")
                 result = await loop.run_in_executor(None, lambda: fetch_990_data_batch(lim, force))
                 return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "start_990_background_fetch":
+                log.info("start_990_background_fetch called")
+                result = start_990_background_fetch()   # non-blocking, no executor needed
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "get_990_fetch_status":
+                log.info("get_990_fetch_status called")
+                result = await loop.run_in_executor(None, get_990_fetch_status)
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
             elif name == "enrich_voter_data":
                 lim = int(arguments.get("limit", 0))
