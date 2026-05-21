@@ -315,9 +315,32 @@ _INFLUENCE_DDL: list[tuple[str, str]] = [
         )
     """),
     ("idx_990_revenue", "CREATE INDEX IF NOT EXISTS idx_990_revenue ON organizations_990_data(total_revenue DESC NULLS LAST)"),
+    ("organizations_union_data", """
+        CREATE TABLE IF NOT EXISTS organizations_union_data (
+            id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            organization_id   UUID NOT NULL REFERENCES organizations_organization(id) ON DELETE CASCADE,
+            file_number       VARCHAR(20),
+            legal_name        VARCHAR(500),
+            affiliation       VARCHAR(100),
+            state             VARCHAR(5),
+            city              VARCHAR(100),
+            total_receipts    BIGINT,
+            total_disbursements BIGINT,
+            total_assets      BIGINT,
+            membership_count  INTEGER,
+            report_year       INTEGER,
+            form_type         VARCHAR(10),
+            match_confidence  INTEGER DEFAULT 0,
+            fetched_at        TIMESTAMPTZ DEFAULT NOW(),
+            updated_at        TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(organization_id)
+        )
+    """),
+    ("idx_union_receipts", "CREATE INDEX IF NOT EXISTS idx_union_receipts ON organizations_union_data(total_receipts DESC NULLS LAST)"),
 ]
 
 _INFLUENCE_ROLLBACK_SQL = (
+    "DROP TABLE IF EXISTS organizations_union_data CASCADE; "
     "DROP TABLE IF EXISTS organizations_990_data CASCADE; "
     "DROP TABLE IF EXISTS people_influence_scores CASCADE; "
     "DROP TABLE IF EXISTS people_voter_enrichment CASCADE; "
@@ -353,12 +376,14 @@ def setup_influence_tables() -> dict:
             "people_voter_enrichment",
             "people_influence_scores",
             "organizations_990_data",
+            "organizations_union_data",
         ],
         "next_steps": [
-            "1. Call enrich_voter_data  — matches contacts to voter file",
-            "2. Call fetch_990_data     — fetches IRS 990 revenue data for orgs",
-            "3. Call compute_influence_scores  — computes v1 scores",
-            "4. Call rank_influential_people  — query results with optional geo filter",
+            "1. Call enrich_voter_data           — matches contacts to voter file",
+            "2. Call fetch_990_data              — fetches nonprofit 990 revenue data",
+            "3. Call fetch_union_data            — fetches union LM-2 receipts from DOL OLMS",
+            "4. Call compute_influence_scores    — computes v1 scores",
+            "5. Call rank_influential_people     — query results with optional geo filter",
         ],
         "to_undo_everything": "Call rollback_influence_tables with confirm=true",
     }
@@ -660,18 +685,29 @@ def compute_influence_scores_batch() -> dict:
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT po.person_id::text, MAX(n.total_revenue) AS max_revenue
+                    SELECT po.person_id::text,
+                        GREATEST(
+                            MAX(COALESCE(n.total_revenue, 0)),
+                            MAX(COALESCE(u.total_receipts, 0))
+                        ) AS best_financial_metric
                     FROM people_personorganization po
-                    JOIN organizations_990_data n ON n.organization_id = po.organization_id
+                    LEFT JOIN organizations_990_data n
+                        ON n.organization_id = po.organization_id
+                        AND n.match_confidence > 70
+                    LEFT JOIN organizations_union_data u
+                        ON u.organization_id = po.organization_id
+                        AND u.match_confidence > 70
                     WHERE po.is_current = TRUE
-                      AND n.total_revenue IS NOT NULL
-                      AND n.total_revenue > 0
-                      AND n.match_confidence > 70
+                      AND (
+                          (n.total_revenue IS NOT NULL AND n.total_revenue > 0)
+                          OR (u.total_receipts IS NOT NULL AND u.total_receipts > 0)
+                      )
                     GROUP BY po.person_id
                 """)
-                revenue_990_map = {r["person_id"]: int(r["max_revenue"]) for r in cur.fetchall()}
+                revenue_990_map = {r["person_id"]: int(r["best_financial_metric"])
+                                   for r in cur.fetchall()}
         except Exception:
-            revenue_990_map = {}  # table may not exist yet
+            revenue_990_map = {}  # tables may not exist yet
 
         with conn.cursor() as cur:
             cur.execute("SELECT id::text AS person_id, full_name FROM people_person WHERE is_active = TRUE")
@@ -1455,6 +1491,407 @@ def get_990_fetch_status() -> dict:
     except Exception as e:
         status["db_error"] = str(e)
 
+    return status
+
+
+
+# ─── Union LM-2 data — DOL OLMS ──────────────────────────────────────────────
+
+_OLMS_SEARCH_URL = "https://olmsapps.dol.gov/olpdr/GetLaborOrganizationSearchResults"
+_OLMS_DETAIL_URL = "https://olmsapps.dol.gov/olpdr/GetOrganizationReport"
+_OLMS_HEADERS    = {
+    "User-Agent": "Mozilla/5.0 (research/public-data)",
+    "Accept":     "application/json, text/plain, */*",
+    "Referer":    "https://olmsapps.dol.gov/olpdr/",
+}
+
+
+def _looks_like_union(org_name: str) -> bool:
+    """Return True if the org name suggests a labor union."""
+    kws = (" local ", "local #", "local no.", "union", "afl-cio", " seiu", " cwa ",
+           " ibew", " ufcw", " uaw ", " ibt ", " afscme", " aft ", "teamsters",
+           "laborers", "ironworkers", "carpenters", "plumbers", "electricians",
+           "painters", " iatse", " pba ", "police benevolent", "firefighters",
+           " iaff", " 1199", "district council", "transport workers", " twu ",
+           " dc37", " dc 37", "building service", "hotel employees",)
+    n = org_name.lower()
+    return any(kw in n for kw in kws)
+
+
+def _int_from_dict(d: dict, *keys: str) -> int:
+    """Extract the first non-zero int from a dict by trying multiple keys."""
+    for k in keys:
+        v = d.get(k)
+        if v:
+            try:
+                return int(str(v).replace(",", "").strip())
+            except (ValueError, TypeError):
+                pass
+    return 0
+
+
+def _search_olms_lm2(org_name: str) -> dict | None:
+    """
+    Search DOL OLMS for LM-2/LM-3 union financial data.
+
+    Tries several parameter combinations since the OLMS OPDR REST API is
+    not officially documented.  All responses are DEBUG-logged so a single
+    deploy-and-test with test_union_lookup() confirms the correct format.
+    Returns a financial data dict or None if no confident match.
+    """
+    clean = org_name.strip()
+    if not clean:
+        return None
+
+    param_sets = [
+        {"srchType": "B", "srchStr": clean, "state": "NY", "reportType": "LM2"},
+        {"srchType": "B", "srchStr": clean, "reportType": "LM2"},
+        {"srchType": "B", "srchStr": clean, "state": "NY"},
+        {"srchType": "B", "srchStr": clean},
+    ]
+
+    raw_items: list = []
+    for params in param_sets:
+        try:
+            resp = requests.get(_OLMS_SEARCH_URL, params=params,
+                                timeout=15, headers=_OLMS_HEADERS)
+            log.debug(f"OLMS search status={resp.status_code} "
+                      f"url={resp.url} body[:300]={resp.text[:300]!r}")
+            if not resp.ok:
+                continue
+            body = resp.text.strip()
+            if not body or body[0] not in ("{", "["):
+                continue
+            data = resp.json()
+            if isinstance(data, list):
+                raw_items = data
+            else:
+                for key in ("items", "results", "laborOrganizations",
+                            "organizations", "data"):
+                    if isinstance(data.get(key), list) and data[key]:
+                        raw_items = data[key]
+                        break
+            if raw_items:
+                log.debug(f"OLMS hit for {org_name!r}: "
+                          f"{len(raw_items)} candidates, params={params}")
+                break
+        except Exception as exc:
+            log.debug(f"OLMS param variant {params} failed: {exc}")
+
+    if not raw_items:
+        return None
+
+    # Fuzzy-match to pick best candidate
+    best, best_score = None, 0
+    for item in raw_items[:15]:
+        addr = item.get("unionAddress") or {}
+        cand = (addr.get("unionName") or item.get("union_name")
+                or item.get("unionName") or item.get("orgName")
+                or item.get("name") or "")
+        score = fuzz.token_sort_ratio(normalize(org_name), normalize(cand))
+        if score > best_score:
+            best_score, best = score, item
+
+    if best_score < 75 or not best:
+        return None
+
+    addr = best.get("unionAddress") or {}
+
+    def _i(*keys: str) -> int:
+        return _int_from_dict({**best, **addr}, *keys)
+
+    receipts      = _i("totalReceipts",    "total_receipts",    "receipts",    "TOTRECEIPTS")
+    disbursements = _i("totalDisbursements","total_disbursements","disbursements","TOTDISBURSEMENTS")
+    assets        = _i("totalAssets",       "total_assets",      "assets",       "TOTASSETS")
+    members       = _i("totalMembers",      "members",           "membership",   "MEMBERS",
+                        "MembersAtEndOfPeriod")
+    year          = _i("rptYear",           "yrCovered",         "year",         "reportYear")
+
+    file_number = str(
+        best.get("fNum") or best.get("fnumber") or best.get("fileNum")
+        or addr.get("fNumString") or addr.get("fileNumber") or ""
+    ).strip()
+
+    # If no financial data in search response, try a detail call
+    if receipts == 0 and file_number:
+        try:
+            import time as _t; _t.sleep(0.3)
+            det = requests.get(_OLMS_DETAIL_URL,
+                               params={"fNum": file_number.replace("-", ""),
+                                       "rptYear": year or ""},
+                               timeout=15, headers=_OLMS_HEADERS)
+            log.debug(f"OLMS detail status={det.status_code} "
+                      f"body[:200]={det.text[:200]!r}")
+            if det.ok and det.text.strip().startswith("{"):
+                d = det.json()
+                receipts      = receipts      or _int_from_dict(d, "totalReceipts",    "receipts")
+                disbursements = disbursements or _int_from_dict(d, "totalDisbursements")
+                assets        = assets        or _int_from_dict(d, "totalAssets",      "assets")
+                members       = members       or _int_from_dict(d, "totalMembers",     "members")
+        except Exception as exc:
+            log.debug(f"OLMS detail call failed for {file_number!r}: {exc}")
+
+    return {
+        "file_number":         file_number,
+        "legal_name":          str(addr.get("unionName") or best.get("union_name")
+                                   or best.get("unionName") or ""),
+        "affiliation":         str(best.get("affiliation") or best.get("affAbbr")
+                                   or addr.get("affAbbr") or ""),
+        "state":               str(addr.get("mailSt") or best.get("state") or "NY"),
+        "city":                str(addr.get("mailCity") or best.get("city") or ""),
+        "total_receipts":      receipts,
+        "total_disbursements": disbursements,
+        "total_assets":        assets,
+        "membership_count":    members,
+        "report_year":         year,
+        "form_type":           str(best.get("formFiled") or best.get("formType")
+                                   or best.get("reportType") or "LM2"),
+        "match_confidence":    best_score,
+    }
+
+
+def test_union_lookup(org_name: str) -> dict:
+    """
+    Diagnostic: run a single OLMS lookup and return the raw result.
+    Use this after first deploy to confirm the API is responding correctly.
+    Example: test_union_lookup('SEIU 32BJ')
+    """
+    result = _search_olms_lm2(org_name)
+    return {
+        "query":    org_name,
+        "found":    result is not None,
+        "receipts": result.get("total_receipts", 0) if result else 0,
+        "result":   result,
+    }
+
+
+def fetch_union_data_batch(limit: int = 50, force: bool = False) -> dict:
+    """
+    Fetch DOL OLMS LM-2/LM-3 union data for Pythia organizations.
+    Skips government entities and orgs already matched via IRS 990.
+    Safe to re-run; use force=True to re-fetch already-processed orgs.
+    """
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT 1 FROM information_schema.tables
+                           WHERE table_name='organizations_union_data'
+                           AND table_schema='public'""")
+            if not cur.fetchone():
+                conn.close()
+                return {"error": "Run setup_influence_tables first."}
+        conn.close()
+    except Exception as e:
+        return {"error": str(e)}
+
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            if force:
+                cur.execute("""SELECT id::text, name FROM organizations_organization
+                               WHERE name IS NOT NULL AND name != ''
+                               ORDER BY name""")
+            else:
+                cur.execute("""
+                    SELECT o.id::text, o.name
+                    FROM organizations_organization o
+                    WHERE o.name IS NOT NULL AND o.name != ''
+                      AND NOT EXISTS (SELECT 1 FROM organizations_union_data u
+                                      WHERE u.organization_id = o.id)
+                      AND NOT EXISTS (SELECT 1 FROM organizations_990_data n
+                                      WHERE n.organization_id = o.id
+                                        AND n.total_revenue > 0
+                                        AND n.match_confidence > 70)
+                    ORDER BY
+                        CASE WHEN lower(o.name) SIMILAR TO
+                            '%%(local|union|afl|seiu|cwa|ibew|ufcw|uaw|ibt|'
+                            || 'teamster|laborer|ironworker|carpenter|plumber|'
+                            || 'electrician|painter|iatse|pba|firefighter|1199|'
+                            || 'transport worker|twu|dc37|building service|hotel)%%'
+                        THEN 0 ELSE 1 END,
+                        o.name
+                """)
+            orgs = list(cur.fetchall())
+        conn.close()
+    except Exception as e:
+        return {"error": f"Failed to load orgs: {e}"}
+
+    if limit and limit > 0:
+        orgs = orgs[:limit]
+    if not orgs:
+        return {"status": "ok",
+                "message": "All orgs processed. Use force=true to re-fetch.",
+                "matched": 0, "skipped": 0, "no_match": 0, "errors": 0}
+
+    import time as _t
+    matched, skipped, no_match, errors = 0, 0, 0, 0
+
+    try:
+        conn = get_db()
+        for i, org in enumerate(orgs):
+            org_id   = org["id"]
+            org_name = (org["name"] or "").strip()
+
+            if not org_name or _is_government_entity(org_name):
+                skipped += 1
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""INSERT INTO organizations_union_data
+                            (organization_id, match_confidence, fetched_at, updated_at)
+                            VALUES (%s,-1,NOW(),NOW())
+                            ON CONFLICT (organization_id) DO NOTHING""", (org_id,))
+                    conn.commit()
+                except Exception:
+                    pass
+                continue
+
+            result = _search_olms_lm2(org_name)
+
+            try:
+                with conn.cursor() as cur:
+                    if result and result.get("total_receipts", 0) > 0:
+                        cur.execute("""
+                            INSERT INTO organizations_union_data (
+                                organization_id, file_number, legal_name, affiliation,
+                                state, city,
+                                total_receipts, total_disbursements, total_assets,
+                                membership_count, report_year, form_type,
+                                match_confidence, fetched_at, updated_at
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+                            ON CONFLICT (organization_id) DO UPDATE SET
+                                file_number=EXCLUDED.file_number,
+                                legal_name=EXCLUDED.legal_name,
+                                affiliation=EXCLUDED.affiliation,
+                                state=EXCLUDED.state, city=EXCLUDED.city,
+                                total_receipts=EXCLUDED.total_receipts,
+                                total_disbursements=EXCLUDED.total_disbursements,
+                                total_assets=EXCLUDED.total_assets,
+                                membership_count=EXCLUDED.membership_count,
+                                report_year=EXCLUDED.report_year,
+                                form_type=EXCLUDED.form_type,
+                                match_confidence=EXCLUDED.match_confidence,
+                                updated_at=NOW()
+                        """, (
+                            org_id,
+                            result["file_number"],    result["legal_name"],
+                            result["affiliation"],    result["state"],
+                            result["city"],           result["total_receipts"],
+                            result["total_disbursements"], result["total_assets"],
+                            result["membership_count"], result["report_year"],
+                            result["form_type"],      result["match_confidence"],
+                        ))
+                        matched += 1
+                    else:
+                        cur.execute("""INSERT INTO organizations_union_data
+                            (organization_id, match_confidence, fetched_at, updated_at)
+                            VALUES (%s,0,NOW(),NOW())
+                            ON CONFLICT (organization_id) DO NOTHING""", (org_id,))
+                        no_match += 1
+                conn.commit()
+            except Exception as e:
+                log.warning(f"fetch_union_data DB error for {org_name!r}: {e}")
+                errors += 1
+                try: conn.rollback()
+                except Exception: pass
+
+            if i < len(orgs) - 1:
+                _t.sleep(0.5)
+            if (i + 1) % 10 == 0:
+                log.info(f"fetch_union_data: {i+1}/{len(orgs)} "
+                         f"matched={matched} no_match={no_match}")
+
+    except Exception as e:
+        log.error(f"fetch_union_data_batch error: {e}", exc_info=True)
+        return {"error": str(e), "matched_before_error": matched}
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    return {
+        "status": "ok",
+        "total_processed": len(orgs),
+        "matched": matched, "skipped": skipped,
+        "no_match": no_match, "errors": errors,
+        "match_rate_pct": round(matched / max(len(orgs) - skipped, 1) * 100, 1),
+        "message": f"Matched {matched} orgs to OLMS union data.",
+    }
+
+
+# ─── Union data background fetch ─────────────────────────────────────────────
+
+_union_bg_lock   = _threading.Lock()
+_union_bg_status: dict = {
+    "running": False, "started_at": None, "finished_at": None,
+    "processed": 0, "matched": 0, "skipped": 0,
+    "no_match": 0, "errors": 0, "last_error": None,
+}
+
+
+def _fetch_union_background_worker() -> None:
+    import time as _t
+    global _union_bg_status
+    _union_bg_status.update(
+        started_at=datetime.now(_tz.utc).isoformat(), finished_at=None,
+        processed=0, matched=0, skipped=0, no_match=0, errors=0, last_error=None,
+    )
+    log.info("Union data background worker started")
+    try:
+        while _union_bg_status["running"]:
+            result = fetch_union_data_batch(limit=100, force=False)
+            if result.get("error"):
+                _union_bg_status["last_error"] = result["error"]
+                break
+            _union_bg_status["processed"] += result.get("total_processed", 0)
+            _union_bg_status["matched"]   += result.get("matched", 0)
+            _union_bg_status["skipped"]   += result.get("skipped", 0)
+            _union_bg_status["no_match"]  += result.get("no_match", 0)
+            _union_bg_status["errors"]    += result.get("errors", 0)
+            if result.get("total_processed", 0) == 0:
+                break
+            log.info(f"Union bg: processed={_union_bg_status['processed']} "
+                     f"matched={_union_bg_status['matched']}")
+            _t.sleep(2)
+    except Exception as e:
+        log.error(f"Union bg worker error: {e}", exc_info=True)
+        _union_bg_status["last_error"] = str(e)
+    finally:
+        _union_bg_status["running"] = False
+        _union_bg_status["finished_at"] = datetime.now(_tz.utc).isoformat()
+
+
+def start_union_data_background_fetch() -> dict:
+    """Start fetching OLMS union data for all remaining orgs in a background thread."""
+    global _union_bg_status
+    with _union_bg_lock:
+        if _union_bg_status["running"]:
+            return {"status": "already_running", "progress": dict(_union_bg_status)}
+        _union_bg_status["running"] = True
+        t = _threading.Thread(target=_fetch_union_background_worker,
+                              daemon=True, name="fetch-union-bg")
+        t.start()
+    return {"status": "started",
+            "message": "Union LM-2 fetch running in background. "
+                       "Call get_union_fetch_status to monitor."}
+
+
+def get_union_fetch_status() -> dict:
+    """Return current status of the background union data fetch."""
+    status = dict(_union_bg_status)
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT COUNT(*) AS total,
+                COUNT(CASE WHEN total_receipts > 0 THEN 1 END) AS matched,
+                COUNT(CASE WHEN match_confidence=-1 THEN 1 END) AS skipped,
+                COUNT(CASE WHEN match_confidence=0  THEN 1 END) AS no_match
+                FROM organizations_union_data""")
+            row = cur.fetchone()
+            if row:
+                status["db_total"] = int(row["total"])
+                status["db_matched"] = int(row["matched"])
+        conn.close()
+    except Exception as e:
+        status["db_error"] = str(e)
     return status
 
 def cfb_donations_received(candidate_name: str, limit: int = 50) -> list[dict]:
@@ -3832,17 +4269,63 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max orgs to process per call. Default 50. Reduce if calls time out.",
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "description": "Re-fetch orgs that already have 990 data. Default false.",
-                    },
+                    "limit": {"type": "integer", "description": "Max orgs per call. Default 50."},
+                    "force": {"type": "boolean", "description": "Re-fetch already-processed orgs. Default false."},
                 },
                 "required": [],
             },
+        ),
+        types.Tool(
+            name="fetch_union_data",
+            description=(
+                "Fetch DOL OLMS LM-2/LM-3 union financial data (total receipts, assets, membership) "
+                "for Pythia organizations via the DOL Office of Labor-Management Standards API. "
+                "Union dues receipts feed directly into compute_influence_scores as the institutional "
+                "weight for union orgs — covering UFT, DC 37, SEIU 32BJ, TWU Local 100, CWA, "
+                "IBT, IUOE, PBA, and all other major NYC unions. "
+                "Skips government entities and orgs already matched via IRS 990. "
+                "Processes up to 50 orgs per call. Safe to re-run. "
+                "Run setup_influence_tables first. "
+                "For bulk processing, use start_union_data_background_fetch."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max orgs per call. Default 50."},
+                    "force": {"type": "boolean", "description": "Re-fetch already-processed orgs. Default false."},
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="test_union_lookup",
+            description=(
+                "Diagnostic tool: run a single OLMS lookup for a specific org name and return "
+                "the full raw result. Use this immediately after first deploy to confirm the "
+                "OLMS API is responding correctly before running the full fetch. "
+                "Example: test_union_lookup('SEIU 32BJ')"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "org_name": {"type": "string", "description": "Union name to look up, e.g. 'DC 37' or 'UFT'"},
+                },
+                "required": ["org_name"],
+            },
+        ),
+        types.Tool(
+            name="start_union_data_background_fetch",
+            description=(
+                "Start fetching DOL OLMS union LM-2 data for all remaining orgs in a background thread. "
+                "Returns immediately — immune to MCP session timeouts. "
+                "Call get_union_fetch_status to monitor progress."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="get_union_fetch_status",
+            description="Return current status of the background union data fetch.",
+            inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="start_990_background_fetch",
@@ -4097,6 +4580,29 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 log.info(f"fetch_990_data called, limit={lim}, force={force}")
                 result = await loop.run_in_executor(None, lambda: fetch_990_data_batch(lim, force))
                 return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "fetch_union_data":
+                lim   = int(arguments.get("limit", 50))
+                force = bool(arguments.get("force", False))
+                log.info(f"fetch_union_data called, limit={lim}, force={force}")
+                result = await loop.run_in_executor(None, lambda: fetch_union_data_batch(lim, force))
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "test_union_lookup":
+                org = arguments.get("org_name", "")
+                log.info(f"test_union_lookup called: {org!r}")
+                result = await loop.run_in_executor(None, lambda: test_union_lookup(org))
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "start_union_data_background_fetch":
+                log.info("start_union_data_background_fetch called")
+                result = start_union_data_background_fetch()
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "get_union_fetch_status":
+                log.info("get_union_fetch_status called")
+                result = await loop.run_in_executor(None, get_union_fetch_status)
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
             elif name == "start_990_background_fetch":
                 log.info("start_990_background_fetch called")
