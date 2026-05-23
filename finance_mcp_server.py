@@ -1652,64 +1652,70 @@ def _search_olms_lm2(org_name: str) -> dict | None:
 
 def test_union_lookup(org_name: str) -> dict:
     """
-    Diagnostic: attempt the OLMS API call directly and return full details
-    including HTTP status, response snippet, and any errors encountered.
-    This makes the API format visible without needing Railway log access.
+    Diagnostic: probe multiple OLMS API endpoint paths to find which one works,
+    then attempt a union lookup. Returns full HTTP status/response for each attempt.
     """
     clean = org_name.strip()
-    attempts = []
 
-    # Try each parameter combination and capture what happens
-    param_sets = [
-        {"srchType": "B", "srchStr": clean, "state": "NY", "reportType": "LM2"},
-        {"srchType": "B", "srchStr": clean, "reportType": "LM2"},
-        {"srchType": "B", "srchStr": clean},
+    # Candidate servlet paths — the correct one will return non-404 JSON
+    candidate_endpoints = [
+        "GetLaborOrganizationSearchResults",
+        "GetOrganizationSearchResults",
+        "GetOrgReport",
+        "GetLaborOrganizationReport",
+        "GetOrganizationReport",
+        "GetReportSearchResults",
+        "GetPublicDisclosureReport",
+        "GetFilingData",
+        "GetOrganizationFilings",
+        "searchOrganization",
+        "SearchOrganization",
+        "orgSearch",
     ]
 
-    for verify_ssl in (True, False):
-        for params in param_sets[:2]:   # just first two variants
-            attempt: dict = {"params": params, "verify_ssl": verify_ssl}
-            try:
-                resp = requests.get(
-                    _OLMS_SEARCH_URL, params=params, timeout=15,
-                    headers=_OLMS_HEADERS, verify=verify_ssl,
-                )
-                attempt["status_code"] = resp.status_code
-                attempt["response_snippet"] = resp.text[:400]
-                attempt["content_type"] = resp.headers.get("Content-Type", "")
-                attempt["looks_like_json"] = resp.text.strip()[:1] in ("{", "[")
-                if resp.ok and attempt["looks_like_json"]:
-                    try:
-                        data = resp.json()
-                        items = (data if isinstance(data, list) else
-                                 next((data[k] for k in
-                                       ("items","results","laborOrganizations","organizations","data")
-                                       if isinstance(data.get(k), list)), []))
-                        attempt["item_count"] = len(items)
-                        attempt["first_item"] = items[0] if items else None
-                        attempt["success"] = True
-                    except Exception as je:
-                        attempt["json_parse_error"] = str(je)
-                else:
-                    attempt["success"] = False
-            except Exception as e:
-                attempt["error"] = str(e)
-                attempt["error_type"] = type(e).__name__
-                attempt["success"] = False
-            attempts.append(attempt)
-            if attempt.get("success") and attempt.get("item_count", 0) > 0:
-                break   # found something useful
-        if any(a.get("success") and a.get("item_count", 0) > 0 for a in attempts):
-            break
+    probe_results = []
+    working_endpoint = None
 
-    # Also try a regular result
-    result = _search_olms_lm2(org_name)
+    for ep in candidate_endpoints:
+        url = f"https://olmsapps.dol.gov/olpdr/{ep}"
+        try:
+            resp = requests.get(
+                url,
+                params={"srchType": "B", "srchStr": clean, "reportType": "LM2"},
+                timeout=10, headers=_OLMS_HEADERS, verify=False,
+            )
+            snippet = resp.text[:200].strip()
+            probe_results.append({
+                "endpoint": ep,
+                "status":   resp.status_code,
+                "snippet":  snippet,
+                "is_json":  resp.text.strip()[:1] in ("{", "["),
+            })
+            if resp.status_code != 404:
+                working_endpoint = ep
+                break   # found a live endpoint
+        except Exception as e:
+            probe_results.append({"endpoint": ep, "error": str(e)})
+
+    # If we found a working endpoint, try a full lookup using it
+    match_result = None
+    if working_endpoint:
+        try:
+            resp = requests.get(
+                f"https://olmsapps.dol.gov/olpdr/{working_endpoint}",
+                params={"srchType": "B", "srchStr": clean, "reportType": "LM2"},
+                timeout=15, headers=_OLMS_HEADERS, verify=False,
+            )
+            if resp.ok and resp.text.strip()[:1] in ("{", "["):
+                match_result = resp.json()
+        except Exception as e:
+            match_result = {"error": str(e)}
+
     return {
-        "query":    org_name,
-        "found":    result is not None,
-        "receipts": result.get("total_receipts", 0) if result else 0,
-        "result":   result,
-        "api_attempts": attempts,
+        "query":            org_name,
+        "working_endpoint": working_endpoint,
+        "full_response":    match_result,
+        "probe_results":    probe_results,
     }
 
 
