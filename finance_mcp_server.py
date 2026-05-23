@@ -1652,70 +1652,63 @@ def _search_olms_lm2(org_name: str) -> dict | None:
 
 def test_union_lookup(org_name: str) -> dict:
     """
-    Diagnostic: probe multiple OLMS API endpoint paths to find which one works,
-    then attempt a union lookup. Returns full HTTP status/response for each attempt.
+    Diagnostic: probe OLMS server for working endpoints and data formats.
+    Tries yearly file list, known-working servlets, and alternate base paths.
     """
     clean = org_name.strip()
+    results = []
 
-    # Candidate servlet paths — the correct one will return non-404 JSON
-    candidate_endpoints = [
-        "GetLaborOrganizationSearchResults",
-        "GetOrganizationSearchResults",
-        "GetOrgReport",
-        "GetLaborOrganizationReport",
-        "GetOrganizationReport",
-        "GetReportSearchResults",
-        "GetPublicDisclosureReport",
-        "GetFilingData",
-        "GetOrganizationFilings",
-        "searchOrganization",
-        "SearchOrganization",
-        "orgSearch",
-    ]
-
-    probe_results = []
-    working_endpoint = None
-
-    for ep in candidate_endpoints:
-        url = f"https://olmsapps.dol.gov/olpdr/{ep}"
+    def _probe(url: str, params: dict | None = None) -> dict:
         try:
-            resp = requests.get(
-                url,
-                params={"srchType": "B", "srchStr": clean, "reportType": "LM2"},
-                timeout=10, headers=_OLMS_HEADERS, verify=False,
-            )
-            snippet = resp.text[:200].strip()
-            probe_results.append({
-                "endpoint": ep,
-                "status":   resp.status_code,
-                "snippet":  snippet,
-                "is_json":  resp.text.strip()[:1] in ("{", "["),
-            })
-            if resp.status_code != 404:
-                working_endpoint = ep
-                break   # found a live endpoint
+            resp = requests.get(url, params=params, timeout=10,
+                                headers=_OLMS_HEADERS, verify=False)
+            return {
+                "url":     resp.url,
+                "status":  resp.status_code,
+                "snippet": resp.text[:300].strip(),
+                "is_json": resp.text.strip()[:1] in ("{", "["),
+                "ct":      resp.headers.get("Content-Type", "")[:60],
+            }
         except Exception as e:
-            probe_results.append({"endpoint": ep, "error": str(e)})
+            return {"url": url, "error": str(e)[:120]}
 
-    # If we found a working endpoint, try a full lookup using it
-    match_result = None
-    if working_endpoint:
-        try:
-            resp = requests.get(
-                f"https://olmsapps.dol.gov/olpdr/{working_endpoint}",
-                params={"srchType": "B", "srchStr": clean, "reportType": "LM2"},
-                timeout=15, headers=_OLMS_HEADERS, verify=False,
-            )
-            if resp.ok and resp.text.strip()[:1] in ("{", "["):
-                match_result = resp.json()
-        except Exception as e:
-            match_result = {"error": str(e)}
+    # 1. Probe for yearly file list (what gives us download filenames)
+    for ep in ["GetYearlyFilingListServlet", "GetYearlyFileListServlet",
+               "GetYearlyFileList", "GetAvailableYearlyFiles", "GetFilingYears"]:
+        results.append(_probe(f"https://olmsapps.dol.gov/olpdr/{ep}"))
+
+    # 2. Try GetYearlyFileServlet with guessed filenames / params
+    for params in [
+        {"year": "2024", "formType": "LM2"},
+        {"rptYear": "2024", "reportType": "LM2"},
+        {"report": "lm2data-2024.zip"},
+        {"report": "fy2024lm2.zip"},
+    ]:
+        results.append(_probe("https://olmsapps.dol.gov/olpdr/GetYearlyFileServlet",
+                               params))
+
+    # 3. Try entirely different base paths (API might not be under /olpdr/)
+    for base in ["/api/olpdr/", "/olms/", "/olpdrapi/", "/api/",
+                 "/olpdr/api/", "/services/"]:
+        results.append(_probe(
+            f"https://olmsapps.dol.gov{base}GetLaborOrganizationSearchResults",
+            {"srchType": "B", "srchStr": clean},
+        ))
+
+    # 4. Try the DOL developer API (separate system, known good)
+    results.append(_probe(
+        "https://api.dol.gov/V1/ELORS/lm2FinalData",
+        {"$filter": f"STATE eq 'NY'", "$top": "1"},
+    ))
+
+    # Summarise which probes returned non-404
+    non_404 = [r for r in results
+               if r.get("status") and r["status"] != 404]
 
     return {
-        "query":            org_name,
-        "working_endpoint": working_endpoint,
-        "full_response":    match_result,
-        "probe_results":    probe_results,
+        "query":    org_name,
+        "non_404_hits": non_404,
+        "all_probes":   results,
     }
 
 
