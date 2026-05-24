@@ -1721,54 +1721,72 @@ def _search_olms_lm2(org_name: str) -> dict | None:
 
 def test_union_lookup(org_name: str) -> dict:
     """
-    Diagnostic: probe data.dol.gov Socrata datasets for union LM-2 data,
-    then attempt a fuzzy match on the given org name.
+    Diagnostic: search data.dol.gov catalog for LM-2 datasets, then attempt lookup.
     """
     key = _get_dol_key()
     if not key:
         return {"error": "DOL_API_KEY not set on Railway"}
 
     headers = {"X-App-Token": key, "Accept": "application/json"}
-    probes  = []
 
-    # Probe each candidate dataset to find which one has LM-2 data
-    for ds_id in _DOL_LM2_DATASET_IDS:
+    # Search Socrata catalog for union / LM-2 datasets
+    catalog_hits = []
+    for q in ["LM-2", "union financial", "OLMS", "labor organization"]:
+        try:
+            resp = requests.get(
+                f"{_DOL_API_BASE}/api/catalog/v1",
+                headers=headers,
+                params={"q": q, "limit": 5},
+                timeout=10,
+            )
+            if resp.ok:
+                data = resp.json()
+                results = data.get("results", [])
+                for r in results:
+                    catalog_hits.append({
+                        "query":      q,
+                        "id":         r.get("resource", {}).get("id"),
+                        "name":       r.get("resource", {}).get("name"),
+                        "description": (r.get("resource", {}).get("description") or "")[:120],
+                        "type":       r.get("resource", {}).get("type"),
+                    })
+        except Exception as exc:
+            catalog_hits.append({"query": q, "error": str(exc)[:80]})
+
+    # Also try fetching one row from any dataset IDs that look promising
+    sample_row = None
+    working_ds = None
+    for hit in catalog_hits:
+        ds_id = hit.get("id")
+        if not ds_id or hit.get("type") != "dataset":
+            continue
         try:
             resp = requests.get(
                 f"{_DOL_API_BASE}/resource/{ds_id}.json",
-                headers=headers,
-                params={"$limit": 1},
-                timeout=10,
+                headers=headers, params={"$limit": 1}, timeout=10,
             )
-            row = None
-            if resp.ok and resp.text.strip().startswith("["):
+            if resp.ok:
                 rows = resp.json()
-                row  = rows[0] if rows else None
-            probes.append({
-                "dataset_id":  ds_id,
-                "status":      resp.status_code,
-                "row_keys":    list(row.keys()) if row else None,
-                "sample_name": (row or {}).get("union_name") or
-                               (row or {}).get("UNION_NAME") or
-                               (row or {}).get("name") or None,
-                "snippet":     resp.text[:200] if not resp.ok else None,
-            })
-        except Exception as exc:
-            probes.append({"dataset_id": ds_id, "error": str(exc)[:120]})
+                if rows:
+                    sample_row = rows[0]
+                    working_ds = ds_id
+                    break
+        except Exception:
+            pass
 
-    # Attempt full lookup using cache
     cache  = _load_olms_lm2_data()
     result = _search_olms_lm2(org_name)
 
     return {
-        "query":        org_name,
-        "key_prefix":   key[:8] + "...",
-        "base_url":     _DOL_API_BASE,
-        "dataset_probes": probes,
-        "cache_size":   len(cache),
-        "found":        result is not None,
-        "receipts":     result.get("total_receipts", 0) if result else 0,
-        "result":       result,
+        "query":           org_name,
+        "key_prefix":      key[:8] + "...",
+        "catalog_hits":    catalog_hits,
+        "working_dataset": working_ds,
+        "sample_row_keys": list(sample_row.keys()) if sample_row else None,
+        "sample_row":      sample_row,
+        "cache_size":      len(cache),
+        "found":           result is not None,
+        "result":          result,
     }
 
 
