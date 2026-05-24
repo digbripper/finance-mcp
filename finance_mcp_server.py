@@ -1710,44 +1710,60 @@ def _search_olms_lm2(org_name: str) -> dict | None:
 
 def test_union_lookup(org_name: str) -> dict:
     """
-    Diagnostic: load NY LM-2 data from DOL API and attempt a union lookup.
-    Returns the raw first record from the API (so you can see field names),
-    plus the match result for the given org name.
-    Call this after setting DOL_API_KEY to confirm the API is working.
+    Diagnostic: test DOL API auth and attempt a union lookup.
+    Tries multiple authentication methods to find what the API accepts.
     """
     key = _get_dol_key()
-    if not key:
-        return {"error": "DOL_API_KEY environment variable not set on Railway"}
 
-    # Show raw API response for one record so we can confirm field names
-    raw_sample = None
-    api_status = None
-    try:
-        resp = requests.get(
-            f"{_DOL_API_BASE}/ELORS/lm2FinalData",
-            params={"KEY": key, "$top": 1, "$format": "json"},
-            timeout=15,
-        )
-        api_status = resp.status_code
-        if resp.ok:
-            records = _dol_extract_records(resp.json())
-            raw_sample = records[0] if records else None
-    except Exception as exc:
-        api_status = str(exc)
+    auth_attempts = []
+    working_auth  = None
 
-    # Full lookup using cache
-    cache = _load_olms_lm2_data()
-    result = _search_olms_lm2(org_name)
+    # Try every auth method the DOL API might accept
+    auth_variants = [
+        ("query_KEY",        {"params": {"KEY": key, "$top": 1, "$format": "json"}, "headers": {}}),
+        ("query_APIKEY",     {"params": {"APIKEY": key, "$top": 1, "$format": "json"}, "headers": {}}),
+        ("query_api_key",    {"params": {"api_key": key, "$top": 1, "$format": "json"}, "headers": {}}),
+        ("header_X-API-KEY", {"params": {"$top": 1, "$format": "json"}, "headers": {"X-API-KEY": key}}),
+        ("header_Authorization", {"params": {"$top": 1, "$format": "json"}, "headers": {"Authorization": f"Token {key}"}}),
+    ]
+
+    for name, kwargs in auth_variants:
+        if not key:
+            auth_attempts.append({"method": name, "error": "DOL_API_KEY env var not set"})
+            continue
+        try:
+            resp = requests.get(
+                f"{_DOL_API_BASE}/ELORS/lm2FinalData",
+                params=kwargs["params"],
+                headers=kwargs["headers"],
+                timeout=15,
+            )
+            result = {
+                "method":  name,
+                "status":  resp.status_code,
+                "snippet": resp.text[:300].strip(),
+            }
+            auth_attempts.append(result)
+            if resp.status_code == 200:
+                working_auth = name
+                break
+        except Exception as exc:
+            auth_attempts.append({"method": name, "error": str(exc)[:120]})
+
+    # If we found a working auth, try the actual lookup
+    match_result = None
+    if working_auth:
+        cache = _load_olms_lm2_data()
+        match_result = _search_olms_lm2(org_name)
 
     return {
-        "query":           org_name,
-        "api_status":      api_status,
-        "cache_size":      len(cache),
-        "raw_sample_keys": list(raw_sample.keys()) if raw_sample else None,
-        "raw_sample":      raw_sample,
-        "found":           result is not None,
-        "receipts":        result.get("total_receipts", 0) if result else 0,
-        "result":          result,
+        "query":         org_name,
+        "key_set":       bool(key),
+        "key_prefix":    (key[:6] + "...") if key else None,
+        "working_auth":  working_auth,
+        "auth_attempts": auth_attempts,
+        "found":         match_result is not None,
+        "result":        match_result,
     }
 
 
