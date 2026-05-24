@@ -237,6 +237,164 @@ def best_match(name: str, index: dict, keys: list[str]) -> tuple[Optional[dict],
 
 import math as _math
 
+def _compute_fin_score_from_rows(boe_rows, cfb_rows, fec_rows) -> tuple[float, dict]:
+    """Compute financial score from raw API rows (no DB writes needed)."""
+    total      = 0.0
+    recipients: set[str] = set()
+
+    for row in (boe_rows or []):
+        amt = float(row.get("amount") or 0)
+        total += amt
+        cand = (row.get("committee_name") or row.get("candidate_name") or "").upper()[:40]
+        if cand: recipients.add(cand)
+
+    for row in (cfb_rows or []):
+        amt = float(row.get("amount") or 0)
+        total += amt
+        cand = (row.get("candidate_name") or "").upper()[:40]
+        if cand: recipients.add(cand)
+
+    for row in (fec_rows or []):
+        amt = float(row.get("contribution_receipt_amount") or 0)
+        total += amt
+        cand = ((row.get("committee") or {}).get("name") or "").upper()[:40]
+        if cand: recipients.add(cand)
+
+    if total <= 0:
+        return 0.0, {}
+
+    amount_score  = min(60.0, _math.log10(total + 1) * 15)
+    breadth_score = min(25.0, len(recipients) * 5)
+    fin_score     = round(amount_score + breadth_score, 2)
+
+    return fin_score, {
+        "total_donated":      round(total, 2),
+        "donation_count":     len(boe_rows or []) + len(cfb_rows or []) + len(fec_rows or []),
+        "unique_recipients":  len(recipients),
+    }
+
+
+def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
+    """
+    Synchronously enrich financial data (BOE + CFB + FEC) for a list of contacts
+    before returning ranking results.  Called inline by rank_influential_people.
+
+    Uses the in-memory BOE dataset (instant) plus parallel CFB + FEC API calls.
+    With 5 concurrent workers, 20-25 contacts complete in ~25-35 seconds.
+
+    Directly updates people_influence_scores so the re-run ranking query
+    immediately reflects the new data.  Background full enrichment (via
+    _auto_enrich_background) later writes proper Campaign Donor relationships
+    for the full scoring pipeline.
+
+    Returns list of person_ids whose scores were updated.
+    """
+    if not contacts:
+        return []
+
+    import concurrent.futures as _cf
+
+    def _enrich_one(contact: dict) -> tuple[str, float, dict] | None:
+        name      = (contact.get("full_name") or "").strip()
+        person_id = (contact.get("person_id") or "").strip()
+        if not name or not person_id:
+            return None
+
+        parts     = name.split()
+        firstname = parts[0]  if len(parts) > 0 else ""
+        lastname  = parts[-1] if len(parts) > 0 else ""
+
+        # BOE: in-memory, instant (first+last name precision, fallback to last-only)
+        boe_rows = boe_donations_by_voter(lastname, firstname)
+        if not boe_rows:
+            boe_rows = boe_donations_by(name, limit=50)
+
+        # CFB + FEC: two parallel HTTP calls
+        cfb_rows, fec_rows = [], []
+        try:
+            with _cf.ThreadPoolExecutor(max_workers=2) as p:
+                f_cfb = p.submit(cfb_donations_made, name)
+                f_fec = p.submit(fec_donations_by,   name)
+                cfb_rows = f_cfb.result(timeout=20) or []
+                fec_rows = f_fec.result(timeout=20) or []
+        except Exception as exc:
+            log.debug(f"_sync_enrich CFB/FEC for {name!r}: {exc}")
+
+        fin_score, raw = _compute_fin_score_from_rows(boe_rows, cfb_rows, fec_rows)
+        if fin_score <= 0:
+            return None
+
+        # Write a compact finance note for audit trail
+        note = (f"Quick-enriched BOE:{len(boe_rows)} CFB:{len(cfb_rows)} "
+                f"FEC:{len(fec_rows)} total=${raw['total_donated']:,.0f} "
+                f"recipients={raw['unique_recipients']}")
+        write_finance_note(person_id, note)
+
+        log.info(f"_sync_enrich: {name} — ${raw['total_donated']:,.0f} "
+                 f"({raw['unique_recipients']} recipients) fin_score={fin_score}")
+        return person_id, fin_score, raw
+
+    # Run all contacts in parallel (max 5 workers)
+    results_map: dict[str, tuple[float, dict]] = {}
+    with _cf.ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_enrich_one, c): c for c in contacts}
+        for future in _cf.as_completed(futures, timeout=120):
+            try:
+                res = future.result()
+                if res:
+                    pid, fin_score, raw = res
+                    results_map[pid] = (fin_score, raw)
+            except Exception as exc:
+                c = futures[future]
+                log.debug(f"_sync_enrich failed for {c.get('full_name')}: {exc}")
+
+    if not results_map:
+        return []
+
+    # Directly update people_influence_scores with computed financial scores
+    # (bypasses the normal relationship-based pipeline for speed; background
+    # full enrichment will later overwrite with properly computed values)
+    updated: list[str] = []
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            for pid, (fin_score, raw) in results_map.items():
+                cur.execute("""
+                    SELECT institutional_score, lobbying_score,
+                           network_score, engagement_score
+                    FROM people_influence_scores WHERE person_id = %s
+                """, (pid,))
+                row = cur.fetchone()
+                if not row:
+                    continue
+                inst  = float(row["institutional_score"] or 5)
+                lobby = float(row["lobbying_score"]      or 0)
+                net   = float(row["network_score"]        or 0)
+                eng   = float(row["engagement_score"]     or 0)
+
+                base   = inst*0.35 + fin_score*0.25 + lobby*0.20 + net*0.15 + eng*0.05
+                strong = sum(1 for s in [inst, fin_score, lobby, net, eng] if s >= 60)
+                if strong >= 2:
+                    base *= 1 + 0.15 * (strong - 1)
+                composite = round(min(100.0, base), 2)
+
+                cur.execute("""
+                    UPDATE people_influence_scores
+                       SET financial_score = %s,
+                           composite_score = %s,
+                           computed_at     = NOW()
+                     WHERE person_id = %s
+                """, (fin_score, composite, pid))
+                updated.append(pid)
+
+        conn.commit()
+        conn.close()
+        log.info(f"_sync_enrich: updated {len(updated)} contacts in people_influence_scores")
+    except Exception as exc:
+        log.error(f"_sync_enrich DB update failed: {exc}")
+
+    return updated
+
 # DDL for each object, in dependency order
 _INFLUENCE_DDL: list[tuple[str, str]] = [
     ("_finance_migrations", """
@@ -1002,7 +1160,6 @@ def rank_influential_people(
             cur.execute(sql, params)
             for row in cur.fetchall():
                 d = dict(row)
-                # Parse JSON breakdown back to dict for clean output
                 if d.get("breakdown_json"):
                     try:
                         d["component_breakdown"] = json.loads(d["breakdown_json"])
@@ -1011,51 +1168,58 @@ def rank_influential_people(
                     del d["breakdown_json"]
                 results.append(d)
 
-    # ── Auto-enrichment: trigger finance lookup for unenriched top contacts ───
-    # A contact is "unenriched" if financial_score == 0 AND network_score <= 5,
-    # meaning lookup_finance_connections has never been run on them.
-    # We kick off enrichment in a background thread (max 10 per call, 3 in parallel)
-    # and re-score them when done.  The next ranking call will show updated scores.
-    try:
-        with _auto_enrich_lock:
-            already = set(_auto_enrich_in_progress)
+    # ── Inline financial enrichment ───────────────────────────────────────────
+    # For every contact in the result set with no existing financial data,
+    # run BOE (in-memory, instant) + CFB + FEC (parallel, ~25-30s total) before
+    # returning so rankings reflect actual donation history on the FIRST call.
+    unenriched = [
+        {"person_id": r["person_id"], "full_name": r["full_name"]}
+        for r in results
+        if float(r.get("financial_score") or 0) == 0.0
+        and (r.get("full_name") or "").strip()
+    ]
 
-        unenriched = [
-            r for r in results
-            if float(r.get("financial_score") or 0) == 0.0
-            and float(r.get("network_score") or 0) <= 5.0
-            and r.get("person_id") not in already
-            and (r.get("full_name") or "").strip()
-        ][:10]
+    if unenriched:
+        log.info(f"rank_influential_people: enriching {len(unenriched)} contacts inline")
+        enriched_ids = _sync_enrich_financial(unenriched)
 
-        if unenriched:
+        if enriched_ids:
+            # Re-run the same query — updated scores now in people_influence_scores
+            results = []
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    for row in cur.fetchall():
+                        d = dict(row)
+                        if d.get("breakdown_json"):
+                            try:
+                                d["component_breakdown"] = json.loads(d["breakdown_json"])
+                            except Exception:
+                                d["component_breakdown"] = {}
+                            del d["breakdown_json"]
+                        results.append(d)
+
+        # Kick off background full enrichment (writes proper Campaign Donor
+        # relationships for the complete scoring pipeline on future queries)
+        try:
             with _auto_enrich_lock:
-                queued = []
-                for r in unenriched:
-                    if r["person_id"] not in _auto_enrich_in_progress:
-                        _auto_enrich_in_progress.add(r["person_id"])
-                        queued.append({"person_id": r["person_id"],
-                                       "full_name": r["full_name"]})
-
+                queued = [
+                    {"person_id": r["person_id"], "full_name": r["full_name"]}
+                    for r in results
+                    if r.get("person_id") not in _auto_enrich_in_progress
+                    and (r.get("full_name") or "").strip()
+                ][:15]
+                for c in queued:
+                    _auto_enrich_in_progress.add(c["person_id"])
             if queued:
-                t = _threading.Thread(
+                _threading.Thread(
                     target=_auto_enrich_background,
                     args=(queued,),
                     daemon=True,
-                    name="auto-enrich",
-                )
-                t.start()
-                # Attach metadata to first result so caller knows enrichment is happening
-                if results:
-                    results[0].setdefault("_meta", {})
-                    results[0]["_meta"]["auto_enriching"] = [c["full_name"] for c in queued]
-                    results[0]["_meta"]["auto_enriching_note"] = (
-                        f"Finance enrichment started for {len(queued)} contacts with no existing "
-                        f"financial data. Call rank_influential_people again in ~60 seconds "
-                        f"for updated scores reflecting their donation history."
-                    )
-    except Exception as _ae:
-        log.warning(f"Auto-enrich trigger failed (non-fatal): {_ae}")
+                    name="auto-enrich-full",
+                ).start()
+        except Exception as _ae:
+            log.debug(f"background full-enrich trigger failed (non-fatal): {_ae}")
 
     return results
 
