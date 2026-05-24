@@ -304,12 +304,11 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
         firstname = parts[0]  if len(parts) > 0 else ""
         lastname  = parts[-1] if len(parts) > 0 else ""
 
-        # BOE: in-memory, instant (first+last name precision, fallback to last-only)
+        # BOE: first+last name precision only — no last-name-only fallback
+        # (last-name fallback causes false positives for common surnames)
         boe_rows = boe_donations_by_voter(lastname, firstname)
-        if not boe_rows:
-            boe_rows = boe_donations_by(name, limit=50)
 
-        # CFB + FEC: two parallel HTTP calls
+        # CFB + FEC: two parallel HTTP calls using full name
         cfb_rows, fec_rows = [], []
         try:
             with _cf.ThreadPoolExecutor(max_workers=2) as p:
@@ -380,11 +379,28 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
 
                 cur.execute("""
                     UPDATE people_influence_scores
-                       SET financial_score = %s,
-                           composite_score = %s,
-                           computed_at     = NOW()
+                       SET financial_score     = %s,
+                           composite_score     = %s,
+                           component_breakdown = component_breakdown::jsonb
+                               || jsonb_build_object(
+                                    'financial', %s::numeric,
+                                    'raw', (component_breakdown->'raw')::jsonb
+                                        || jsonb_build_object(
+                                             'total_donated',    %s::numeric,
+                                             'donation_count',   %s::int,
+                                             'unique_recipients', %s::int
+                                           )
+                                  ),
+                           computed_at         = NOW()
                      WHERE person_id = %s
-                """, (fin_score, composite, pid))
+                """, (
+                    fin_score, composite,
+                    fin_score,
+                    raw.get("total_donated", 0),
+                    raw.get("donation_count", 0),
+                    raw.get("unique_recipients", 0),
+                    pid,
+                ))
                 updated.append(pid)
 
         conn.commit()
