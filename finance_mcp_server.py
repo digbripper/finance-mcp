@@ -1495,15 +1495,127 @@ def get_990_fetch_status() -> dict:
 
 
 
-# ─── Union LM-2 data — DOL OLMS ──────────────────────────────────────────────
+# ─── Union LM-2 data — DOL developer API (api.dol.gov/V1/ELORS) ─────────────
+#
+# The DOL OLMS public-facing web app (olmsapps.dol.gov/olpdr) has no usable
+# REST API — all endpoints return 404 or require the Angular app session.
+# The official DOL developer API is the correct access path.
+# Requires DOL_API_KEY env var (free key at developer.dol.gov).
 
-_OLMS_SEARCH_URL = "https://olmsapps.dol.gov/olpdr/GetLaborOrganizationSearchResults"
-_OLMS_DETAIL_URL = "https://olmsapps.dol.gov/olpdr/GetOrganizationReport"
-_OLMS_HEADERS    = {
-    "User-Agent": "Mozilla/5.0 (research/public-data)",
-    "Accept":     "application/json, text/plain, */*",
-    "Referer":    "https://olmsapps.dol.gov/olpdr/",
-}
+_DOL_API_BASE  = "https://api.dol.gov/V1"
+_DOL_API_KEY   = None   # loaded lazily from env
+
+# In-memory cache: all NY LM-2 union records, loaded once per process lifetime
+_olms_lm2_cache:        list[dict] = []
+_olms_lm2_cache_loaded: bool       = False
+
+
+def _get_dol_key() -> str | None:
+    global _DOL_API_KEY
+    if _DOL_API_KEY is None:
+        _DOL_API_KEY = os.environ.get("DOL_API_KEY", "").strip() or None
+    return _DOL_API_KEY
+
+
+def _load_olms_lm2_data(force: bool = False) -> list[dict]:
+    """
+    Download all NY-state LM-2 union records from the DOL developer API and
+    cache them in memory.  Subsequent calls return the cache instantly.
+    Typical NY dataset: ~500-1 000 records, loads in 2-5 seconds.
+    """
+    global _olms_lm2_cache, _olms_lm2_cache_loaded
+
+    if _olms_lm2_cache_loaded and not force:
+        return _olms_lm2_cache
+
+    key = _get_dol_key()
+    if not key:
+        log.warning("DOL_API_KEY not set — union LM-2 data unavailable")
+        return []
+
+    all_records: list[dict] = []
+    page_size   = 200
+    skip        = 0
+
+    # Try both state field name variants in one pass; stop on first success
+    state_filters = ["State eq 'NY'", "STATE eq 'NY'", "mailSt eq 'NY'"]
+    working_filter: str | None = None
+
+    for sf in state_filters:
+        try:
+            resp = requests.get(
+                f"{_DOL_API_BASE}/ELORS/lm2FinalData",
+                params={"KEY": key, "$filter": sf, "$top": 1, "$format": "json"},
+                timeout=20,
+            )
+            log.debug(f"DOL API probe filter={sf!r} status={resp.status_code} "
+                      f"body[:200]={resp.text[:200]!r}")
+            if resp.ok:
+                body = resp.json()
+                records = _dol_extract_records(body)
+                if records is not None:   # empty list is OK — filter worked
+                    working_filter = sf
+                    break
+        except Exception as exc:
+            log.debug(f"DOL API filter probe {sf!r} failed: {exc}")
+
+    if working_filter is None:
+        log.error("DOL API: could not determine correct state filter field name")
+        return []
+
+    # Full paginated download
+    while True:
+        try:
+            resp = requests.get(
+                f"{_DOL_API_BASE}/ELORS/lm2FinalData",
+                params={
+                    "KEY":     key,
+                    "$filter": working_filter,
+                    "$top":    page_size,
+                    "$skip":   skip,
+                    "$format": "json",
+                },
+                timeout=30,
+            )
+            if not resp.ok:
+                log.error(f"DOL API error {resp.status_code}: {resp.text[:200]}")
+                break
+            records = _dol_extract_records(resp.json())
+            if not records:
+                break
+            all_records.extend(records)
+            log.info(f"DOL API: {len(all_records)} NY LM-2 records loaded so far")
+            if len(records) < page_size:
+                break
+            skip += page_size
+        except Exception as exc:
+            log.error(f"DOL API pagination error at skip={skip}: {exc}")
+            break
+
+    _olms_lm2_cache        = all_records
+    _olms_lm2_cache_loaded = True
+    log.info(f"DOL API: cached {len(all_records)} NY LM-2 records")
+    return all_records
+
+
+def _dol_extract_records(body: dict | list) -> list[dict] | None:
+    """
+    Extract the list of records from a DOL API response.
+    Returns None if the body doesn't look like a valid API response,
+    empty list if the filter worked but returned no rows.
+    """
+    if isinstance(body, list):
+        return body
+    # OData v3: {"d": {"results": [...]}}
+    if "d" in body and isinstance(body["d"], dict):
+        return body["d"].get("results", [])
+    # OData v4: {"value": [...]}
+    if "value" in body and isinstance(body["value"], list):
+        return body["value"]
+    # Flat dict with single record
+    if any(k in body for k in ("UNION_NAME", "union_name", "UnionName", "NAME")):
+        return [body]
+    return None
 
 
 def _looks_like_union(org_name: str) -> bool:
@@ -1532,184 +1644,112 @@ def _int_from_dict(d: dict, *keys: str) -> int:
 
 def _search_olms_lm2(org_name: str) -> dict | None:
     """
-    Search DOL OLMS for LM-2/LM-3 union financial data.
-
-    Tries several parameter combinations since the OLMS OPDR REST API is
-    not officially documented.  All responses are DEBUG-logged so a single
-    deploy-and-test with test_union_lookup() confirms the correct format.
-    Returns a financial data dict or None if no confident match.
+    Search the in-memory DOL LM-2 cache for a union matching org_name.
+    Loads the cache from api.dol.gov on first call.
+    Returns financial data dict or None if no confident match found.
     """
-    clean = org_name.strip()
-    if not clean:
+    records = _load_olms_lm2_data()
+    if not records:
         return None
 
-    param_sets = [
-        {"srchType": "B", "srchStr": clean, "state": "NY", "reportType": "LM2"},
-        {"srchType": "B", "srchStr": clean, "reportType": "LM2"},
-        {"srchType": "B", "srchStr": clean, "state": "NY"},
-        {"srchType": "B", "srchStr": clean},
-    ]
-
-    raw_items: list = []
-    for params in param_sets:
-        try:
-            resp = requests.get(_OLMS_SEARCH_URL, params=params,
-                                timeout=15, headers=_OLMS_HEADERS)
-            log.debug(f"OLMS search status={resp.status_code} "
-                      f"url={resp.url} body[:300]={resp.text[:300]!r}")
-            if not resp.ok:
-                continue
-            body = resp.text.strip()
-            if not body or body[0] not in ("{", "["):
-                continue
-            data = resp.json()
-            if isinstance(data, list):
-                raw_items = data
-            else:
-                for key in ("items", "results", "laborOrganizations",
-                            "organizations", "data"):
-                    if isinstance(data.get(key), list) and data[key]:
-                        raw_items = data[key]
-                        break
-            if raw_items:
-                log.debug(f"OLMS hit for {org_name!r}: "
-                          f"{len(raw_items)} candidates, params={params}")
-                break
-        except Exception as exc:
-            log.debug(f"OLMS param variant {params} failed: {exc}")
-
-    if not raw_items:
-        return None
-
-    # Fuzzy-match to pick best candidate
     best, best_score = None, 0
-    for item in raw_items[:15]:
-        addr = item.get("unionAddress") or {}
-        cand = (addr.get("unionName") or item.get("union_name")
-                or item.get("unionName") or item.get("orgName")
-                or item.get("name") or "")
-        score = fuzz.token_sort_ratio(normalize(org_name), normalize(cand))
+    for r in records:
+        # DOL API field names vary slightly by dataset version — try all
+        name = (r.get("UNION_NAME") or r.get("union_name") or r.get("UnionName")
+                or r.get("NAME") or r.get("name") or "")
+        score = fuzz.token_sort_ratio(normalize(org_name), normalize(name))
         if score > best_score:
-            best_score, best = score, item
+            best_score, best = score, r
 
     if best_score < 75 or not best:
         return None
 
-    addr = best.get("unionAddress") or {}
-
     def _i(*keys: str) -> int:
-        return _int_from_dict({**best, **addr}, *keys)
+        return _int_from_dict(best, *keys)
 
-    receipts      = _i("totalReceipts",    "total_receipts",    "receipts",    "TOTRECEIPTS")
-    disbursements = _i("totalDisbursements","total_disbursements","disbursements","TOTDISBURSEMENTS")
-    assets        = _i("totalAssets",       "total_assets",      "assets",       "TOTASSETS")
-    members       = _i("totalMembers",      "members",           "membership",   "MEMBERS",
-                        "MembersAtEndOfPeriod")
-    year          = _i("rptYear",           "yrCovered",         "year",         "reportYear")
+    # Receipts — try every plausible field name
+    receipts = _i("TOTRECEIPTS", "TOTALRECEIPTS", "total_receipts",
+                  "TotalReceipts", "receipts", "RECEIPTS")
+    assets   = _i("TOTASSETS", "TOTALASSETS", "total_assets",
+                  "TotalAssets", "assets", "ASSETS")
+    disburse = _i("TOTDISBURSE", "TOTALDISBURSEMENTS", "total_disbursements",
+                  "TotalDisbursements", "disbursements", "DISBURSEMENTS")
+    members  = _i("MEMBERS_AT_END_OF_PERIOD", "TOTMEMBERS", "total_members",
+                  "TotalMembers", "members", "MEMBERS", "TOTALMEMBERS",
+                  "MembersAtEndOfPeriod")
+    year     = _i("PERIOD_OF_REPT", "YEAR", "year", "RPTYR",
+                  "period_of_report", "PeriodOfReport")
 
-    file_number = str(
-        best.get("fNum") or best.get("fnumber") or best.get("fileNum")
-        or addr.get("fNumString") or addr.get("fileNumber") or ""
-    ).strip()
-
-    # If no financial data in search response, try a detail call
-    if receipts == 0 and file_number:
-        try:
-            import time as _t; _t.sleep(0.3)
-            det = requests.get(_OLMS_DETAIL_URL,
-                               params={"fNum": file_number.replace("-", ""),
-                                       "rptYear": year or ""},
-                               timeout=15, headers=_OLMS_HEADERS)
-            log.debug(f"OLMS detail status={det.status_code} "
-                      f"body[:200]={det.text[:200]!r}")
-            if det.ok and det.text.strip().startswith("{"):
-                d = det.json()
-                receipts      = receipts      or _int_from_dict(d, "totalReceipts",    "receipts")
-                disbursements = disbursements or _int_from_dict(d, "totalDisbursements")
-                assets        = assets        or _int_from_dict(d, "totalAssets",      "assets")
-                members       = members       or _int_from_dict(d, "totalMembers",     "members")
-        except Exception as exc:
-            log.debug(f"OLMS detail call failed for {file_number!r}: {exc}")
+    file_num  = str(best.get("FILE_NUM") or best.get("file_num")
+                    or best.get("FileNum") or best.get("FILE_NUMBER") or "").strip()
+    affil     = str(best.get("AFFILIATION") or best.get("affiliation")
+                    or best.get("AFF_ABBR") or best.get("affAbbr") or "").strip()
+    city      = str(best.get("CITY") or best.get("city") or "").strip()
+    state     = str(best.get("STATE") or best.get("state")
+                    or best.get("MAILST") or "NY").strip()
+    form_type = str(best.get("FORM_TYPE") or best.get("form_type")
+                    or best.get("FormType") or "LM2").strip()
+    union_name = str(best.get("UNION_NAME") or best.get("union_name")
+                     or best.get("UnionName") or best.get("NAME") or "").strip()
 
     return {
-        "file_number":         file_number,
-        "legal_name":          str(addr.get("unionName") or best.get("union_name")
-                                   or best.get("unionName") or ""),
-        "affiliation":         str(best.get("affiliation") or best.get("affAbbr")
-                                   or addr.get("affAbbr") or ""),
-        "state":               str(addr.get("mailSt") or best.get("state") or "NY"),
-        "city":                str(addr.get("mailCity") or best.get("city") or ""),
+        "file_number":         file_num,
+        "legal_name":          union_name,
+        "affiliation":         affil,
+        "state":               state,
+        "city":                city,
         "total_receipts":      receipts,
-        "total_disbursements": disbursements,
+        "total_disbursements": disburse,
         "total_assets":        assets,
         "membership_count":    members,
         "report_year":         year,
-        "form_type":           str(best.get("formFiled") or best.get("formType")
-                                   or best.get("reportType") or "LM2"),
+        "form_type":           form_type,
         "match_confidence":    best_score,
     }
 
 
 def test_union_lookup(org_name: str) -> dict:
     """
-    Diagnostic: probe OLMS server for working endpoints and data formats.
-    Tries yearly file list, known-working servlets, and alternate base paths.
+    Diagnostic: load NY LM-2 data from DOL API and attempt a union lookup.
+    Returns the raw first record from the API (so you can see field names),
+    plus the match result for the given org name.
+    Call this after setting DOL_API_KEY to confirm the API is working.
     """
-    clean = org_name.strip()
-    results = []
+    key = _get_dol_key()
+    if not key:
+        return {"error": "DOL_API_KEY environment variable not set on Railway"}
 
-    def _probe(url: str, params: dict | None = None) -> dict:
-        try:
-            resp = requests.get(url, params=params, timeout=10,
-                                headers=_OLMS_HEADERS, verify=False)
-            return {
-                "url":     resp.url,
-                "status":  resp.status_code,
-                "snippet": resp.text[:300].strip(),
-                "is_json": resp.text.strip()[:1] in ("{", "["),
-                "ct":      resp.headers.get("Content-Type", "")[:60],
-            }
-        except Exception as e:
-            return {"url": url, "error": str(e)[:120]}
+    # Show raw API response for one record so we can confirm field names
+    raw_sample = None
+    api_status = None
+    try:
+        resp = requests.get(
+            f"{_DOL_API_BASE}/ELORS/lm2FinalData",
+            params={"KEY": key, "$top": 1, "$format": "json"},
+            timeout=15,
+        )
+        api_status = resp.status_code
+        if resp.ok:
+            records = _dol_extract_records(resp.json())
+            raw_sample = records[0] if records else None
+    except Exception as exc:
+        api_status = str(exc)
 
-    # 1. Probe for yearly file list (what gives us download filenames)
-    for ep in ["GetYearlyFilingListServlet", "GetYearlyFileListServlet",
-               "GetYearlyFileList", "GetAvailableYearlyFiles", "GetFilingYears"]:
-        results.append(_probe(f"https://olmsapps.dol.gov/olpdr/{ep}"))
-
-    # 2. Try GetYearlyFileServlet with guessed filenames / params
-    for params in [
-        {"year": "2024", "formType": "LM2"},
-        {"rptYear": "2024", "reportType": "LM2"},
-        {"report": "lm2data-2024.zip"},
-        {"report": "fy2024lm2.zip"},
-    ]:
-        results.append(_probe("https://olmsapps.dol.gov/olpdr/GetYearlyFileServlet",
-                               params))
-
-    # 3. Try entirely different base paths (API might not be under /olpdr/)
-    for base in ["/api/olpdr/", "/olms/", "/olpdrapi/", "/api/",
-                 "/olpdr/api/", "/services/"]:
-        results.append(_probe(
-            f"https://olmsapps.dol.gov{base}GetLaborOrganizationSearchResults",
-            {"srchType": "B", "srchStr": clean},
-        ))
-
-    # 4. Try the DOL developer API (separate system, known good)
-    results.append(_probe(
-        "https://api.dol.gov/V1/ELORS/lm2FinalData",
-        {"$filter": f"STATE eq 'NY'", "$top": "1"},
-    ))
-
-    # Summarise which probes returned non-404
-    non_404 = [r for r in results
-               if r.get("status") and r["status"] != 404]
+    # Full lookup using cache
+    cache = _load_olms_lm2_data()
+    result = _search_olms_lm2(org_name)
 
     return {
-        "query":    org_name,
-        "non_404_hits": non_404,
-        "all_probes":   results,
+        "query":           org_name,
+        "api_status":      api_status,
+        "cache_size":      len(cache),
+        "raw_sample_keys": list(raw_sample.keys()) if raw_sample else None,
+        "raw_sample":      raw_sample,
+        "found":           result is not None,
+        "receipts":        result.get("total_receipts", 0) if result else 0,
+        "result":          result,
     }
+
 
 
 def fetch_union_data_batch(limit: int = 50, force: bool = False) -> dict:
@@ -2684,122 +2724,6 @@ def fec_top_donors(candidate_name: str, limit: int = 100) -> list[dict]:
             donor_map[name]["latest_date"] = date
 
     return sorted(donor_map.values(), key=lambda x: -x["total_amount"])
-
-# ─── Federal LDA Lobbying — who lobbied this official ────────────────────────
-
-def lda_lobbying_targeting(official_name: str,
-                            years: list[int] | None = None,
-                            limit: int = 50) -> list[dict]:
-    """
-    Find federal LDA filings mentioning this official in specific_lobbying_issues.
-    Uses the FEDERAL_OFFICIALS table to get the right search term.
-    Skips state/local officials (Hochul, Adams) that don't appear in LDA.
-    """
-    last = official_name.strip().split()[-1].lower()
-    official = FEDERAL_OFFICIALS.get(last)
-
-    # State/local officials: no LDA presence
-    if last in ("hochul", "adams", "james", "dinapoli", "mamdani", "cuomo"):
-        log.info(f"LDA: {official_name} is state/local, skipping")
-        return []
-
-    search_term = official["lda_search"] if official else official_name.strip().split()[-1]
-
-    if years is None:
-        years = [2025, 2024]
-
-    all_filings: list[dict] = []
-    seen_uuids: set[str] = set()
-
-    # LDA strategy for senators/house members:
-    # 1. Search by registrant_name containing the official's name (catches cases
-    #    where the person IS a registered lobbyist themselves — rare but real)
-    # 2. Fetch NY-client filings and filter by government_entities containing "SENATE"
-    #    or "HOUSE" + last name match in the activity description
-    # The specific_lobbying_issues field contains bill/issue text, NOT senator names.
-
-    for year in years:
-        # Search 1: NY clients lobbying in this year — filter for Senate/House contacts
-        try:
-            resp = requests.get(f"{LDA_BASE}/filings/",
-                params={
-                    "client_state": "NY",
-                    "filing_year": year,
-                    "filing_type": "Q1,Q2,Q3,Q4",
-                    "limit": limit,
-                },
-                timeout=12,
-                headers={"Accept": "application/json"})
-            resp.raise_for_status()
-            filings = resp.json().get("results", [])
-            for f in filings:
-                uid = f.get("filing_uuid") or str(f.get("id") or "")
-                if uid in seen_uuids:
-                    continue
-                # Check if any lobbying activity targets this official by name
-                # in government_entities or in the lobbyist names
-                matched = False
-                for act in (f.get("lobbying_activities") or []):
-                    entities = " ".join(
-                        (e.get("name") or "").lower()
-                        for e in (act.get("government_entities") or [])
-                    )
-                    if search_term.lower() in entities:
-                        matched = True
-                        break
-                if matched:
-                    seen_uuids.add(uid)
-                    all_filings.append(f)
-            log.info(f"LDA {year} NY clients: {len(filings)} filings, {len(all_filings)} matched {search_term}")
-        except Exception as e:
-            log.warning(f"LDA targeting error {year}: {e}")
-
-    log.info(f"LDA total: {len(all_filings)} filings targeting {official_name}")
-    return all_filings
-
-def _dedupe_lda_filings(filings: list[dict]) -> list[dict]:
-    """Collapse LDA filings to one entry per registrant+client+year."""
-    seen: dict[str, dict] = {}
-    for f in filings:
-        registrant = (f.get("registrant") or {}).get("name", "")
-        client     = (f.get("client") or {}).get("name", "")
-        year       = str(f.get("filing_year", ""))
-        key        = f"{registrant}|{client}|{year}"
-
-        if key not in seen:
-            issues: set[str] = set()
-            lobbyist_names: list[str] = []
-            entities: set[str] = set()
-            for act in (f.get("lobbying_activities") or []):
-                if act.get("general_issue_code_display"):
-                    issues.add(act["general_issue_code_display"])
-                for lb in (act.get("lobbyists") or []):
-                    lobj = lb.get("lobbyist") or {}
-                    fn = lobj.get("first_name", "")
-                    ln = lobj.get("last_name", "")
-                    if fn or ln:
-                        lobbyist_names.append(f"{fn} {ln}".strip())
-                for ent in (act.get("government_entities") or []):
-                    if ent.get("name"):
-                        entities.add(ent["name"])
-            seen[key] = {
-                "registrant_name":    registrant,
-                "client_name":        client,
-                "year":               year,
-                "filing_type":        f.get("filing_type_display", ""),
-                "income":             float(f.get("income") or 0),
-                "expenses":           float(f.get("expenses") or 0),
-                "issues":             ", ".join(sorted(issues))[:300],
-                "lobbyist_names":     list(set(lobbyist_names))[:10],
-                "government_entities":list(entities)[:10],
-            }
-        else:
-            seen[key]["income"]   += float(f.get("income") or 0)
-            seen[key]["expenses"] += float(f.get("expenses") or 0)
-
-    return sorted(seen.values(), key=lambda x: -(x["income"] + x["expenses"]))
-
-
 # ─── LDA registrant cross-reference (in-memory from bundled CSV) ─────────────
 # lda_registrants.csv is built by running lda_fetch.py locally and committing.
 # Format: id, name, description, city, state (17k+ rows, ~1MB)
