@@ -1502,8 +1502,19 @@ def get_990_fetch_status() -> dict:
 # The official DOL developer API is the correct access path.
 # Requires DOL_API_KEY env var (free key at developer.dol.gov).
 
-_DOL_API_BASE  = "https://api.dol.gov/V1"
+_DOL_API_BASE  = "https://data.dol.gov"
 _DOL_API_KEY   = None   # loaded lazily from env
+
+# Known dataset IDs on data.dol.gov for union financial reports
+# Socrata dataset IDs are 4+4 alphanumeric strings (e.g. "abc1-def2")
+# We probe these in order until one returns data
+_DOL_LM2_DATASET_IDS = [
+    "yp2a-xjxh",   # OLMS LM-2 (most likely)
+    "gkaz-dk4j",
+    "qfw3-56mm",
+    "rb3y-gg2h",
+    "nr9r-5yn2",
+]
 
 # In-memory cache: all NY LM-2 union records, loaded once per process lifetime
 _olms_lm2_cache:        list[dict] = []
@@ -1519,9 +1530,9 @@ def _get_dol_key() -> str | None:
 
 def _load_olms_lm2_data(force: bool = False) -> list[dict]:
     """
-    Download all NY-state LM-2 union records from the DOL developer API and
-    cache them in memory.  Subsequent calls return the cache instantly.
-    Typical NY dataset: ~500-1 000 records, loads in 2-5 seconds.
+    Download all NY-state LM-2 union records from data.dol.gov (Socrata).
+    Probes known dataset IDs to find the right one, then paginates through all NY records.
+    Caches in memory for the process lifetime (~500-1000 records, loads in 2-5s).
     """
     global _olms_lm2_cache, _olms_lm2_cache_loaded
 
@@ -1533,68 +1544,68 @@ def _load_olms_lm2_data(force: bool = False) -> list[dict]:
         log.warning("DOL_API_KEY not set — union LM-2 data unavailable")
         return []
 
-    all_records: list[dict] = []
-    page_size   = 200
-    skip        = 0
+    # Socrata auth: X-App-Token header (primary) or $$app_token param (fallback)
+    headers = {"X-App-Token": key, "Accept": "application/json"}
 
-    # Try both state field name variants in one pass; stop on first success
-    state_filters = ["State eq 'NY'", "STATE eq 'NY'", "mailSt eq 'NY'"]
-    working_filter: str | None = None
+    # Discover which dataset ID has LM-2 union data
+    working_dataset = None
+    state_field     = None
 
-    for sf in state_filters:
-        try:
-            resp = requests.get(
-                f"{_DOL_API_BASE}/ELORS/lm2FinalData",
-                params={"KEY": key, "$filter": sf, "$top": 1, "$format": "json"},
-                timeout=20,
-            )
-            log.debug(f"DOL API probe filter={sf!r} status={resp.status_code} "
-                      f"body[:200]={resp.text[:200]!r}")
-            if resp.ok:
-                body = resp.json()
-                records = _dol_extract_records(body)
-                if records is not None:   # empty list is OK — filter worked
-                    working_filter = sf
+    for ds_id in _DOL_LM2_DATASET_IDS:
+        for sf in ("State", "STATE", "state", "MAILST", "mailSt"):
+            try:
+                url = f"{_DOL_API_BASE}/resource/{ds_id}.json"
+                resp = requests.get(url, headers=headers,
+                                    params={"$limit": 1, sf: "NY"},
+                                    timeout=15)
+                log.debug(f"DOL probe ds={ds_id} sf={sf} "
+                          f"status={resp.status_code} body[:150]={resp.text[:150]!r}")
+                if resp.ok and resp.text.strip().startswith("["):
+                    working_dataset = ds_id
+                    state_field     = sf
                     break
-        except Exception as exc:
-            log.debug(f"DOL API filter probe {sf!r} failed: {exc}")
+            except Exception as exc:
+                log.debug(f"DOL probe ds={ds_id} sf={sf} error: {exc}")
+        if working_dataset:
+            break
 
-    if working_filter is None:
-        log.error("DOL API: could not determine correct state filter field name")
+    if not working_dataset:
+        log.error("DOL API: no working dataset ID found — update _DOL_LM2_DATASET_IDS")
         return []
 
-    # Full paginated download
+    # Paginate through all NY records
+    all_records: list[dict] = []
+    page_size = 1000
+    offset    = 0
+
     while True:
         try:
             resp = requests.get(
-                f"{_DOL_API_BASE}/ELORS/lm2FinalData",
-                params={
-                    "KEY":     key,
-                    "$filter": working_filter,
-                    "$top":    page_size,
-                    "$skip":   skip,
-                    "$format": "json",
-                },
+                f"{_DOL_API_BASE}/resource/{working_dataset}.json",
+                headers=headers,
+                params={state_field: "NY", "$limit": page_size, "$offset": offset},
                 timeout=30,
             )
             if not resp.ok:
-                log.error(f"DOL API error {resp.status_code}: {resp.text[:200]}")
+                log.error(f"DOL paginate error {resp.status_code}: {resp.text[:200]}")
                 break
-            records = _dol_extract_records(resp.json())
-            if not records:
+            batch = resp.json()
+            if not batch:
                 break
-            all_records.extend(records)
-            log.info(f"DOL API: {len(all_records)} NY LM-2 records loaded so far")
-            if len(records) < page_size:
+            all_records.extend(batch)
+            log.info(f"DOL API: {len(all_records)} NY LM-2 records loaded "
+                     f"(dataset={working_dataset})")
+            if len(batch) < page_size:
                 break
-            skip += page_size
+            offset += page_size
         except Exception as exc:
-            log.error(f"DOL API pagination error at skip={skip}: {exc}")
+            log.error(f"DOL paginate error offset={offset}: {exc}")
             break
 
     _olms_lm2_cache        = all_records
     _olms_lm2_cache_loaded = True
-    log.info(f"DOL API: cached {len(all_records)} NY LM-2 records")
+    log.info(f"DOL API: cached {len(all_records)} NY LM-2 records "
+             f"(dataset={working_dataset}, state_field={state_field})")
     return all_records
 
 
@@ -1710,60 +1721,54 @@ def _search_olms_lm2(org_name: str) -> dict | None:
 
 def test_union_lookup(org_name: str) -> dict:
     """
-    Diagnostic: test DOL API auth and attempt a union lookup.
-    Tries multiple authentication methods to find what the API accepts.
+    Diagnostic: probe data.dol.gov Socrata datasets for union LM-2 data,
+    then attempt a fuzzy match on the given org name.
     """
     key = _get_dol_key()
+    if not key:
+        return {"error": "DOL_API_KEY not set on Railway"}
 
-    auth_attempts = []
-    working_auth  = None
+    headers = {"X-App-Token": key, "Accept": "application/json"}
+    probes  = []
 
-    # Try every auth method the DOL API might accept
-    auth_variants = [
-        ("query_KEY",        {"params": {"KEY": key, "$top": 1, "$format": "json"}, "headers": {}}),
-        ("query_APIKEY",     {"params": {"APIKEY": key, "$top": 1, "$format": "json"}, "headers": {}}),
-        ("query_api_key",    {"params": {"api_key": key, "$top": 1, "$format": "json"}, "headers": {}}),
-        ("header_X-API-KEY", {"params": {"$top": 1, "$format": "json"}, "headers": {"X-API-KEY": key}}),
-        ("header_Authorization", {"params": {"$top": 1, "$format": "json"}, "headers": {"Authorization": f"Token {key}"}}),
-    ]
-
-    for name, kwargs in auth_variants:
-        if not key:
-            auth_attempts.append({"method": name, "error": "DOL_API_KEY env var not set"})
-            continue
+    # Probe each candidate dataset to find which one has LM-2 data
+    for ds_id in _DOL_LM2_DATASET_IDS:
         try:
             resp = requests.get(
-                f"{_DOL_API_BASE}/ELORS/lm2FinalData",
-                params=kwargs["params"],
-                headers=kwargs["headers"],
-                timeout=15,
+                f"{_DOL_API_BASE}/resource/{ds_id}.json",
+                headers=headers,
+                params={"$limit": 1},
+                timeout=10,
             )
-            result = {
-                "method":  name,
-                "status":  resp.status_code,
-                "snippet": resp.text[:300].strip(),
-            }
-            auth_attempts.append(result)
-            if resp.status_code == 200:
-                working_auth = name
-                break
+            row = None
+            if resp.ok and resp.text.strip().startswith("["):
+                rows = resp.json()
+                row  = rows[0] if rows else None
+            probes.append({
+                "dataset_id":  ds_id,
+                "status":      resp.status_code,
+                "row_keys":    list(row.keys()) if row else None,
+                "sample_name": (row or {}).get("union_name") or
+                               (row or {}).get("UNION_NAME") or
+                               (row or {}).get("name") or None,
+                "snippet":     resp.text[:200] if not resp.ok else None,
+            })
         except Exception as exc:
-            auth_attempts.append({"method": name, "error": str(exc)[:120]})
+            probes.append({"dataset_id": ds_id, "error": str(exc)[:120]})
 
-    # If we found a working auth, try the actual lookup
-    match_result = None
-    if working_auth:
-        cache = _load_olms_lm2_data()
-        match_result = _search_olms_lm2(org_name)
+    # Attempt full lookup using cache
+    cache  = _load_olms_lm2_data()
+    result = _search_olms_lm2(org_name)
 
     return {
-        "query":         org_name,
-        "key_set":       bool(key),
-        "key_prefix":    (key[:6] + "...") if key else None,
-        "working_auth":  working_auth,
-        "auth_attempts": auth_attempts,
-        "found":         match_result is not None,
-        "result":        match_result,
+        "query":        org_name,
+        "key_prefix":   key[:8] + "...",
+        "base_url":     _DOL_API_BASE,
+        "dataset_probes": probes,
+        "cache_size":   len(cache),
+        "found":        result is not None,
+        "receipts":     result.get("total_receipts", 0) if result else 0,
+        "result":       result,
     }
 
 
