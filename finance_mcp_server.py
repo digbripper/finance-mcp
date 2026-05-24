@@ -590,7 +590,7 @@ def _parse_first_dollar(text: str) -> float:
         return 0.0
 
 
-def compute_influence_scores_batch() -> dict:
+def compute_influence_scores_batch(person_ids_filter: list[str] | None = None) -> dict:
     """
     Compute v1 influence scores for every active Pythia contact.
     Five components:
@@ -713,7 +713,12 @@ def compute_influence_scores_batch() -> dict:
             cur.execute("SELECT id::text AS person_id, full_name FROM people_person WHERE is_active = TRUE")
             all_people = list(cur.fetchall())
 
-        log.info(f"compute_influence_scores: loaded data for {len(all_people)} contacts")
+        # If filtering to specific contacts (e.g. after auto-enrichment), only score those
+        if person_ids_filter:
+            allowed = set(person_ids_filter)
+            all_people = [p for p in all_people if p["person_id"] in allowed]
+
+        log.info(f"compute_influence_scores: scoring {len(all_people)} contacts")
 
         # ── Stage 3: compute scores in Python ─────────────────────────────────
         scored = []
@@ -1005,6 +1010,52 @@ def rank_influential_people(
                         d["component_breakdown"] = {}
                     del d["breakdown_json"]
                 results.append(d)
+
+    # ── Auto-enrichment: trigger finance lookup for unenriched top contacts ───
+    # A contact is "unenriched" if financial_score == 0 AND network_score <= 5,
+    # meaning lookup_finance_connections has never been run on them.
+    # We kick off enrichment in a background thread (max 10 per call, 3 in parallel)
+    # and re-score them when done.  The next ranking call will show updated scores.
+    try:
+        with _auto_enrich_lock:
+            already = set(_auto_enrich_in_progress)
+
+        unenriched = [
+            r for r in results
+            if float(r.get("financial_score") or 0) == 0.0
+            and float(r.get("network_score") or 0) <= 5.0
+            and r.get("person_id") not in already
+            and (r.get("full_name") or "").strip()
+        ][:10]
+
+        if unenriched:
+            with _auto_enrich_lock:
+                queued = []
+                for r in unenriched:
+                    if r["person_id"] not in _auto_enrich_in_progress:
+                        _auto_enrich_in_progress.add(r["person_id"])
+                        queued.append({"person_id": r["person_id"],
+                                       "full_name": r["full_name"]})
+
+            if queued:
+                t = _threading.Thread(
+                    target=_auto_enrich_background,
+                    args=(queued,),
+                    daemon=True,
+                    name="auto-enrich",
+                )
+                t.start()
+                # Attach metadata to first result so caller knows enrichment is happening
+                if results:
+                    results[0].setdefault("_meta", {})
+                    results[0]["_meta"]["auto_enriching"] = [c["full_name"] for c in queued]
+                    results[0]["_meta"]["auto_enriching_note"] = (
+                        f"Finance enrichment started for {len(queued)} contacts with no existing "
+                        f"financial data. Call rank_influential_people again in ~60 seconds "
+                        f"for updated scores reflecting their donation history."
+                    )
+    except Exception as _ae:
+        log.warning(f"Auto-enrich trigger failed (non-fatal): {_ae}")
 
     return results
 
@@ -2091,6 +2142,49 @@ def get_union_fetch_status() -> dict:
     except Exception as e:
         status["db_error"] = str(e)
     return status
+
+
+# ─── Auto-enrichment: triggered automatically by rank_influential_people ──────
+
+_auto_enrich_in_progress: set[str] = set()   # person_ids currently being enriched
+_auto_enrich_lock = _threading.Lock()
+
+
+def _auto_enrich_background(contacts: list[dict]) -> None:
+    """
+    Background thread: run finance enrichment for unenriched contacts,
+    then re-score just those contacts so the next ranking query reflects
+    their updated financial data.
+    """
+    import concurrent.futures as _cf
+
+    log.info(f"Auto-enrichment: starting for {len(contacts)} contacts: "
+             f"{[c['full_name'] for c in contacts]}")
+
+    # Enrich up to 3 contacts in parallel (keeps external API calls reasonable)
+    with _cf.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            pool.submit(enrich_person, c["full_name"]): c
+            for c in contacts
+        }
+        for future in _cf.as_completed(futures):
+            contact = futures[future]
+            try:
+                future.result()
+                log.info(f"Auto-enriched: {contact['full_name']}")
+            except Exception as exc:
+                log.warning(f"Auto-enrich failed for {contact['full_name']}: {exc}")
+            finally:
+                with _auto_enrich_lock:
+                    _auto_enrich_in_progress.discard(contact["person_id"])
+
+    # Re-score only the enriched contacts so rankings update quickly
+    pids = [c["person_id"] for c in contacts]
+    try:
+        compute_influence_scores_batch(person_ids_filter=pids)
+        log.info(f"Auto-enrichment: re-scored {len(pids)} contacts")
+    except Exception as exc:
+        log.error(f"Auto-enrich re-score failed: {exc}")
 
 def cfb_donations_received(candidate_name: str, limit: int = 50) -> list[dict]:
     last = candidate_name.strip().split()[-1]
