@@ -308,12 +308,52 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
         # (last-name fallback causes false positives for common surnames)
         boe_rows = boe_donations_by_voter(lastname, firstname)
 
-        # CFB + FEC: two parallel HTTP calls using full name
+        # CFB + FEC with first+last name precision (not last-name-only)
+        # This prevents common surnames (Torres, Cooper, Schwartz) from matching
+        # unrelated donors and inflating scores.
         cfb_rows, fec_rows = [], []
         try:
+            def _cfb_precise(fn: str, ln: str, limit: int = 50) -> list[dict]:
+                try:
+                    resp = requests.get(
+                        f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json",
+                        params={
+                            "$limit": limit,
+                            "$where": (
+                                f"upper(contributor_name) like upper('%{ln}%') "
+                                f"AND upper(contributor_name) like upper('%{fn[:4]}%') "
+                                f"AND amount >= 250"
+                            ),
+                            "$order": "amount DESC",
+                        },
+                        timeout=15,
+                    )
+                    return resp.json() if resp.ok else []
+                except Exception:
+                    return []
+
+            def _fec_precise(fn: str, ln: str, limit: int = 50) -> list[dict]:
+                key = _cfg("FEC_API_KEY", "DEMO_KEY")
+                try:
+                    # FEC stores contributor names as "LASTNAME, FIRSTNAME" — search both forms
+                    resp = requests.get(
+                        f"{FEC_BASE}/schedules/schedule_a/",
+                        params={
+                            "api_key": key,
+                            "per_page": min(limit, 100),
+                            "contributor_name": f"{ln}, {fn}",
+                            "min_amount": 250,
+                            "sort": "-contribution_receipt_amount",
+                        },
+                        timeout=15,
+                    )
+                    return resp.json().get("results", []) if resp.ok else []
+                except Exception:
+                    return []
+
             with _cf.ThreadPoolExecutor(max_workers=2) as p:
-                f_cfb = p.submit(cfb_donations_made, name)
-                f_fec = p.submit(fec_donations_by,   name)
+                f_cfb = p.submit(_cfb_precise, firstname, lastname)
+                f_fec = p.submit(_fec_precise, firstname, lastname)
                 cfb_rows = f_cfb.result(timeout=20) or []
                 fec_rows = f_fec.result(timeout=20) or []
         except Exception as exc:
