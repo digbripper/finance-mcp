@@ -313,49 +313,79 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
         # unrelated donors and inflating scores.
         cfb_rows, fec_rows = [], []
         try:
-            def _cfb_precise(fn: str, ln: str, limit: int = 50) -> list[dict]:
-                try:
-                    resp = requests.get(
-                        f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json",
-                        params={
-                            "$limit": limit,
-                            "$where": (
-                                f"upper(contributor_name) like upper('%{ln}%') "
-                                f"AND upper(contributor_name) like upper('%{fn[:4]}%') "
-                                f"AND amount >= 250"
-                            ),
-                            "$order": "amount DESC",
-                        },
-                        timeout=15,
-                    )
-                    return resp.json() if resp.ok else []
-                except Exception:
-                    return []
+            # Nickname → formal name map: political databases use legal names
+            _NICK: dict[str, list[str]] = {
+                "steve": ["steven", "stephen"], "bob": ["robert"],
+                "bill":  ["william"],           "will": ["william"],
+                "jim":   ["james"],             "jeff": ["jeffrey"],
+                "joe":   ["joseph"],            "mike": ["michael"],
+                "tom":   ["thomas"],            "tim":  ["timothy"],
+                "dan":   ["daniel"],            "dave": ["david"],
+                "rob":   ["robert"],            "rich": ["richard"],
+                "dick":  ["richard"],           "nick": ["nicholas"],
+                "matt":  ["matthew"],           "andy": ["andrew"],
+                "tony":  ["anthony"],           "ed":   ["edward", "edmund"],
+                "ted":   ["theodore", "edward"],"sam":  ["samuel"],
+                "ben":   ["benjamin"],          "ken":  ["kenneth"],
+                "liz":   ["elizabeth"],         "sue":  ["susan"],
+                "kate":  ["katherine"],         "chris": ["christopher"],
+            }
+            fn_variants = [firstname] + _NICK.get(firstname.lower(), [])
 
-            def _fec_precise(fn: str, ln: str, limit: int = 50) -> list[dict]:
+            def _cfb_precise(fn_list: list, ln: str, limit: int = 50) -> list[dict]:
+                seen, rows = set(), []
+                for fn in fn_list:
+                    try:
+                        resp = requests.get(
+                            f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json",
+                            params={
+                                "$limit": limit,
+                                "$where": (
+                                    f"upper(contributor_name) like upper('%{ln}%') "
+                                    f"AND upper(contributor_name) like upper('%{fn[:4]}%') "
+                                    f"AND amount >= 250"
+                                ),
+                                "$order": "amount DESC",
+                            },
+                            timeout=15,
+                        )
+                        for r in (resp.json() if resp.ok else []):
+                            rid = r.get("filing_id") or id(r)
+                            if rid not in seen:
+                                seen.add(rid); rows.append(r)
+                    except Exception:
+                        pass
+                return rows
+
+            def _fec_precise(fn_list: list, ln: str, limit: int = 50) -> list[dict]:
                 key = _cfg("FEC_API_KEY", "DEMO_KEY")
-                try:
-                    # FEC stores contributor names as "LASTNAME, FIRSTNAME" — search both forms
-                    resp = requests.get(
-                        f"{FEC_BASE}/schedules/schedule_a/",
-                        params={
-                            "api_key": key,
-                            "per_page": min(limit, 100),
-                            "contributor_name": f"{ln}, {fn}",
-                            "min_amount": 250,
-                            "sort": "-contribution_receipt_amount",
-                        },
-                        timeout=15,
-                    )
-                    return resp.json().get("results", []) if resp.ok else []
-                except Exception:
-                    return []
+                seen, rows = set(), []
+                for fn in fn_list:
+                    try:
+                        resp = requests.get(
+                            f"{FEC_BASE}/schedules/schedule_a/",
+                            params={
+                                "api_key":          key,
+                                "per_page":         min(limit, 100),
+                                "contributor_name": f"{ln}, {fn}",
+                                "min_amount":       250,
+                                "sort":             "-contribution_receipt_amount",
+                            },
+                            timeout=15,
+                        )
+                        for r in (resp.json().get("results", []) if resp.ok else []):
+                            rid = r.get("sub_id") or id(r)
+                            if rid not in seen:
+                                seen.add(rid); rows.append(r)
+                    except Exception:
+                        pass
+                return rows
 
             with _cf.ThreadPoolExecutor(max_workers=2) as p:
-                f_cfb = p.submit(_cfb_precise, firstname, lastname)
-                f_fec = p.submit(_fec_precise, firstname, lastname)
-                cfb_rows = f_cfb.result(timeout=20) or []
-                fec_rows = f_fec.result(timeout=20) or []
+                f_cfb = p.submit(_cfb_precise, fn_variants, lastname)
+                f_fec = p.submit(_fec_precise, fn_variants, lastname)
+                cfb_rows = f_cfb.result(timeout=25) or []
+                fec_rows = f_fec.result(timeout=25) or []
         except Exception as exc:
             log.debug(f"_sync_enrich CFB/FEC for {name!r}: {exc}")
 
