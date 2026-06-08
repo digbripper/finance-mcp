@@ -538,7 +538,7 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
                                 "api_key":          key,
                                 "per_page":         min(limit, 100),
                                 "contributor_name": f"{ln}, {fn}",
-                                "min_amount":       250,
+                                "min_amount":       200,   # FEC itemization threshold
                                 "sort":             "-contribution_receipt_amount",
                             },
                             timeout=15,
@@ -1590,6 +1590,32 @@ def rank_influential_people(
             }
             for r in results[:limit]
         ][:15]
+
+        # Also force-include contacts that have org/title data but $0 financial
+        # — executives, founders, and officials who don't donate to NY state
+        # races get no BOE score and would otherwise be excluded from Phase 2,
+        # even though their CFB/FEC data may be substantial (e.g. Valerie Berlin).
+        already_in_phase2 = {c["person_id"] for c in top_for_full_enrichment}
+        force_include = [
+            {
+                "person_id": r["person_id"],
+                "full_name": r["full_name"],
+                "orgs":      r.get("orgs") or "",
+                "titles":    r.get("titles") or "",
+            }
+            for r in results
+            if r["person_id"] not in already_in_phase2
+            and float(r.get("financial_score") or 0) == 0.0
+            and (r.get("orgs") or r.get("titles"))   # has some profile data
+        ]
+        # Merge, dedup, cap total at 20
+        seen_ids: set = set()
+        merged: list[dict] = []
+        for c in top_for_full_enrichment + force_include:
+            if c["person_id"] not in seen_ids:
+                seen_ids.add(c["person_id"])
+                merged.append(c)
+        top_for_full_enrichment = merged[:20]
 
         if top_for_full_enrichment:
             log.info(f"rank_influential_people phase-2: full CFB+FEC enrichment "
