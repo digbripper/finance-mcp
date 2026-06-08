@@ -637,15 +637,21 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
     results_map: dict[str, tuple[float, dict]] = {}
     with _cf.ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(_enrich_one, c): c for c in contacts}
-        for future in _cf.as_completed(futures, timeout=120):
-            try:
-                res = future.result()
-                if res:
-                    pid, fin_score, raw = res
-                    results_map[pid] = (fin_score, raw)
-            except Exception as exc:
-                c = futures[future]
-                log.debug(f"_sync_enrich failed for {c.get('full_name')}: {exc}")
+        try:
+            for future in _cf.as_completed(futures, timeout=120):
+                try:
+                    res = future.result()
+                    if res:
+                        pid, fin_score, raw = res
+                        results_map[pid] = (fin_score, raw)
+                except Exception as exc:
+                    c = futures[future]
+                    log.debug(f"_sync_enrich failed for {c.get('full_name')}: {exc}")
+        except _cf.TimeoutError:
+            finished   = sum(1 for f in futures if f.done())
+            unfinished = len(futures) - finished
+            log.warning(f"_sync_enrich: 120s timeout — {finished} done, "
+                        f"{unfinished} unfinished; returning partial results")
 
     if not results_map:
         return []
