@@ -362,6 +362,9 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
 
     return updated
 
+import math as _math
+
+
 def _compute_fin_score_from_rows(boe_rows, cfb_rows, fec_rows) -> tuple[float, dict]:
     """Compute financial score from raw API rows (no DB writes needed)."""
     total      = 0.0
