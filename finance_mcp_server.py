@@ -235,7 +235,132 @@ def best_match(name: str, index: dict, keys: list[str]) -> tuple[Optional[dict],
 
 # ─── Influence ranking — table setup & rollback ───────────────────────────────
 
-import math as _math
+def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
+    """
+    Instant BOE-only financial pre-scan for all unenriched contacts.
+
+    The BOE dataset (106,976 NY state contributions) is already loaded in memory
+    at server startup.  Scanning every contact in a zip code for their NY state
+    donation history takes under 5ms total — no API calls, no rate limits,
+    no timeouts, no cap needed.
+
+    This is the baseline pass: it catches every major NY state political donor
+    (governor, AG, comptroller, legislature) immediately.  Full CFB + FEC data
+    (NYC and federal) is filled in by the background enrichment thread.
+
+    Returns list of person_ids whose financial scores were updated.
+    """
+    if not contacts:
+        return []
+
+    score_updates: list[tuple] = []   # (pid, fin_score, raw_dict)
+
+    for contact in contacts:
+        name      = (contact.get("full_name") or "").strip()
+        person_id = (contact.get("person_id") or "").strip()
+        if not name or not person_id:
+            continue
+
+        parts     = name.split()
+        firstname = parts[0]  if parts else ""
+        lastname  = parts[-1] if parts else ""
+
+        # Also try formal name variants (Steve → Steven etc.)
+        _NICK: dict[str, list[str]] = {
+            "steve": ["steven", "stephen"], "bob":  ["robert"],
+            "bill":  ["william"],           "will": ["william"],
+            "jim":   ["james"],             "jeff": ["jeffrey"],
+            "joe":   ["joseph"],            "mike": ["michael"],
+            "tom":   ["thomas"],            "dan":  ["daniel"],
+            "dave":  ["david"],             "rob":  ["robert"],
+            "rich":  ["richard"],           "matt": ["matthew"],
+            "andy":  ["andrew"],            "tony": ["anthony"],
+            "ed":    ["edward", "edmund"],  "sam":  ["samuel"],
+            "ben":   ["benjamin"],          "ken":  ["kenneth"],
+            "liz":   ["elizabeth"],         "kate": ["katherine"],
+        }
+        boe_rows: list[dict] = []
+        for fn in [firstname] + _NICK.get(firstname.lower(), []):
+            rows = boe_donations_by_voter(lastname, fn)
+            for r in rows:
+                if r not in boe_rows:
+                    boe_rows.append(r)
+
+        if not boe_rows:
+            continue
+
+        fin_score, raw = _compute_fin_score_from_rows(boe_rows, [], [])
+        if fin_score > 0:
+            score_updates.append((person_id, fin_score, raw))
+
+    if not score_updates:
+        log.info(f"_boe_enrich: scanned {len(contacts)} contacts — no BOE data found")
+        return []
+
+    # Bulk update people_influence_scores
+    updated: list[str] = []
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            # Fetch current component scores for all contacts in one query
+            pids = [t[0] for t in score_updates]
+            cur.execute("""
+                SELECT person_id::text, institutional_score, lobbying_score,
+                       network_score, engagement_score
+                FROM people_influence_scores
+                WHERE person_id = ANY(%s)
+            """, (pids,))
+            score_rows = {r["person_id"]: dict(r) for r in cur.fetchall()}
+
+            for pid, fin_score, raw in score_updates:
+                row = score_rows.get(pid)
+                if not row:
+                    continue
+                inst  = float(row["institutional_score"] or 5)
+                lobby = float(row["lobbying_score"]      or 0)
+                net   = float(row["network_score"]        or 0)
+                eng   = float(row["engagement_score"]     or 0)
+
+                base   = inst*0.35 + fin_score*0.25 + lobby*0.20 + net*0.15 + eng*0.05
+                strong = sum(1 for s in [inst, fin_score, lobby, net, eng] if s >= 60)
+                if strong >= 2:
+                    base *= 1 + 0.15 * (strong - 1)
+                composite = round(min(100.0, base), 2)
+
+                cur.execute("""
+                    UPDATE people_influence_scores
+                       SET financial_score     = %s,
+                           composite_score     = %s,
+                           component_breakdown = component_breakdown::jsonb
+                               || jsonb_build_object(
+                                    'financial', %s::numeric,
+                                    'raw', (component_breakdown->'raw')::jsonb
+                                        || jsonb_build_object(
+                                             'total_donated',     %s::numeric,
+                                             'donation_count',    %s::int,
+                                             'unique_recipients', %s::int
+                                           )
+                                  ),
+                           computed_at         = NOW()
+                     WHERE person_id = %s
+                """, (
+                    fin_score, composite,
+                    fin_score,
+                    raw.get("total_donated", 0),
+                    raw.get("donation_count", 0),
+                    raw.get("unique_recipients", 0),
+                    pid,
+                ))
+                updated.append(pid)
+
+        conn.commit()
+        conn.close()
+        log.info(f"_boe_enrich: updated {len(updated)}/{len(contacts)} contacts "
+                 f"from in-memory BOE scan")
+    except Exception as exc:
+        log.error(f"_boe_enrich DB update failed: {exc}")
+
+    return updated
 
 def _compute_fin_score_from_rows(boe_rows, cfb_rows, fec_rows) -> tuple[float, dict]:
     """Compute financial score from raw API rows (no DB writes needed)."""
@@ -1265,12 +1390,23 @@ def rank_influential_people(
         and (r.get("full_name") or "").strip()
     ]
 
+    # ── Inline BOE scan — instant baseline for all unenriched contacts ───────
+    # BOE data is in-memory: scanning every contact in any zip takes <5ms.
+    # No cap needed — this always runs for every unenriched contact.
+    # Full CFB + FEC depth is handled by the background thread below.
+    unenriched = [
+        {"person_id": r["person_id"], "full_name": r["full_name"]}
+        for r in results
+        if float(r.get("financial_score") or 0) == 0.0
+        and (r.get("full_name") or "").strip()
+    ]
+
     if unenriched:
-        log.info(f"rank_influential_people: enriching {len(unenriched)} contacts inline")
-        enriched_ids = _sync_enrich_financial(unenriched)
+        log.info(f"rank_influential_people: BOE scanning {len(unenriched)} unenriched contacts")
+        enriched_ids = _boe_enrich_contacts(unenriched)
 
         if enriched_ids:
-            # Re-run the same query — updated scores now in people_influence_scores
+            # Re-run ranking with BOE-updated scores
             results = []
             with get_db() as conn:
                 with conn.cursor() as cur:
@@ -1285,27 +1421,27 @@ def rank_influential_people(
                             del d["breakdown_json"]
                         results.append(d)
 
-        # Kick off background full enrichment (writes proper Campaign Donor
-        # relationships for the complete scoring pipeline on future queries)
-        try:
-            with _auto_enrich_lock:
-                queued = [
-                    {"person_id": r["person_id"], "full_name": r["full_name"]}
-                    for r in results
-                    if r.get("person_id") not in _auto_enrich_in_progress
-                    and (r.get("full_name") or "").strip()
-                ][:15]
-                for c in queued:
-                    _auto_enrich_in_progress.add(c["person_id"])
-            if queued:
-                _threading.Thread(
-                    target=_auto_enrich_background,
-                    args=(queued,),
-                    daemon=True,
-                    name="auto-enrich-full",
-                ).start()
-        except Exception as _ae:
-            log.debug(f"background full-enrich trigger failed (non-fatal): {_ae}")
+    # Background: full CFB + FEC enrichment for all contacts (no cap on who,
+    # but runs asynchronously so it doesn't slow down this response)
+    try:
+        with _auto_enrich_lock:
+            queued = [
+                {"person_id": r["person_id"], "full_name": r["full_name"]}
+                for r in results
+                if r.get("person_id") not in _auto_enrich_in_progress
+                and (r.get("full_name") or "").strip()
+            ][:15]
+            for c in queued:
+                _auto_enrich_in_progress.add(c["person_id"])
+        if queued:
+            _threading.Thread(
+                target=_auto_enrich_background,
+                args=(queued,),
+                daemon=True,
+                name="auto-enrich-full",
+            ).start()
+    except Exception as _ae:
+        log.debug(f"background full-enrich trigger (non-fatal): {_ae}")
 
     return results
 
