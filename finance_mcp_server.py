@@ -1390,47 +1390,89 @@ def rank_influential_people(
         and (r.get("full_name") or "").strip()
     ]
 
-    # ── Inline BOE scan — instant baseline for all unenriched contacts ───────
-    # BOE data is in-memory: scanning every contact in any zip takes <5ms.
-    # No cap needed — this always runs for every unenriched contact.
-    # Full CFB + FEC depth is handled by the background thread below.
-    unenriched = [
+    # ── Two-phase enrichment ──────────────────────────────────────────────────
+    #
+    # Phase 1 — Instant BOE baseline (no API calls, no cap)
+    #   Scan every unenriched contact against the in-memory BOE dataset.
+    #   This establishes who's worth a full profile based on NY state giving.
+    #
+    # Phase 2 — Full CFB + FEC for the top contacts identified by Phase 1
+    #   Now that we know who's actually influential, run CFB + FEC only for
+    #   them (~20-25s for up to 15 contacts with 5 parallel workers).
+    #
+    # Result: comprehensive financial profiles for the people who matter,
+    # without wasting API calls on contacts that score low even after BOE.
+
+    unenriched_all = [
         {"person_id": r["person_id"], "full_name": r["full_name"]}
         for r in results
         if float(r.get("financial_score") or 0) == 0.0
         and (r.get("full_name") or "").strip()
     ]
 
-    if unenriched:
-        log.info(f"rank_influential_people: BOE scanning {len(unenriched)} unenriched contacts")
-        enriched_ids = _boe_enrich_contacts(unenriched)
+    if unenriched_all:
+        # ── Phase 1: BOE scan everyone (instant) ─────────────────────────────
+        log.info(f"rank_influential_people phase-1: BOE scanning "
+                 f"{len(unenriched_all)} unenriched contacts")
+        _boe_enrich_contacts(unenriched_all)
 
-        if enriched_ids:
-            # Re-run ranking with BOE-updated scores
-            results = []
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql, params)
-                    for row in cur.fetchall():
-                        d = dict(row)
-                        if d.get("breakdown_json"):
-                            try:
-                                d["component_breakdown"] = json.loads(d["breakdown_json"])
-                            except Exception:
-                                d["component_breakdown"] = {}
-                            del d["breakdown_json"]
-                        results.append(d)
+        # Re-rank with BOE-informed scores to find the true top contacts
+        results = []
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                for row in cur.fetchall():
+                    d = dict(row)
+                    if d.get("breakdown_json"):
+                        try:
+                            d["component_breakdown"] = json.loads(d["breakdown_json"])
+                        except Exception:
+                            d["component_breakdown"] = {}
+                        del d["breakdown_json"]
+                    results.append(d)
 
-    # Background: full CFB + FEC enrichment for all contacts (no cap on who,
-    # but runs asynchronously so it doesn't slow down this response)
+        # ── Phase 2: Full CFB + FEC for the top contacts ─────────────────────
+        # These are the people the BOE baseline says are most influential —
+        # give them a complete financial profile. Cap at 15 to stay in budget
+        # (~25s with 5 parallel workers).
+        top_for_full_enrichment = [
+            {"person_id": r["person_id"], "full_name": r["full_name"]}
+            for r in results[:limit]
+        ][:15]
+
+        if top_for_full_enrichment:
+            log.info(f"rank_influential_people phase-2: full CFB+FEC enrichment "
+                     f"for top {len(top_for_full_enrichment)} contacts")
+            enriched_full = _sync_enrich_financial(top_for_full_enrichment)
+
+            if enriched_full:
+                # Final re-rank with complete financial data
+                results = []
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, params)
+                        for row in cur.fetchall():
+                            d = dict(row)
+                            if d.get("breakdown_json"):
+                                try:
+                                    d["component_breakdown"] = json.loads(d["breakdown_json"])
+                                except Exception:
+                                    d["component_breakdown"] = {}
+                                del d["breakdown_json"]
+                            results.append(d)
+
+    # Background: full enrichment for remaining contacts outside the top window
     try:
+        already_enriched = {r["person_id"] for r in results
+                            if float(r.get("financial_score") or 0) > 0}
         with _auto_enrich_lock:
             queued = [
                 {"person_id": r["person_id"], "full_name": r["full_name"]}
                 for r in results
-                if r.get("person_id") not in _auto_enrich_in_progress
+                if r.get("person_id") not in already_enriched
+                and r.get("person_id") not in _auto_enrich_in_progress
                 and (r.get("full_name") or "").strip()
-            ][:15]
+            ][:10]
             for c in queued:
                 _auto_enrich_in_progress.add(c["person_id"])
         if queued:
@@ -1438,10 +1480,10 @@ def rank_influential_people(
                 target=_auto_enrich_background,
                 args=(queued,),
                 daemon=True,
-                name="auto-enrich-full",
+                name="auto-enrich-bg",
             ).start()
     except Exception as _ae:
-        log.debug(f"background full-enrich trigger (non-fatal): {_ae}")
+        log.debug(f"background enrich trigger (non-fatal): {_ae}")
 
     return results
 
