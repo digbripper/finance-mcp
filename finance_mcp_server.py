@@ -413,8 +413,10 @@ def _compute_fin_score_from_rows(
         cand = ((row.get("committee") or {}).get("name") or "").upper()[:40]
         if cand: recipients.add(cand)
 
-    # Company PAC: counted at 25% (CEO directs but doesn't personally fund)
-    total += company_pac_total * 0.25
+    # Company PAC: CEO/Chairman directs political spending but doesn't personally
+    # fund it — 15% weight reflects that it's institutional money aligned with
+    # leadership preferences, not a direct personal contribution
+    total += company_pac_total * 0.15
 
     # PAC receipts signal political value (money flowing TO them) — up to 15 pts
     pac_recipient_score = (
@@ -567,9 +569,13 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
             "public advocate", "borough president", "alderman",
         ])
         is_executive = bool(org_name) and any(kw in job_title for kw in [
-            "ceo", "chairman", "president and ceo", "co-founder", "founder",
-            "managing partner", "managing director", "owner", "principal",
+            "ceo", "chairman", "co-founder", "founder", "owner",
+            "president and ceo",
         ])
+        # Note: "managing director", "managing partner", "principal" intentionally
+        # excluded — corporate PAC direction is set by true C-suite (CEO/Chairman/
+        # Founder), not by mid-level or professional-services executives whose
+        # title conventions vary widely across industries.
 
         superpac_rows:     list[dict] = []
         company_pac_total: float      = 0.0
@@ -1083,13 +1089,21 @@ def compute_influence_scores_batch(person_ids_filter: list[str] | None = None) -
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT p.id::text AS person_id, p.full_name,
-                    MIN(o.influence_tier) AS best_tier,
-                    MAX(CASE WHEN rt.is_decision_maker THEN 1 ELSE 0 END) AS is_decision_maker,
-                    MAX(COALESCE(rt.seniority_level, 0)) AS max_seniority,
-                    COUNT(DISTINCT CASE WHEN o.influence_tier = 1 THEN o.id END) AS tier1_orgs
+                    MIN(o_tiered.influence_tier)                               AS best_tier,
+                    MAX(CASE WHEN rt.is_decision_maker THEN 1 ELSE 0 END)     AS is_decision_maker,
+                    MAX(COALESCE(rt.seniority_level, 0))                       AS max_seniority,
+                    COUNT(DISTINCT CASE WHEN o_tiered.influence_tier = 1
+                                        THEN o_tiered.id END)                 AS tier1_orgs,
+                    STRING_AGG(DISTINCT o_all.name,     ', ')                  AS all_orgs,
+                    STRING_AGG(DISTINCT po.job_title,   ', ')                  AS all_titles
                 FROM people_person p
-                LEFT JOIN people_personorganization po ON po.person_id = p.id AND po.is_current = TRUE
-                LEFT JOIN organizations_organization o ON o.id = po.organization_id AND o.influence_tier IS NOT NULL
+                LEFT JOIN people_personorganization po
+                       ON po.person_id = p.id AND po.is_current = TRUE
+                LEFT JOIN organizations_organization o_all
+                       ON o_all.id = po.organization_id
+                LEFT JOIN organizations_organization o_tiered
+                       ON o_tiered.id = po.organization_id
+                      AND o_tiered.influence_tier IS NOT NULL
                 LEFT JOIN people_roletype rt ON rt.id = po.role_type_id
                 WHERE p.is_active = TRUE
                 GROUP BY p.id, p.full_name
@@ -1212,6 +1226,16 @@ def compute_influence_scores_batch(person_ids_filter: list[str] | None = None) -
             decision_bonus    = 15 if inst.get("is_decision_maker") else 0
             multi_tier1_bonus = min(10, max(0, int(inst.get("tier1_orgs", 0) or 0) - 1) * 5)
             institutional_score = min(100.0, institutional_base + seniority_bonus + decision_bonus + multi_tier1_bonus)
+
+            # Government position override — elected officials and senior
+            # appointees get a fixed base score based on their position title,
+            # regardless of whether their org has an influence_tier set.
+            gov_score = _government_position_score(
+                inst.get("all_titles") or "",
+                inst.get("all_orgs")   or "",
+            )
+            if gov_score > 0:
+                institutional_score = max(institutional_score, gov_score)
 
             total_donated = 0.0
             for chunk in (don.get("all_notes") or "").split("|||"):
@@ -1636,26 +1660,109 @@ def _is_government_entity(org_name: str) -> bool:
 
 def _revenue_to_institutional_score(revenue: int | None) -> float:
     """
-    Convert annual nonprofit revenue (from IRS 990) to an institutional score (0-100).
-    Uses a log-like scale so score differences between small orgs are meaningful.
+    Convert annual nonprofit / union revenue (from IRS 990 or LM-2) to an
+    institutional score (0-100).  Log-like scale so small-org differences matter.
     """
     if not revenue or revenue <= 0:
         return 0.0
-    if revenue >= 1_000_000_000:   # $1B+
-        return 95.0
-    if revenue >= 500_000_000:     # $500M – $1B
-        return 88.0
-    if revenue >= 100_000_000:     # $100M – $500M
-        return 80.0
-    if revenue >= 50_000_000:      # $50M – $100M
-        return 70.0
-    if revenue >= 10_000_000:      # $10M – $50M
-        return 55.0
-    if revenue >= 5_000_000:       # $5M – $10M
-        return 40.0
-    if revenue >= 1_000_000:       # $1M – $5M
-        return 25.0
+    if revenue >= 1_000_000_000:   return 95.0
+    if revenue >= 500_000_000:     return 88.0
+    if revenue >= 100_000_000:     return 80.0
+    if revenue >= 50_000_000:      return 70.0
+    if revenue >= 10_000_000:      return 55.0
+    if revenue >= 5_000_000:       return 40.0
+    if revenue >= 1_000_000:       return 25.0
     return 10.0
+
+
+# ─── Government position institutional scores ─────────────────────────────────
+#
+# Elected officials and senior appointees get a fixed institutional base score
+# based on their position title, bypassing the org influence_tier system (which
+# doesn't cover government orgs).  Ordered from most specific → most general;
+# first match wins.  Matching is case-insensitive substring on combined
+# title + org string.
+
+_GOV_POSITION_SCORES: list[tuple[list[str], float]] = [
+    # Federal — leadership
+    (["president of the united states", "potus"],                           100),
+    (["vice president of the united states"],                                99),
+    (["senate majority leader"],                                             97),
+    (["senate minority leader"],                                             96),
+    (["speaker of the house"],                                               96),
+    (["senate majority whip", "senate minority whip"],                       93),
+    (["house majority leader", "house minority leader"],                     93),
+    (["house majority whip", "house minority whip"],                         91),
+    # Federal — rank and file
+    (["us senator", "united states senator", "senator from new york",
+      "senator, new york", "senator, ny"],                                   90),
+    (["us representative", "member of congress", "congressman",
+      "congresswoman", "us house of representatives",
+      "member, us house", "representative, ny"],                             83),
+    # Federal — cabinet / agencies
+    (["secretary of state", "secretary of defense",
+      "secretary of the treasury", "secretary of labor",
+      "secretary of commerce", "secretary of education",
+      "secretary of health"],                                                88),
+    (["director of the fbi", "director of the cia",
+      "national security advisor"],                                          85),
+    # NYS — leadership
+    (["governor of new york", "nys governor",
+      "governor, new york"],                                                 95),
+    (["new york state attorney general", "nys attorney general",
+      "attorney general of new york", "attorney general, new york"],         88),
+    (["new york state comptroller", "nys comptroller",
+      "state comptroller, new york"],                                        85),
+    (["lieutenant governor", "lt. governor"],                                80),
+    (["new york state senate majority leader",
+      "nys senate majority leader"],                                         84),
+    (["new york state senate minority leader",
+      "nys senate minority leader"],                                         83),
+    (["new york state assembly speaker", "nys assembly speaker"],            83),
+    # NYS — rank and file
+    (["new york state senator", "nys senator",
+      "state senator, new york", "state senator"],                           74),
+    (["assemblymember", "assembly member",
+      "new york state assembly", "nys assembly"],                            68),
+    # NYC — leadership
+    (["mayor of new york", "nyc mayor",
+      "mayor, new york city"],                                               92),
+    (["new york city comptroller", "nyc comptroller",
+      "comptroller, new york city", "comptroller, nyc",
+      "nyc comptroller"],                                                    82),
+    (["new york city public advocate", "nyc public advocate",
+      "public advocate, new york"],                                          79),
+    (["new york city council speaker", "nyc council speaker",
+      "speaker of the city council"],                                        82),
+    (["borough president"],                                                   77),
+    # NYC — rank and file
+    (["new york city council member", "nyc council member",
+      "city council member", "council member, new york"],                    68),
+    # NYC agencies — appointed officials
+    (["nypd commissioner", "police commissioner",
+      "commissioner of police"],                                             72),
+    (["schools chancellor", "nyc schools chancellor",
+      "chancellor of the new york city"],                                    75),
+    (["mta chairman", "mta ceo", "mta president"],                           73),
+    (["fire commissioner", "fdny commissioner"],                             70),
+    # Generic fallback for named commissioner / director roles
+    (["commissioner"],                                                        65),
+]
+
+
+def _government_position_score(titles: str, orgs: str) -> float:
+    """
+    Return the institutional base score for a government position, or 0.0 if
+    the combined title + org string doesn't match any known government position.
+    Matching is case-insensitive substring; first entry in _GOV_POSITION_SCORES wins.
+    """
+    combined = ((titles or "") + " || " + (orgs or "")).lower()
+    for keywords, score in _GOV_POSITION_SCORES:
+        if any(kw in combined for kw in keywords):
+            return float(score)
+    return 0.0
+
+
 
 
 def _search_propublica_990(org_name: str) -> dict | None:
@@ -3508,6 +3615,11 @@ def fec_superpac_donations_by(name_variants: list[str],
                     timeout=15,
                 )
                 for r in (resp.json().get("results", []) if resp.ok else []):
+                    # Only count actual individual human contributions —
+                    # not PAC-to-PAC transfers, which can falsely inflate
+                    # scores when an org name resembles a person's name
+                    if (r.get("entity_type") or "IND").upper() not in ("IND", ""):
+                        continue
                     rid = r.get("sub_id") or str(id(r))
                     if rid not in seen:
                         seen.add(rid)
