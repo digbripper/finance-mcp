@@ -365,8 +365,26 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
 import math as _math
 
 
-def _compute_fin_score_from_rows(boe_rows, cfb_rows, fec_rows) -> tuple[float, dict]:
-    """Compute financial score from raw API rows (no DB writes needed)."""
+def _compute_fin_score_from_rows(
+    boe_rows, cfb_rows, fec_rows,
+    superpac_rows=None,
+    company_pac_total: float = 0.0,
+    pac_receipts_in:   float = 0.0,
+) -> tuple[float, dict]:
+    """
+    Compute financial score from raw contribution rows.
+
+    boe_rows          — NY state individual contributions (in-memory)
+    cfb_rows          — NYC CFB individual contributions
+    fec_rows          — FEC hard-money individual contributions (capped)
+    superpac_rows     — FEC Schedule A to Super PACs (unlimited; often 10-100x
+                        larger than hard-money giving for major donors)
+    company_pac_total — Total spent by the contact's company PAC; counted at
+                        25% weight since it reflects institutional power the
+                        CEO directs but doesn't personally fund
+    pac_receipts_in   — PAC money flowing INTO a politician's campaign;
+                        signals how much organised interest backs them
+    """
     total      = 0.0
     recipients: set[str] = set()
 
@@ -388,17 +406,39 @@ def _compute_fin_score_from_rows(boe_rows, cfb_rows, fec_rows) -> tuple[float, d
         cand = ((row.get("committee") or {}).get("name") or "").upper()[:40]
         if cand: recipients.add(cand)
 
-    if total <= 0:
+    # Super PAC contributions — same FEC row structure, unlimited amounts
+    for row in (superpac_rows or []):
+        amt = float(row.get("contribution_receipt_amount") or 0)
+        total += amt
+        cand = ((row.get("committee") or {}).get("name") or "").upper()[:40]
+        if cand: recipients.add(cand)
+
+    # Company PAC: counted at 25% (CEO directs but doesn't personally fund)
+    total += company_pac_total * 0.25
+
+    # PAC receipts signal political value (money flowing TO them) — up to 15 pts
+    pac_recipient_score = (
+        min(15.0, _math.log10(pac_receipts_in + 1) * 5)
+        if pac_receipts_in > 0 else 0.0
+    )
+
+    if total <= 0 and pac_recipient_score <= 0:
         return 0.0, {}
 
-    amount_score  = min(60.0, _math.log10(total + 1) * 15)
+    amount_score  = min(60.0, _math.log10(total + 1) * 15) if total > 0 else 0.0
     breadth_score = min(25.0, len(recipients) * 5)
-    fin_score     = round(amount_score + breadth_score, 2)
+    fin_score     = round(min(100.0, amount_score + breadth_score + pac_recipient_score), 2)
 
     return fin_score, {
         "total_donated":      round(total, 2),
-        "donation_count":     len(boe_rows or []) + len(cfb_rows or []) + len(fec_rows or []),
+        "donation_count":     (len(boe_rows or []) + len(cfb_rows or [])
+                               + len(fec_rows or []) + len(superpac_rows or [])),
         "unique_recipients":  len(recipients),
+        "superpac_total":     round(
+            sum(float(r.get("contribution_receipt_amount") or 0) for r in (superpac_rows or [])), 2
+        ),
+        "company_pac_total":  round(company_pac_total, 2),
+        "pac_receipts_in":    round(pac_receipts_in, 2),
     }
 
 
@@ -517,18 +557,74 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
         except Exception as exc:
             log.debug(f"_sync_enrich CFB/FEC for {name!r}: {exc}")
 
-        fin_score, raw = _compute_fin_score_from_rows(boe_rows, cfb_rows, fec_rows)
+        # ── PAC: Super PAC donations, company PAC, politician PAC receipts ──
+        org_name  = (contact.get("orgs") or "").split(",")[0].strip()
+        job_title = (contact.get("titles") or "").lower()
+
+        is_politician = any(kw in job_title for kw in [
+            "council", "senator", "assembly", "mayor", "governor",
+            "representative", "congress", "comptroller", "whip", "speaker",
+            "public advocate", "borough president", "alderman",
+        ])
+        is_executive = bool(org_name) and any(kw in job_title for kw in [
+            "ceo", "chairman", "president and ceo", "co-founder", "founder",
+            "managing partner", "managing director", "owner", "principal",
+        ])
+
+        superpac_rows:     list[dict] = []
+        company_pac_total: float      = 0.0
+        pac_receipts_in:   float      = 0.0
+
+        # FEC PAC searches use "LASTNAME, FIRSTNAME" format
+        pac_name_variants = (
+            [f"{lastname}, {fn}" for fn in fn_variants] + fn_variants
+        )
+
+        try:
+            with _cf.ThreadPoolExecutor(max_workers=3) as pp:
+                f_superpac = pp.submit(fec_superpac_donations_by, pac_name_variants)
+                f_cpac     = pp.submit(fec_company_pac, org_name) if is_executive else None
+                f_polpac   = pp.submit(fec_politician_pac_profile, fn_variants) if is_politician else None
+
+                superpac_rows = f_superpac.result(timeout=20) or []
+
+                if f_cpac is not None:
+                    cpac = f_cpac.result(timeout=20) or {}
+                    company_pac_total = float(cpac.get("total_spent") or 0)
+
+                if f_polpac is not None:
+                    ppac = f_polpac.result(timeout=20) or {}
+                    pac_receipts_in = (
+                        float(ppac.get("pac_receipts_to_campaign") or 0)
+                        + float(ppac.get("leadership_pac_disbursements") or 0)
+                    )
+        except Exception as exc:
+            log.debug(f"_sync_enrich PAC for {name!r}: {exc}")
+
+        fin_score, raw = _compute_fin_score_from_rows(
+            boe_rows, cfb_rows, fec_rows,
+            superpac_rows=superpac_rows,
+            company_pac_total=company_pac_total,
+            pac_receipts_in=pac_receipts_in,
+        )
         if fin_score <= 0:
             return None
 
-        # Write a compact finance note for audit trail
-        note = (f"Quick-enriched BOE:{len(boe_rows)} CFB:{len(cfb_rows)} "
-                f"FEC:{len(fec_rows)} total=${raw['total_donated']:,.0f} "
-                f"recipients={raw['unique_recipients']}")
+        note = (
+            f"Quick-enriched BOE:{len(boe_rows)} CFB:{len(cfb_rows)} "
+            f"FEC:{len(fec_rows)} SuperPAC:{len(superpac_rows)} "
+            f"CompanyPAC:${company_pac_total:,.0f} PACin:${pac_receipts_in:,.0f} "
+            f"total=${raw['total_donated']:,.0f} recipients={raw['unique_recipients']}"
+        )
         write_finance_note(person_id, note)
 
-        log.info(f"_sync_enrich: {name} — ${raw['total_donated']:,.0f} "
-                 f"({raw['unique_recipients']} recipients) fin_score={fin_score}")
+        log.info(
+            f"_sync_enrich: {name} total=${raw['total_donated']:,.0f} "
+            f"superpac=${raw.get('superpac_total',0):,.0f} "
+            f"cpac=${raw.get('company_pac_total',0):,.0f} "
+            f"pac_in=${raw.get('pac_receipts_in',0):,.0f} "
+            f"fin_score={fin_score}"
+        )
         return person_id, fin_score, raw
 
     # Run all contacts in parallel (max 5 workers)
@@ -1406,10 +1502,27 @@ def rank_influential_people(
     # Result: comprehensive financial profiles for the people who matter,
     # without wasting API calls on contacts that score low even after BOE.
 
+    # A contact needs enrichment if: never enriched (score==0) OR data is stale (>30d)
+    from datetime import datetime as _dt_cls, timezone as _tz
+    def _is_stale(ts) -> bool:
+        try:
+            dt = _dt_cls.fromisoformat(str(ts))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_tz.utc)
+            return (_dt_cls.now(_tz.utc) - dt).days > 30
+        except Exception:
+            return False
+
     unenriched_all = [
-        {"person_id": r["person_id"], "full_name": r["full_name"]}
+        {
+            "person_id": r["person_id"],
+            "full_name": r["full_name"],
+            "orgs":      r.get("orgs") or "",
+            "titles":    r.get("titles") or "",
+        }
         for r in results
-        if float(r.get("financial_score") or 0) == 0.0
+        if (float(r.get("financial_score") or 0) == 0.0
+            or _is_stale(r.get("computed_at")))
         and (r.get("full_name") or "").strip()
     ]
 
@@ -1439,7 +1552,12 @@ def rank_influential_people(
         # give them a complete financial profile. Cap at 15 to stay in budget
         # (~25s with 5 parallel workers).
         top_for_full_enrichment = [
-            {"person_id": r["person_id"], "full_name": r["full_name"]}
+            {
+                "person_id": r["person_id"],
+                "full_name": r["full_name"],
+                "orgs":      r.get("orgs") or "",
+                "titles":    r.get("titles") or "",
+            }
             for r in results[:limit]
         ][:15]
 
@@ -3360,6 +3478,141 @@ def fec_top_donors(candidate_name: str, limit: int = 100) -> list[dict]:
             donor_map[name]["latest_date"] = date
 
     return sorted(donor_map.values(), key=lambda x: -x["total_amount"])
+
+
+# ─── PAC data functions ───────────────────────────────────────────────────────
+
+def fec_superpac_donations_by(name_variants: list[str],
+                               limit: int = 100) -> list[dict]:
+    """
+    Find unlimited contributions by a person to Super PACs (committee_type O),
+    Hybrid PACs (I), and Party committees (Y).  No dollar floor — catches the
+    $1M-$50M contributions that dwarf an individual's capped hard-money giving.
+    Searching across name variants handles Steve/Steven, Jeff/Jeffrey etc.
+    """
+    key = _cfg("FEC_API_KEY", "DEMO_KEY")
+    seen: set[str] = set()
+    rows: list[dict] = []
+    for name in name_variants:
+        for ctype in ["O", "I", "Y"]:
+            try:
+                resp = requests.get(
+                    f"{FEC_BASE}/schedules/schedule_a/",
+                    params={
+                        "api_key":          key,
+                        "contributor_name": name,
+                        "committee_type":   ctype,
+                        "per_page":         min(limit, 100),
+                        "sort":             "-contribution_receipt_amount",
+                    },
+                    timeout=15,
+                )
+                for r in (resp.json().get("results", []) if resp.ok else []):
+                    rid = r.get("sub_id") or str(id(r))
+                    if rid not in seen:
+                        seen.add(rid)
+                        rows.append(r)
+            except Exception as exc:
+                log.debug(f"fec_superpac_donations_by {name} type={ctype}: {exc}")
+    return rows
+
+
+def fec_company_pac(org_name: str) -> dict:
+    """
+    Find PACs associated with an organisation (connected PAC type B, Super PAC
+    type O, non-connected PAC type N) and return their total financial activity.
+    Use for CEOs/Chairs — their company's PAC is their political footprint.
+    """
+    key = _cfg("FEC_API_KEY", "DEMO_KEY")
+    committees: list[dict] = []
+    for ctype in ["B", "O", "N"]:
+        try:
+            resp = requests.get(
+                f"{FEC_BASE}/committees/",
+                params={"api_key": key, "name": org_name,
+                        "committee_type": ctype, "per_page": 10},
+                timeout=15,
+            )
+            if resp.ok:
+                committees.extend(resp.json().get("results", []))
+        except Exception as exc:
+            log.debug(f"fec_company_pac {org_name} type={ctype}: {exc}")
+    if not committees:
+        return {}
+    top = committees[:5]
+    return {
+        "pac_names":       [c.get("name", "") for c in top[:3]],
+        "total_raised":    round(sum(float(c.get("total_receipts") or 0) for c in top), 2),
+        "total_spent":     round(sum(float(c.get("total_disbursements") or 0) for c in top), 2),
+        "committee_count": len(committees),
+    }
+
+
+def fec_politician_pac_profile(name_variants: list[str]) -> dict:
+    """
+    For politicians: (1) PAC contributions received by their principal campaign
+    committee — signals which industries/unions/groups back them; (2) total
+    disbursements from any leadership PAC they personally control — signals
+    their standing as a party power broker.
+
+    Katherine Clark's leadership PAC disbursements reflect why she's Whip.
+    Chuck Schumer's PAC receipts reflect why he's the most sought-after Senate
+    vote in the country.
+    """
+    key = _cfg("FEC_API_KEY", "DEMO_KEY")
+    pac_receipts     = 0.0
+    leadership_total = 0.0
+
+    for name in name_variants[:2]:
+        # Campaign committee PAC receipts
+        try:
+            cr = requests.get(
+                f"{FEC_BASE}/candidates/search/",
+                params={"api_key": key, "q": name, "per_page": 3},
+                timeout=15,
+            )
+            if cr.ok:
+                for cand in cr.json().get("results", [])[:2]:
+                    for pc in (cand.get("principal_committees") or [])[:1]:
+                        cid = pc.get("committee_id", "")
+                        if not cid:
+                            continue
+                        try:
+                            tr = requests.get(
+                                f"{FEC_BASE}/committee/{cid}/totals/",
+                                params={"api_key": key, "per_page": 1},
+                                timeout=15,
+                            )
+                            if tr.ok:
+                                t = (tr.json().get("results") or [{}])[0]
+                                pac_receipts += float(
+                                    t.get("other_political_committee_contributions", 0) or 0
+                                )
+                        except Exception:
+                            pass
+        except Exception as exc:
+            log.debug(f"fec_politician_pac_profile receipts {name}: {exc}")
+
+        # Leadership PAC (where the politician is treasurer)
+        try:
+            lpr = requests.get(
+                f"{FEC_BASE}/committees/",
+                params={"api_key": key, "treasurer_name": name,
+                        "committee_type": ["N", "Q", "V"], "per_page": 5},
+                timeout=15,
+            )
+            if lpr.ok:
+                for pac in lpr.json().get("results", []):
+                    leadership_total += float(pac.get("total_disbursements") or 0)
+        except Exception as exc:
+            log.debug(f"fec_politician_pac_profile leadership {name}: {exc}")
+
+    return {
+        "pac_receipts_to_campaign":     round(pac_receipts, 2),
+        "leadership_pac_disbursements": round(leadership_total, 2),
+    }
+
+
 # ─── LDA registrant cross-reference (in-memory from bundled CSV) ─────────────
 # lda_registrants.csv is built by running lda_fetch.py locally and committing.
 # Format: id, name, description, city, state (17k+ rows, ~1MB)
