@@ -153,23 +153,33 @@ def get_db():
     return psycopg2.connect(_require("DATABASE_URL"), cursor_factory=psycopg2.extras.RealDictCursor)
 
 def get_all_contacts() -> list[dict]:
+    base_sql = """
+        SELECT
+            p.id::text,
+            p.full_name,
+            p.first_name,
+            p.last_name,
+            p.notes,
+            string_agg(DISTINCT o.name, ', ') AS orgs,
+            string_agg(DISTINCT po.job_title, ', ') AS titles{zip_select}
+        FROM people_person p
+        LEFT JOIN people_personorganization po ON p.id = po.person_id
+        LEFT JOIN organizations_organization o ON po.organization_id = o.id{zip_join}
+        WHERE p.is_active = TRUE
+        GROUP BY p.id, p.full_name, p.first_name, p.last_name, p.notes
+    """
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    p.id::text,
-                    p.full_name,
-                    p.first_name,
-                    p.last_name,
-                    p.notes,
-                    string_agg(DISTINCT o.name, ', ') AS orgs,
-                    string_agg(DISTINCT po.job_title, ', ') AS titles
-                FROM people_person p
-                LEFT JOIN people_personorganization po ON p.id = po.person_id
-                LEFT JOIN organizations_organization o ON po.organization_id = o.id
-                WHERE p.is_active = TRUE
-                GROUP BY p.id, p.full_name, p.first_name, p.last_name, p.notes
-            """)
+            try:
+                # voter_zip powers identity confirmation in enrichment
+                cur.execute(base_sql.format(
+                    zip_select=",\n            MAX(pve.voter_zip) AS voter_zip",
+                    zip_join="\n        LEFT JOIN people_voter_enrichment pve ON pve.person_id = p.id",
+                ))
+            except psycopg2.errors.UndefinedTable:
+                # people_voter_enrichment not created yet (setup_influence_tables)
+                conn.rollback()
+                cur.execute(base_sql.format(zip_select="", zip_join=""))
             return [dict(r) for r in cur.fetchall()]
 
 def write_finance_note(person_id: str, note: str):
@@ -186,6 +196,35 @@ def write_finance_note(person_id: str, note: str):
             cur.execute(
                 "UPDATE people_person SET notes = %s, updated_at = NOW() WHERE id = %s",
                 (existing + sep + note, person_id)
+            )
+        conn.commit()
+
+
+# Enrichment-pass notes are REPLACED, not appended: one structured line per
+# contact, updated on each pass. Also removes legacy append-style notes
+# ("Quick-enriched ...") that accumulated one line per ranking run.
+_ENRICH_NOTE_RE = re.compile(r"^\[Enriched \d{4}-\d{2}-\d{2}\].*$", re.MULTILINE)
+_LEGACY_ENRICH_NOTE_RE = re.compile(r"^Quick-enriched .*$", re.MULTILINE)
+
+def write_enrichment_note(person_id: str, note: str):
+    """Replace the contact's enrichment note with `note` (single structured
+    line). Non-enrichment notes are preserved untouched."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT notes FROM people_person WHERE id = %s", (person_id,))
+            row = cur.fetchone()
+            if not row:
+                return
+            existing = row["notes"] or ""
+            cleaned = _ENRICH_NOTE_RE.sub("", existing)
+            cleaned = _LEGACY_ENRICH_NOTE_RE.sub("", cleaned)
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+            updated = (cleaned + ("\n\n" if cleaned else "") + note) if note else cleaned
+            if updated == existing:
+                return
+            cur.execute(
+                "UPDATE people_person SET notes = %s, updated_at = NOW() WHERE id = %s",
+                (updated, person_id)
             )
         conn.commit()
 
@@ -233,6 +272,221 @@ def best_match(name: str, index: dict, keys: list[str]) -> tuple[Optional[dict],
         return None, 0.0
     return index[result[0]], result[1]
 
+# ─── Confidence-scored contribution matching ──────────────────────────────────
+#
+# Multi-signal identity confirmation before attributing contributions to a
+# contact.  Name-only matching caused false positives — most critically Super
+# PAC contributions worth millions attributed to strangers who share a name
+# (e.g. Brooklyn's Gregory Mitchell vs. a Texas rail executive).
+#
+# Signals, in order of strength:
+#   ZIP        — contributor_zip in the same zip3 region as the contact's voter
+#                file zip (Manhattan 100/101/102 unified: donors routinely give
+#                from office zips like 10154 = 345 Park Ave)
+#   Employer   — FEC contributor_employer fuzzy-matches one of the contact's
+#                Pythia organizations ("THE BLACKSTONE GROUP" ≈ "Blackstone")
+#   Occupation — contributor_occupation is plausible for the contact's titles
+#                ("CONGRESSMAN" for a US Senator)
+#
+# Confidence tiers:
+#   high   (name + ZIP or name + employer)  → include in all totals
+#   medium (name + occupation plausible)    → hard money only, never Super PAC
+#   low    (name only, rare + NY-clustered) → hard money with warning flag
+#   low    (name only, otherwise)           → exclude entirely, log unconfirmed
+
+_NICKNAMES: dict[str, list[str]] = {
+    "steve": ["steven", "stephen"], "bob":  ["robert"],
+    "bill":  ["william"],           "will": ["william"],
+    "jim":   ["james"],             "jeff": ["jeffrey"],
+    "joe":   ["joseph"],            "mike": ["michael"],
+    "tom":   ["thomas"],            "tim":  ["timothy"],
+    "dan":   ["daniel"],            "dave": ["david"],
+    "rob":   ["robert"],            "rich": ["richard"],
+    "dick":  ["richard"],           "nick": ["nicholas"],
+    "matt":  ["matthew"],           "andy": ["andrew"],
+    "tony":  ["anthony"],           "ed":   ["edward", "edmund"],
+    "ted":   ["theodore", "edward"],"sam":  ["samuel"],
+    "ben":   ["benjamin"],          "ken":  ["kenneth"],
+    "liz":   ["elizabeth"],         "sue":  ["susan"],
+    "kate":  ["katherine"],         "chris": ["christopher"],
+}
+
+def _name_variants(firstname: str) -> list[str]:
+    return [firstname] + _NICKNAMES.get(firstname.lower(), [])
+
+# Manhattan business/PO zips (101xx, 102xx) belong to the same area as
+# residential 100xx — a 10021 voter giving from a 10154 office is the norm.
+_MANHATTAN_ZIP3 = {"100", "101", "102"}
+
+def _zip_region(zip_code) -> str:
+    digits = re.sub(r"\D", "", str(zip_code or ""))[:5]
+    if len(digits) < 3:
+        return ""
+    z3 = digits[:3]
+    return "MAN" if z3 in _MANHATTAN_ZIP3 else z3
+
+def _zips_match(contrib_zip, voter_zip) -> bool:
+    a, b = _zip_region(contrib_zip), _zip_region(voter_zip)
+    return bool(a) and bool(b) and a == b
+
+_ORG_STOPWORDS = {
+    "the", "a", "an", "of", "and", "&", "inc", "llc", "llp", "lp", "ltd",
+    "corp", "corporation", "company", "co", "group", "holdings", "partners",
+    "new", "york", "ny", "nyc", "government", "relations", "associates",
+}
+
+_NON_EMPLOYERS = {
+    "retired", "self", "self-employed", "self employed", "none", "n/a",
+    "not employed", "unemployed", "homemaker", "information requested",
+    "best efforts", "",
+}
+
+def _org_core(text: str) -> str:
+    tokens = re.sub(r"[^\w\s]", " ", (text or "").lower()).split()
+    return " ".join(t for t in tokens if t not in _ORG_STOPWORDS)
+
+def _employer_matches_orgs(employer: str, orgs: str) -> bool:
+    """True if an FEC/CFB employer string credibly matches one of the
+    contact's Pythia organizations."""
+    emp = (employer or "").strip()
+    if emp.lower() in _NON_EMPLOYERS:
+        return False
+    org_list = [o.strip() for o in (orgs or "").split(",") if o.strip()]
+    if not org_list:
+        return False
+    emp_core    = _org_core(emp)
+    emp_compact = re.sub(r"\W", "", emp.lower())
+    for org in org_list:
+        org_core    = _org_core(org)
+        org_compact = re.sub(r"\W", "", org.lower())
+        # Token match on significant words: "RG GROUP" ≈ "RG Group - New York
+        # Government Relations" (stopwords removed on both sides)
+        if emp_core and org_core and fuzz.token_set_ratio(emp_core, org_core) >= 80:
+            return True
+        # Compact containment: "POINT 72" → "point72" ⊂ "point72assetmanagement"
+        if len(emp_compact) >= 5 and (emp_compact in org_compact or org_compact in emp_compact):
+            return True
+        # CamelCase initials: employer "BR" matches "BerlinRosen" (capitals BR)
+        caps = "".join(re.findall(r"[A-Z]", org.split(",")[0].split("-")[0])).lower()
+        if len(emp_compact) >= 2 and emp_compact == caps:
+            return True
+    return False
+
+_POLITICAL_OCC = (
+    "senator", "senate", "congressman", "congresswoman", "congress",
+    "representative", "council", "mayor", "governor", "comptroller",
+    "assembly", "legislator", "public advocate", "borough president",
+    "elected", "whip", "speaker", "minority leader", "majority leader",
+)
+_EXECUTIVE_OCC = (
+    "ceo", "chief executive", "chairman", "chair", "founder", "co-founder",
+    "owner", "president", "executive director", "managing director",
+    "managing partner", "principal", "executive",
+)
+
+def _occupation_plausible(occupation: str, titles: str) -> bool:
+    occ = (occupation or "").lower().strip()
+    ttl = (titles or "").lower().strip()
+    if not occ or not ttl or occ in _NON_EMPLOYERS:
+        return False
+    if fuzz.token_set_ratio(occ, ttl) >= 70:
+        return True
+    # Same occupational class counts: "CONGRESSMAN" is plausible for a contact
+    # titled "US Senator"; "CHAIRMAN, CEO" is plausible for a "Founder & CEO"
+    if any(k in occ for k in _POLITICAL_OCC) and any(k in ttl for k in _POLITICAL_OCC):
+        return True
+    if any(k in occ for k in _EXECUTIVE_OCC) and any(k in ttl for k in _EXECUTIVE_OCC):
+        return True
+    return False
+
+def _row_signals(row: dict, source: str) -> dict:
+    """Extract (zip, state, employer, occupation, amount) uniformly per source."""
+    if source == "fec":
+        return {
+            "zip":        row.get("contributor_zip") or "",
+            "state":      (row.get("contributor_state") or "").upper(),
+            "employer":   row.get("contributor_employer") or "",
+            "occupation": row.get("contributor_occupation") or "",
+            "amount":     float(row.get("contribution_receipt_amount") or 0),
+        }
+    if source == "boe":
+        return {
+            "zip":        row.get("zip") or "",
+            "state":      (row.get("state") or "NY").upper(),
+            "employer":   "",
+            "occupation": "",
+            "amount":     float(row.get("amount") or 0),
+        }
+    # CFB (NYC Socrata) — field names vary by dataset version
+    return {
+        "zip":        row.get("zip") or row.get("zip_code") or row.get("contributor_zip") or "",
+        "state":      (row.get("state") or "NY").upper(),
+        "employer":   row.get("employer") or row.get("contributor_employer") or "",
+        "occupation": row.get("occupation") or "",
+        "amount":     float(row.get("amount") or 0),
+    }
+
+def _name_rarity(fec_rows: list[dict]) -> dict:
+    """
+    How distinctive is this name in federal data?  Results spread across many
+    states = common name, secondary confirmation required.  Results clustered
+    in NY = likely rare enough for NY-specific attribution.
+    No federal rows at all = no contrary evidence; treat as rare/NY for the
+    NY-only BOE dataset.
+    """
+    states = [
+        (r.get("contributor_state") or "").upper()
+        for r in (fec_rows or [])
+        if r.get("contributor_state")
+    ]
+    if not states:
+        return {"distinct_states": 0, "ny_share": 1.0, "common": False, "ny_clustered": True}
+    distinct = len(set(states))
+    ny_share = states.count("NY") / len(states)
+    return {
+        "distinct_states": distinct,
+        "ny_share":        round(ny_share, 2),
+        "common":          distinct >= 10,
+        "ny_clustered":    ny_share >= 0.8,
+    }
+
+def classify_contributions(rows: list[dict], source: str, voter_zip: str,
+                           orgs: str, titles: str, rarity: dict) -> dict:
+    """
+    Sort contribution rows into confidence buckets.  Returns dict with row
+    lists per tier plus dollar/count stats.
+    """
+    buckets = {"high_zip": [], "high_employer": [], "medium": [], "low_ny": [], "excluded": []}
+    for row in rows or []:
+        sig = _row_signals(row, source)
+        if voter_zip and _zips_match(sig["zip"], voter_zip):
+            buckets["high_zip"].append(row)
+        elif _employer_matches_orgs(sig["employer"], orgs):
+            buckets["high_employer"].append(row)
+        # Filers sometimes put the occupation in the employer field
+        # ("CONGRESSMAN" with no occupation) — check both
+        elif _occupation_plausible(sig["occupation"], titles) \
+                or _occupation_plausible(sig["employer"], titles):
+            buckets["medium"].append(row)
+        elif (not rarity.get("common")) and rarity.get("ny_clustered") \
+                and (sig["state"] == "NY" or source == "boe"):
+            buckets["low_ny"].append(row)
+        else:
+            buckets["excluded"].append(row)
+
+    def _total(key):
+        return round(sum(_row_signals(r, source)["amount"] for r in buckets[key]), 2)
+
+    return {
+        **buckets,
+        "included":        buckets["high_zip"] + buckets["high_employer"]
+                           + buckets["medium"] + buckets["low_ny"],
+        "confirmed_total": round(_total("high_zip") + _total("high_employer"), 2),
+        "medium_total":    _total("medium"),
+        "low_ny_total":    _total("low_ny"),
+        "excluded_total":  _total("excluded"),
+    }
+
 # ─── Influence ranking — table setup & rollback ───────────────────────────────
 
 def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
@@ -258,33 +512,30 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
     for contact in contacts:
         name      = (contact.get("full_name") or "").strip()
         person_id = (contact.get("person_id") or "").strip()
+        voter_zip = (contact.get("voter_zip") or "").strip()
         if not name or not person_id:
+            continue
+
+        # ZIP confirmation required for the instant baseline: without a voter
+        # zip we cannot distinguish this contact from same-named donors, and a
+        # phase-1 score would stick for 30 days. Phase 2 / background
+        # enrichment handles no-zip contacts with full rarity analysis.
+        if not voter_zip:
             continue
 
         parts     = name.split()
         firstname = parts[0]  if parts else ""
         lastname  = parts[-1] if parts else ""
 
-        # Also try formal name variants (Steve → Steven etc.)
-        _NICK: dict[str, list[str]] = {
-            "steve": ["steven", "stephen"], "bob":  ["robert"],
-            "bill":  ["william"],           "will": ["william"],
-            "jim":   ["james"],             "jeff": ["jeffrey"],
-            "joe":   ["joseph"],            "mike": ["michael"],
-            "tom":   ["thomas"],            "dan":  ["daniel"],
-            "dave":  ["david"],             "rob":  ["robert"],
-            "rich":  ["richard"],           "matt": ["matthew"],
-            "andy":  ["andrew"],            "tony": ["anthony"],
-            "ed":    ["edward", "edmund"],  "sam":  ["samuel"],
-            "ben":   ["benjamin"],          "ken":  ["kenneth"],
-            "liz":   ["elizabeth"],         "kate": ["katherine"],
-        }
         boe_rows: list[dict] = []
-        for fn in [firstname] + _NICK.get(firstname.lower(), []):
+        for fn in _name_variants(firstname):
             rows = boe_donations_by_voter(lastname, fn)
             for r in rows:
                 if r not in boe_rows:
                     boe_rows.append(r)
+
+        # Keep only contributions from the contact's zip region
+        boe_rows = [r for r in boe_rows if _zips_match(r.get("zip"), voter_zip)]
 
         if not boe_rows:
             continue
@@ -444,6 +695,236 @@ def _compute_fin_score_from_rows(
     }
 
 
+def _fec_get(path: str, params: dict, tries: int = 4) -> dict:
+    """FEC GET with 429 rate-limit retry. Silent empty results were masking
+    rate-limited fetches as 'no contributions found'."""
+    key = _cfg("FEC_API_KEY", "DEMO_KEY")
+    for attempt in range(tries):
+        try:
+            resp = requests.get(f"{FEC_BASE}{path}",
+                                params={"api_key": key, **params}, timeout=15)
+            if resp.status_code == 429:
+                wait = min(int(resp.headers.get("Retry-After") or 0) or (2 ** attempt * 3), 20)
+                log.warning(f"FEC 429 on {path} — retrying in {wait}s ({attempt + 1}/{tries})")
+                time.sleep(wait)
+                continue
+            if resp.ok:
+                return resp.json()
+            return {}
+        except Exception as exc:
+            log.debug(f"_fec_get {path}: {exc}")
+            return {}
+    log.warning(f"FEC {path} still rate-limited after {tries} tries — returning empty")
+    return {}
+
+
+def _cfb_search(fn_variants: list, ln: str, limit: int = 50) -> list[dict]:
+    """NYC CFB contribution search by first+last name variants."""
+    seen, rows = set(), []
+    for fn in fn_variants:
+        try:
+            resp = requests.get(
+                f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json",
+                params={
+                    "$limit": limit,
+                    "$where": (
+                        f"upper(contributor_name) like upper('%{ln}%') "
+                        f"AND upper(contributor_name) like upper('%{fn[:4]}%') "
+                        f"AND amount >= 250"
+                    ),
+                    "$order": "amount DESC",
+                },
+                timeout=15,
+            )
+            for r in (resp.json() if resp.ok else []):
+                rid = r.get("filing_id") or id(r)
+                if rid not in seen:
+                    seen.add(rid); rows.append(r)
+        except Exception:
+            pass
+    return rows
+
+
+def _fec_search(fn_variants: list, ln: str, limit: int = 50) -> list[dict]:
+    """FEC hard-money contribution search by first+last name variants."""
+    seen, rows = set(), []
+    for fn in fn_variants:
+        data = _fec_get("/schedules/schedule_a/", {
+            "per_page":         min(limit, 100),
+            "contributor_name": f"{ln}, {fn}",
+            "min_amount":       200,   # FEC itemization threshold
+            "sort":             "-contribution_receipt_amount",
+        })
+        for r in data.get("results", []):
+            rid = r.get("sub_id") or id(r)
+            if rid not in seen:
+                seen.add(rid); rows.append(r)
+    return rows
+
+
+def confidence_enrich_contact(contact: dict) -> Optional[dict]:
+    """
+    Fetch BOE + CFB + FEC + Super PAC contribution data for one contact and
+    classify every row with multi-signal identity confirmation (ZIP region,
+    employer, occupation, name rarity).
+
+    READ-ONLY — writes nothing.  Production callers persist the score and
+    note; tests inspect the full confidence breakdown.
+
+    contact: {person_id, full_name, voter_zip?, orgs?, titles?}
+    Returns {fin_score, raw, note, rarity, classification, superpac_included}
+    or None if the contact has no usable name.
+    """
+    import concurrent.futures as _cf
+
+    name = (contact.get("full_name") or "").strip()
+    if not name:
+        return None
+    voter_zip = (contact.get("voter_zip") or "").strip()
+    orgs      = contact.get("orgs")   or ""
+    titles    = contact.get("titles") or ""
+    job_title = titles.lower()
+
+    parts = name.split()
+    firstname = parts[0]  if parts else ""
+    lastname  = parts[-1] if parts else ""
+    fn_variants = _name_variants(firstname)
+
+    # BOE (in-memory, instant)
+    boe_rows: list[dict] = []
+    for fn in fn_variants:
+        for r in boe_donations_by_voter(lastname, fn):
+            if r not in boe_rows:
+                boe_rows.append(r)
+
+    org_name = orgs.split(",")[0].strip()
+    is_politician = any(kw in job_title for kw in [
+        "council", "senator", "assembly", "mayor", "governor",
+        "representative", "congress", "comptroller", "whip", "speaker",
+        "public advocate", "borough president", "alderman",
+    ])
+    is_executive = bool(org_name) and any(kw in job_title for kw in [
+        "ceo", "chairman", "co-founder", "founder", "owner",
+        "president and ceo",
+    ])
+
+    # FEC PAC searches use "LASTNAME, FIRSTNAME" format. Bare first-name
+    # variants were dropped: "steven" alone matches every Steven in the
+    # country and doubles the request count for pure noise.
+    pac_name_variants = [f"{lastname}, {fn}" for fn in fn_variants]
+
+    cfb_rows: list[dict] = []
+    fec_rows: list[dict] = []
+    superpac_raw: list[dict] = []
+    company_pac_total = 0.0
+    pac_receipts_in   = 0.0
+
+    # Each future gets its own timeout/except so one slow source (FEC 429
+    # retries can sleep tens of seconds) doesn't discard the others' results
+    def _safe(future, timeout, default):
+        if future is None:
+            return default
+        try:
+            return future.result(timeout=timeout) or default
+        except Exception as exc:
+            log.debug(f"confidence_enrich fetch for {name!r}: {exc}")
+            return default
+
+    with _cf.ThreadPoolExecutor(max_workers=5) as p:
+        f_cfb    = p.submit(_cfb_search, fn_variants, lastname)
+        f_fec    = p.submit(_fec_search, fn_variants, lastname)
+        f_sp     = p.submit(_fec_superpac_fetch, pac_name_variants)
+        f_cpac   = p.submit(fec_company_pac, org_name) if is_executive else None
+        f_polpac = p.submit(fec_politician_pac_profile, fn_variants) if is_politician else None
+
+        cfb_rows     = _safe(f_cfb, 25, [])
+        fec_rows     = _safe(f_fec, 60, [])
+        superpac_raw = _safe(f_sp, 90, [])
+        company_pac_total = float(_safe(f_cpac, 45, {}).get("total_spent") or 0)
+        ppac = _safe(f_polpac, 45, {})
+        pac_receipts_in = (float(ppac.get("pac_receipts_to_campaign") or 0)
+                           + float(ppac.get("leadership_pac_disbursements") or 0))
+
+    # Name rarity from federal data (BOE is NY-only and would skew the signal)
+    rarity = _name_rarity(fec_rows + superpac_raw)
+
+    cls_boe = classify_contributions(boe_rows, "boe", voter_zip, orgs, titles, rarity)
+    cls_cfb = classify_contributions(cfb_rows, "cfb", voter_zip, orgs, titles, rarity)
+    cls_fec = classify_contributions(fec_rows, "fec", voter_zip, orgs, titles, rarity)
+    cls_sp  = classify_contributions(superpac_raw, "fec", voter_zip, orgs, titles, rarity)
+
+    # Super PAC: high-confidence only (ZIP or employer). Occupation-plausible
+    # and rare-name tiers are NEVER enough for unlimited-money attribution.
+    superpac_included = cls_sp["high_zip"] + cls_sp["high_employer"]
+
+    fin_score, raw = _compute_fin_score_from_rows(
+        cls_boe["included"], cls_cfb["included"], cls_fec["included"],
+        superpac_rows=superpac_included,
+        company_pac_total=company_pac_total,
+        pac_receipts_in=pac_receipts_in,
+    )
+    if not raw:
+        raw = {
+            "total_donated": 0.0, "donation_count": 0, "unique_recipients": 0,
+            "superpac_total": 0.0,
+            "company_pac_total": round(company_pac_total, 2),
+            "pac_receipts_in":   round(pac_receipts_in, 2),
+        }
+
+    hard = [cls_boe, cls_cfb, cls_fec]
+    zip_n = sum(len(c["high_zip"]) for c in hard)      + len(cls_sp["high_zip"])
+    emp_n = sum(len(c["high_employer"]) for c in hard) + len(cls_sp["high_employer"])
+    med_n = sum(len(c["medium"]) for c in hard)
+    low_n = sum(len(c["low_ny"]) for c in hard)
+    confirmed_total = round(sum(c["confirmed_total"] for c in hard) + cls_sp["confirmed_total"], 2)
+    medium_total    = round(sum(c["medium_total"] for c in hard), 2)
+    low_ny_total    = round(sum(c["low_ny_total"] for c in hard), 2)
+    excluded_n      = (sum(len(c["excluded"]) for c in hard)
+                       + len(cls_sp["medium"]) + len(cls_sp["low_ny"]) + len(cls_sp["excluded"]))
+    excluded_total  = round(sum(c["excluded_total"] for c in hard)
+                            + cls_sp["medium_total"] + cls_sp["low_ny_total"]
+                            + cls_sp["excluded_total"], 2)
+
+    raw.update({
+        "confirmed_total": confirmed_total,
+        "warning_total":   low_ny_total,
+        "excluded_total":  excluded_total,
+        "excluded_count":  excluded_n,
+        "name_common":     rarity["common"],
+        "distinct_states": rarity["distinct_states"],
+    })
+
+    # One structured note per enrichment pass — replaces the previous one
+    note = ""
+    included_n = zip_n + emp_n + med_n + low_n
+    if included_n > 0 or excluded_n > 0:
+        today = time.strftime("%Y-%m-%d")
+        match_bits = []
+        if zip_n: match_bits.append(f"{zip_n} ZIP-matched")
+        if emp_n: match_bits.append(f"{emp_n} employer-matched")
+        if med_n: match_bits.append(f"{med_n} occupation-matched, hard money only")
+        if low_n: match_bits.append(f"{low_n} rare-NY name-only, WARNING: unverified")
+        note = (
+            f"[Enriched {today}] Confirmed: ${confirmed_total + medium_total + low_ny_total:,.0f} "
+            f"from {included_n} contributions ({'; '.join(match_bits) or 'none'}). "
+            f"Unconfirmed: ${excluded_total:,.0f} excluded (name-only, {excluded_n} contributions)."
+        )
+
+    return {
+        "person_id":  (contact.get("person_id") or "").strip(),
+        "full_name":  name,
+        "voter_zip":  voter_zip,
+        "orgs":       orgs,
+        "titles":     titles,
+        "rarity":     rarity,
+        "classification": {"boe": cls_boe, "cfb": cls_cfb, "fec": cls_fec, "superpac": cls_sp},
+        "superpac_included": superpac_included,
+        "fin_score":  fin_score,
+        "raw":        raw,
+        "note":       note,
+    }
+
+
 def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
     """
     Synchronously enrich financial data (BOE + CFB + FEC) for a list of contacts
@@ -465,172 +946,29 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
     import concurrent.futures as _cf
 
     def _enrich_one(contact: dict) -> tuple[str, float, dict] | None:
-        name      = (contact.get("full_name") or "").strip()
         person_id = (contact.get("person_id") or "").strip()
-        if not name or not person_id:
+        if not person_id:
             return None
 
-        parts     = name.split()
-        firstname = parts[0]  if len(parts) > 0 else ""
-        lastname  = parts[-1] if len(parts) > 0 else ""
-
-        # BOE: first+last name precision only — no last-name-only fallback
-        # (last-name fallback causes false positives for common surnames)
-        boe_rows = boe_donations_by_voter(lastname, firstname)
-
-        # CFB + FEC with first+last name precision (not last-name-only)
-        # This prevents common surnames (Torres, Cooper, Schwartz) from matching
-        # unrelated donors and inflating scores.
-        cfb_rows, fec_rows = [], []
-        try:
-            # Nickname → formal name map: political databases use legal names
-            _NICK: dict[str, list[str]] = {
-                "steve": ["steven", "stephen"], "bob": ["robert"],
-                "bill":  ["william"],           "will": ["william"],
-                "jim":   ["james"],             "jeff": ["jeffrey"],
-                "joe":   ["joseph"],            "mike": ["michael"],
-                "tom":   ["thomas"],            "tim":  ["timothy"],
-                "dan":   ["daniel"],            "dave": ["david"],
-                "rob":   ["robert"],            "rich": ["richard"],
-                "dick":  ["richard"],           "nick": ["nicholas"],
-                "matt":  ["matthew"],           "andy": ["andrew"],
-                "tony":  ["anthony"],           "ed":   ["edward", "edmund"],
-                "ted":   ["theodore", "edward"],"sam":  ["samuel"],
-                "ben":   ["benjamin"],          "ken":  ["kenneth"],
-                "liz":   ["elizabeth"],         "sue":  ["susan"],
-                "kate":  ["katherine"],         "chris": ["christopher"],
-            }
-            fn_variants = [firstname] + _NICK.get(firstname.lower(), [])
-
-            def _cfb_precise(fn_list: list, ln: str, limit: int = 50) -> list[dict]:
-                seen, rows = set(), []
-                for fn in fn_list:
-                    try:
-                        resp = requests.get(
-                            f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json",
-                            params={
-                                "$limit": limit,
-                                "$where": (
-                                    f"upper(contributor_name) like upper('%{ln}%') "
-                                    f"AND upper(contributor_name) like upper('%{fn[:4]}%') "
-                                    f"AND amount >= 250"
-                                ),
-                                "$order": "amount DESC",
-                            },
-                            timeout=15,
-                        )
-                        for r in (resp.json() if resp.ok else []):
-                            rid = r.get("filing_id") or id(r)
-                            if rid not in seen:
-                                seen.add(rid); rows.append(r)
-                    except Exception:
-                        pass
-                return rows
-
-            def _fec_precise(fn_list: list, ln: str, limit: int = 50) -> list[dict]:
-                key = _cfg("FEC_API_KEY", "DEMO_KEY")
-                seen, rows = set(), []
-                for fn in fn_list:
-                    try:
-                        resp = requests.get(
-                            f"{FEC_BASE}/schedules/schedule_a/",
-                            params={
-                                "api_key":          key,
-                                "per_page":         min(limit, 100),
-                                "contributor_name": f"{ln}, {fn}",
-                                "min_amount":       200,   # FEC itemization threshold
-                                "sort":             "-contribution_receipt_amount",
-                            },
-                            timeout=15,
-                        )
-                        for r in (resp.json().get("results", []) if resp.ok else []):
-                            rid = r.get("sub_id") or id(r)
-                            if rid not in seen:
-                                seen.add(rid); rows.append(r)
-                    except Exception:
-                        pass
-                return rows
-
-            with _cf.ThreadPoolExecutor(max_workers=2) as p:
-                f_cfb = p.submit(_cfb_precise, fn_variants, lastname)
-                f_fec = p.submit(_fec_precise, fn_variants, lastname)
-                cfb_rows = f_cfb.result(timeout=25) or []
-                fec_rows = f_fec.result(timeout=25) or []
-        except Exception as exc:
-            log.debug(f"_sync_enrich CFB/FEC for {name!r}: {exc}")
-
-        # ── PAC: Super PAC donations, company PAC, politician PAC receipts ──
-        org_name  = (contact.get("orgs") or "").split(",")[0].strip()
-        job_title = (contact.get("titles") or "").lower()
-
-        is_politician = any(kw in job_title for kw in [
-            "council", "senator", "assembly", "mayor", "governor",
-            "representative", "congress", "comptroller", "whip", "speaker",
-            "public advocate", "borough president", "alderman",
-        ])
-        is_executive = bool(org_name) and any(kw in job_title for kw in [
-            "ceo", "chairman", "co-founder", "founder", "owner",
-            "president and ceo",
-        ])
-        # Note: "managing director", "managing partner", "principal" intentionally
-        # excluded — corporate PAC direction is set by true C-suite (CEO/Chairman/
-        # Founder), not by mid-level or professional-services executives whose
-        # title conventions vary widely across industries.
-
-        superpac_rows:     list[dict] = []
-        company_pac_total: float      = 0.0
-        pac_receipts_in:   float      = 0.0
-
-        # FEC PAC searches use "LASTNAME, FIRSTNAME" format
-        pac_name_variants = (
-            [f"{lastname}, {fn}" for fn in fn_variants] + fn_variants
-        )
-
-        try:
-            with _cf.ThreadPoolExecutor(max_workers=3) as pp:
-                f_superpac = pp.submit(fec_superpac_donations_by, pac_name_variants)
-                f_cpac     = pp.submit(fec_company_pac, org_name) if is_executive else None
-                f_polpac   = pp.submit(fec_politician_pac_profile, fn_variants) if is_politician else None
-
-                superpac_rows = f_superpac.result(timeout=20) or []
-
-                if f_cpac is not None:
-                    cpac = f_cpac.result(timeout=20) or {}
-                    company_pac_total = float(cpac.get("total_spent") or 0)
-
-                if f_polpac is not None:
-                    ppac = f_polpac.result(timeout=20) or {}
-                    pac_receipts_in = (
-                        float(ppac.get("pac_receipts_to_campaign") or 0)
-                        + float(ppac.get("leadership_pac_disbursements") or 0)
-                    )
-        except Exception as exc:
-            log.debug(f"_sync_enrich PAC for {name!r}: {exc}")
-
-        fin_score, raw = _compute_fin_score_from_rows(
-            boe_rows, cfb_rows, fec_rows,
-            superpac_rows=superpac_rows,
-            company_pac_total=company_pac_total,
-            pac_receipts_in=pac_receipts_in,
-        )
-        if fin_score <= 0:
+        res = confidence_enrich_contact(contact)
+        if res is None:
             return None
 
-        note = (
-            f"Quick-enriched BOE:{len(boe_rows)} CFB:{len(cfb_rows)} "
-            f"FEC:{len(fec_rows)} SuperPAC:{len(superpac_rows)} "
-            f"CompanyPAC:${company_pac_total:,.0f} PACin:${pac_receipts_in:,.0f} "
-            f"total=${raw['total_donated']:,.0f} recipients={raw['unique_recipients']}"
-        )
-        write_finance_note(person_id, note)
+        fin_score, raw, note = res["fin_score"], res["raw"], res["note"]
+
+        if note:
+            write_enrichment_note(person_id, note)
 
         log.info(
-            f"_sync_enrich: {name} total=${raw['total_donated']:,.0f} "
-            f"superpac=${raw.get('superpac_total',0):,.0f} "
-            f"cpac=${raw.get('company_pac_total',0):,.0f} "
-            f"pac_in=${raw.get('pac_receipts_in',0):,.0f} "
+            f"_sync_enrich: {res['full_name']} "
+            f"confirmed=${raw.get('confirmed_total', 0):,.0f} "
+            f"warning=${raw.get('warning_total', 0):,.0f} "
+            f"excluded=${raw.get('excluded_total', 0):,.0f} "
+            f"superpac=${raw.get('superpac_total', 0):,.0f} "
             f"fin_score={fin_score}"
         )
+        # Return even when fin_score == 0: writing the corrected (possibly
+        # zero) score is how previously-inflated false positives get fixed.
         return person_id, fin_score, raw
 
     # Run all contacts in parallel (max 5 workers)
@@ -694,7 +1032,11 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
                                         || jsonb_build_object(
                                              'total_donated',    %s::numeric,
                                              'donation_count',   %s::int,
-                                             'unique_recipients', %s::int
+                                             'unique_recipients', %s::int,
+                                             'superpac_total',   %s::numeric,
+                                             'confirmed_total',  %s::numeric,
+                                             'excluded_total',   %s::numeric,
+                                             'excluded_count',   %s::int
                                            )
                                   ),
                            computed_at         = NOW()
@@ -705,6 +1047,10 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
                     raw.get("total_donated", 0),
                     raw.get("donation_count", 0),
                     raw.get("unique_recipients", 0),
+                    raw.get("superpac_total", 0),
+                    raw.get("confirmed_total", 0),
+                    raw.get("excluded_total", 0),
+                    raw.get("excluded_count", 0),
                     pid,
                 ))
                 updated.append(pid)
@@ -1549,6 +1895,7 @@ def rank_influential_people(
             "full_name": r["full_name"],
             "orgs":      r.get("orgs") or "",
             "titles":    r.get("titles") or "",
+            "voter_zip": r.get("voter_zip") or "",
         }
         for r in results
         if (float(r.get("financial_score") or 0) == 0.0
@@ -1587,6 +1934,7 @@ def rank_influential_people(
                 "full_name": r["full_name"],
                 "orgs":      r.get("orgs") or "",
                 "titles":    r.get("titles") or "",
+                "voter_zip": r.get("voter_zip") or "",
             }
             for r in results[:limit]
         ][:15]
@@ -1602,6 +1950,7 @@ def rank_influential_people(
                 "full_name": r["full_name"],
                 "orgs":      r.get("orgs") or "",
                 "titles":    r.get("titles") or "",
+                "voter_zip": r.get("voter_zip") or "",
             }
             for r in results
             if r["person_id"] not in already_in_phase2
@@ -3621,44 +3970,68 @@ def fec_top_donors(candidate_name: str, limit: int = 100) -> list[dict]:
 
 # ─── PAC data functions ───────────────────────────────────────────────────────
 
-def fec_superpac_donations_by(name_variants: list[str],
-                               limit: int = 100) -> list[dict]:
+def _fec_superpac_fetch(name_variants: list[str],
+                        limit: int = 100) -> list[dict]:
     """
-    Find unlimited contributions by a person to Super PACs (committee_type O),
+    Raw name search for contributions to Super PACs (committee_type O),
     Hybrid PACs (I), and Party committees (Y).  No dollar floor — catches the
     $1M-$50M contributions that dwarf an individual's capped hard-money giving.
     Searching across name variants handles Steve/Steven, Jeff/Jeffrey etc.
+
+    UNCONFIRMED — rows are name matches only and MUST pass identity
+    confirmation (ZIP region or employer) before being attributed to a
+    contact.  Use fec_superpac_donations_by for confirmed results.
     """
-    key = _cfg("FEC_API_KEY", "DEMO_KEY")
     seen: set[str] = set()
     rows: list[dict] = []
     for name in name_variants:
         for ctype in ["O", "I", "Y"]:
-            try:
-                resp = requests.get(
-                    f"{FEC_BASE}/schedules/schedule_a/",
-                    params={
-                        "api_key":          key,
-                        "contributor_name": name,
-                        "committee_type":   ctype,
-                        "per_page":         min(limit, 100),
-                        "sort":             "-contribution_receipt_amount",
-                    },
-                    timeout=15,
-                )
-                for r in (resp.json().get("results", []) if resp.ok else []):
-                    # Only count actual individual human contributions —
-                    # not PAC-to-PAC transfers, which can falsely inflate
-                    # scores when an org name resembles a person's name
-                    if (r.get("entity_type") or "IND").upper() not in ("IND", ""):
-                        continue
-                    rid = r.get("sub_id") or str(id(r))
-                    if rid not in seen:
-                        seen.add(rid)
-                        rows.append(r)
-            except Exception as exc:
-                log.debug(f"fec_superpac_donations_by {name} type={ctype}: {exc}")
+            data = _fec_get("/schedules/schedule_a/", {
+                "contributor_name": name,
+                "committee_type":   ctype,
+                "per_page":         min(limit, 100),
+                "sort":             "-contribution_receipt_amount",
+            })
+            for r in data.get("results", []):
+                # Only count actual individual human contributions —
+                # not PAC-to-PAC transfers, which can falsely inflate
+                # scores when an org name resembles a person's name
+                if (r.get("entity_type") or "IND").upper() not in ("IND", ""):
+                    continue
+                rid = r.get("sub_id") or str(id(r))
+                if rid not in seen:
+                    seen.add(rid)
+                    rows.append(r)
     return rows
+
+
+def fec_superpac_donations_by(name_variants: list[str],
+                              voter_zip: str = "",
+                              orgs: str = "",
+                              limit: int = 100) -> list[dict]:
+    """
+    Confirmed Super PAC contributions by a person.
+
+    Identity confirmation is REQUIRED: a row is attributed only when its
+    contributor_zip falls in the contact's voter-zip region OR its
+    contributor_employer matches one of the contact's organizations.
+    Name alone is never sufficient — common names were previously attributing
+    other people's multi-million-dollar Super PAC contributions.
+
+    No voter zip and no orgs = no Super PAC attribution at all.
+    """
+    if not (voter_zip or "").strip() and not (orgs or "").strip():
+        return []
+    rows = _fec_superpac_fetch(name_variants, limit)
+    confirmed = [
+        r for r in rows
+        if ((voter_zip and _zips_match(r.get("contributor_zip"), voter_zip))
+            or _employer_matches_orgs(r.get("contributor_employer") or "", orgs))
+    ]
+    if len(confirmed) != len(rows):
+        log.info(f"fec_superpac_donations_by: {len(rows) - len(confirmed)}/{len(rows)} "
+                 f"name-only rows excluded (zip={voter_zip!r}, orgs={orgs[:40]!r})")
+    return confirmed
 
 
 def fec_company_pac(org_name: str) -> dict:
@@ -3667,20 +4040,13 @@ def fec_company_pac(org_name: str) -> dict:
     type O, non-connected PAC type N) and return their total financial activity.
     Use for CEOs/Chairs — their company's PAC is their political footprint.
     """
-    key = _cfg("FEC_API_KEY", "DEMO_KEY")
     committees: list[dict] = []
     for ctype in ["B", "O", "N"]:
-        try:
-            resp = requests.get(
-                f"{FEC_BASE}/committees/",
-                params={"api_key": key, "name": org_name,
-                        "committee_type": ctype, "per_page": 10},
-                timeout=15,
-            )
-            if resp.ok:
-                committees.extend(resp.json().get("results", []))
-        except Exception as exc:
-            log.debug(f"fec_company_pac {org_name} type={ctype}: {exc}")
+        committees.extend(
+            _fec_get("/committees/",
+                     {"name": org_name, "committee_type": ctype,
+                      "per_page": 10}).get("results", [])
+        )
     if not committees:
         return {}
     top = committees[:5]
@@ -3703,53 +4069,29 @@ def fec_politician_pac_profile(name_variants: list[str]) -> dict:
     Chuck Schumer's PAC receipts reflect why he's the most sought-after Senate
     vote in the country.
     """
-    key = _cfg("FEC_API_KEY", "DEMO_KEY")
     pac_receipts     = 0.0
     leadership_total = 0.0
 
     for name in name_variants[:2]:
         # Campaign committee PAC receipts
-        try:
-            cr = requests.get(
-                f"{FEC_BASE}/candidates/search/",
-                params={"api_key": key, "q": name, "per_page": 3},
-                timeout=15,
-            )
-            if cr.ok:
-                for cand in cr.json().get("results", [])[:2]:
-                    for pc in (cand.get("principal_committees") or [])[:1]:
-                        cid = pc.get("committee_id", "")
-                        if not cid:
-                            continue
-                        try:
-                            tr = requests.get(
-                                f"{FEC_BASE}/committee/{cid}/totals/",
-                                params={"api_key": key, "per_page": 1},
-                                timeout=15,
-                            )
-                            if tr.ok:
-                                t = (tr.json().get("results") or [{}])[0]
-                                pac_receipts += float(
-                                    t.get("other_political_committee_contributions", 0) or 0
-                                )
-                        except Exception:
-                            pass
-        except Exception as exc:
-            log.debug(f"fec_politician_pac_profile receipts {name}: {exc}")
+        for cand in _fec_get("/candidates/search/",
+                             {"q": name, "per_page": 3}).get("results", [])[:2]:
+            for pc in (cand.get("principal_committees") or [])[:1]:
+                cid = pc.get("committee_id", "")
+                if not cid:
+                    continue
+                t = (_fec_get(f"/committee/{cid}/totals/",
+                              {"per_page": 1}).get("results") or [{}])[0]
+                pac_receipts += float(
+                    t.get("other_political_committee_contributions", 0) or 0
+                )
 
         # Leadership PAC (where the politician is treasurer)
-        try:
-            lpr = requests.get(
-                f"{FEC_BASE}/committees/",
-                params={"api_key": key, "treasurer_name": name,
-                        "committee_type": ["N", "Q", "V"], "per_page": 5},
-                timeout=15,
-            )
-            if lpr.ok:
-                for pac in lpr.json().get("results", []):
-                    leadership_total += float(pac.get("total_disbursements") or 0)
-        except Exception as exc:
-            log.debug(f"fec_politician_pac_profile leadership {name}: {exc}")
+        for pac in _fec_get("/committees/",
+                            {"treasurer_name": name,
+                             "committee_type": ["N", "Q", "V"],
+                             "per_page": 5}).get("results", []):
+            leadership_total += float(pac.get("total_disbursements") or 0)
 
     return {
         "pac_receipts_to_campaign":     round(pac_receipts, 2),
@@ -4836,21 +5178,37 @@ def enrich_person(person_name: str) -> dict:
     for row in (f_cfb_recv.result() or []):
         d = (row.get("contributor_name") or "").strip()
         if d: all_received.append({"donor_name": d, "amount": float(row.get("amount") or 0),
-                                    "year": (row.get("date") or "")[:4], "source": "NYC CFB"})
+                                    "year": (row.get("date") or "")[:4], "source": "NYC CFB",
+                                    "_row": row, "_src": "cfb"})
     for row in (f_fec_recv.result() or []):
         d = (row.get("contributor_name") or "").strip()
         if d: all_received.append({"donor_name": d,
                                     "amount": float(row.get("contribution_receipt_amount") or 0),
-                                    "year": (row.get("contribution_receipt_date") or "")[:4], "source": "FEC"})
+                                    "year": (row.get("contribution_receipt_date") or "")[:4], "source": "FEC",
+                                    "_row": row, "_src": "fec"})
     for row in (f_boe_recv.result() or []):
         d = (row.get("contributor_name") or "").strip()
         if d: all_received.append({"donor_name": d, "amount": float(row.get("amount") or 0),
                                     "year": row.get("election_year") or (row.get("date") or "")[:4],
-                                    "source": "NYS BOE"})
+                                    "source": "NYS BOE", "_row": row, "_src": "boe"})
 
     for item in all_received:
         dc, _ = best_match(item["donor_name"], index, keys)
         if not dc: continue
+        # Identity confirmation before attributing this donation to a DB
+        # contact: the row's zip/employer must match the contact when the row
+        # carries those signals. Rows with no signals at all pass through
+        # (some CFB exports omit address fields).
+        sig = _row_signals(item["_row"], item["_src"])
+        if sig["zip"] or sig["employer"]:
+            dc_zip = (dc.get("voter_zip") or "").strip()
+            confirmed = ((dc_zip and _zips_match(sig["zip"], dc_zip))
+                         or _employer_matches_orgs(sig["employer"], dc.get("orgs") or ""))
+            if not confirmed:
+                log.debug(f"enrich_person: skipping unconfirmed donor attribution "
+                          f"{item['donor_name']!r} -> {dc['_display']!r} "
+                          f"(zip={sig['zip'][:5]!r}, employer={sig['employer'][:30]!r})")
+                continue
         findings["known_donors_in_db"].append({
             "name": dc["_display"], "person_id": dc["id"], "orgs": dc.get("orgs", ""),
             "amount": item["amount"], "source": item["source"], "year": item["year"],
@@ -4862,19 +5220,37 @@ def enrich_person(person_name: str) -> dict:
                 f"${item['amount']:,.0f} | Source: {item['source']} | {item['year']}"):
             findings["new_connections_written"] += 1
 
-    # 2. Who did THIS person donate to? — use results fetched in parallel above
+    # 2. Who did THIS person donate to? — confidence-filtered before attribution
+    # (contributions are only attributed to the subject when ZIP, employer, or
+    # occupation confirms identity, or the name is rare and NY-clustered)
+    subj_zip    = (subject.get("voter_zip") or "").strip() if subject else ""
+    subj_orgs   = (subject.get("orgs")   or "") if subject else ""
+    subj_titles = (subject.get("titles") or "") if subject else ""
+
+    cfb_made = f_cfb_made.result() or []
+    fec_made = f_fec_made.result() or []
+    boe_made = f_boe_made.result() or []
+    made_rarity = _name_rarity(fec_made)
+    inc_cfb = classify_contributions(cfb_made, "cfb", subj_zip, subj_orgs, subj_titles, made_rarity)
+    inc_fec = classify_contributions(fec_made, "fec", subj_zip, subj_orgs, subj_titles, made_rarity)
+    inc_boe = classify_contributions(boe_made, "boe", subj_zip, subj_orgs, subj_titles, made_rarity)
+    n_excluded_made = len(inc_cfb["excluded"]) + len(inc_fec["excluded"]) + len(inc_boe["excluded"])
+    if n_excluded_made:
+        log.info(f"enrich_person {person_name!r}: excluded {n_excluded_made} "
+                 f"unconfirmed donations-made rows (name-only)")
+
     rmap: dict[str, dict] = {}
-    for row in (f_cfb_made.result() or []):
+    for row in inc_cfb["included"]:
         c = (row.get("candidate_name") or "").strip()
         if c:
             if c not in rmap: rmap[c] = {"amount": 0, "year": (row.get("date") or "")[:4], "source": "NYC CFB"}
             rmap[c]["amount"] += float(row.get("amount") or 0)
-    for row in (f_fec_made.result() or []):
+    for row in inc_fec["included"]:
         c = (row.get("committee_name") or "").strip()
         if c:
             if c not in rmap: rmap[c] = {"amount": 0, "year": (row.get("contribution_receipt_date") or "")[:4], "source": "FEC"}
             rmap[c]["amount"] += float(row.get("contribution_receipt_amount") or 0)
-    for row in (f_boe_made.result() or []):
+    for row in inc_boe["included"]:
         c = (row.get("candidate_name") or "").strip()
         if c:
             if c not in rmap: rmap[c] = {"amount": 0, "year": row.get("election_year") or "", "source": "NYS BOE"}
@@ -4927,6 +5303,13 @@ def enrich_person(person_name: str) -> dict:
             "lda_active_clients": donor.get("lda_active_clients", []),
         }
         findings["federal_donors"].append(entry)
+        # Donor-to-contact attribution requires employer confirmation or an
+        # NY-state row — fec_top_donors aggregates have no zip to check
+        if dc and not (
+            _employer_matches_orgs(donor.get("employer") or "", dc.get("orgs") or "")
+            or (donor.get("state") or "").upper() == "NY"
+        ):
+            dc = None
         if dc and subject_id:
             rel_note = f"${donor.get('total_amount',0):,.0f} | {donor.get('employer','')}"
             if donor.get("is_lda_registrant"):
