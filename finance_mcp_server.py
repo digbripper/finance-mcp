@@ -2950,8 +2950,128 @@ def test_union_lookup(org_name: str) -> dict:
     }
 
 
+def inspect_voter_db() -> dict:
+    """
+    Diagnostic: inspect the SQLite voter database schema and contents.
+    Returns:
+      - db_path: filesystem path to the SQLite file
+      - db_exists: whether the file exists and is a valid SQLite database
+      - db_size_mb: file size in MB
+      - tables: list of tables in the database
+      - schema: column names and types for each table
+      - row_counts: row count per table
+      - sample_row: first row of the main voter table (field names + values)
+      - congressional_districts: distinct CD values and counts
+      - election_columns: any columns that look like per-election
+                          participation fields (e.g. year codes, YYYYmmdd)
+      - gx_votes_range: min/max of GE_VOTES or equivalent columns
+    """
+    import glob as _glob
+    import os as _os
 
-def fetch_union_data_batch(limit: int = 50, force: bool = False) -> dict:
+    result: dict = {
+        "db_path":               VOTER_DB_LOCAL_PATH,
+        "db_exists":             False,
+        "db_size_mb":            None,
+        "tables":                [],
+        "schema":                {},
+        "row_counts":            {},
+        "sample_row":            None,
+        "congressional_districts": [],
+        "election_columns":      [],
+        "ge_votes_range":        None,
+        "notes":                 [],
+    }
+
+    # Also search for any .db / .sqlite files on the filesystem in case the
+    # path constant is wrong on this deployment
+    found_files = (
+        _glob.glob("/app/**/*.db",     recursive=True) +
+        _glob.glob("/app/**/*.sqlite", recursive=True) +
+        _glob.glob("/tmp/**/*.db",     recursive=True) +
+        _glob.glob(str(_os.path.dirname(_os.path.abspath(__file__))) + "/*.db")
+    )
+    result["notes"].append(f"All .db/.sqlite files found: {found_files}")
+
+    path = VOTER_DB_LOCAL_PATH
+    if not _os.path.exists(path):
+        result["notes"].append(f"{path} does not exist — voter DB not downloaded yet")
+        return result
+
+    if not _is_real_sqlite(path):
+        result["notes"].append(f"{path} exists but is not a valid SQLite file")
+        return result
+
+    result["db_exists"]   = True
+    result["db_size_mb"]  = round(_os.path.getsize(path) / 1_048_576, 1)
+
+    try:
+        import sqlite3 as _sq
+        con = _sq.connect(f"file:{path}?mode=ro", uri=True)
+        con.row_factory = _sq.Row
+
+        # Tables
+        tables = [r[0] for r in
+                  con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        result["tables"] = tables
+
+        for tbl in tables:
+            # Schema
+            cols = con.execute(f"PRAGMA table_info({tbl})").fetchall()
+            result["schema"][tbl] = [
+                {"cid": c[0], "name": c[1], "type": c[2]} for c in cols
+            ]
+
+            # Row count
+            cnt = con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            result["row_counts"][tbl] = cnt
+
+            # Sample row from the first (largest) table
+            if result["sample_row"] is None and cnt > 0:
+                row = con.execute(f"SELECT * FROM {tbl} LIMIT 1").fetchone()
+                result["sample_row"] = dict(row)
+
+            # Look for election-specific columns (4-8 digit year codes like
+            # 20161108, or columns whose name contains a 4-digit year >= 2000)
+            import re as _re
+            election_cols = [
+                c[1] for c in cols
+                if _re.search(r'(20\d{2})', c[1]) or
+                   _re.search(r'(election|voted|ge_\d|gx_\d)', c[1].lower())
+            ]
+            if election_cols:
+                result["election_columns"].extend(election_cols)
+
+            # Congressional districts
+            col_names = [c[1].upper() for c in cols]
+            cd_col = next((c[1] for c in cols
+                           if c[1].upper() in ("CD", "CONGRESSIONAL_DISTRICT",
+                                               "CONG_DIST", "CONG_DISTRICT")), None)
+            if cd_col:
+                rows = con.execute(
+                    f"SELECT {cd_col}, COUNT(*) as n FROM {tbl} "
+                    f"GROUP BY {cd_col} ORDER BY n DESC LIMIT 30"
+                ).fetchall()
+                result["congressional_districts"] = [
+                    {"district": r[0], "count": r[1]} for r in rows
+                ]
+
+            # GE_VOTES range
+            ge_col = next((c[1] for c in cols
+                           if c[1].upper() in ("GE_VOTES", "GEVOTES",
+                                               "GE_COUNT", "GENERAL_VOTES")), None)
+            if ge_col:
+                mn, mx = con.execute(
+                    f"SELECT MIN({ge_col}), MAX({ge_col}) FROM {tbl}"
+                ).fetchone()
+                result["ge_votes_range"] = {"column": ge_col, "min": mn, "max": mx}
+
+        con.close()
+
+    except Exception as exc:
+        result["notes"].append(f"Error reading DB: {exc}")
+
+    return result
     """
     Fetch DOL OLMS LM-2/LM-3 union data for Pythia organizations.
     Skips government entities and orgs already matched via IRS 990.
@@ -5701,6 +5821,18 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="inspect_voter_db",
+            description=(
+                "Diagnostic: inspect the SQLite voter database on the Railway server. "
+                "Returns the file path, tables, full schema (column names + types), row counts, "
+                "a sample row, congressional district breakdown, any per-election participation "
+                "columns, and the GE_VOTES range. "
+                "Use this to understand exactly what voter data is available before building "
+                "voter export or district-filtering tools."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
             name="start_union_data_background_fetch",
             description=(
                 "Start fetching DOL OLMS union LM-2 data for all remaining orgs in a background thread. "
@@ -5980,6 +6112,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 log.info(f"test_union_lookup called: {org!r}")
                 result = await loop.run_in_executor(None, lambda: test_union_lookup(org))
                 return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "inspect_voter_db":
+                log.info("inspect_voter_db called")
+                result = await loop.run_in_executor(None, inspect_voter_db)
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
             elif name == "start_union_data_background_fetch":
                 log.info("start_union_data_background_fetch called")
