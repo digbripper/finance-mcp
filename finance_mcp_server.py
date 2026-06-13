@@ -5835,71 +5835,49 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="export_voter_csv",
             description=(
-                "Query the NYC voter database and export matching voters to a downloadable CSV. "
-                "Supports filtering by congressional district, state senate district, assembly "
-                "district, council district, zip code, county/borough, party, specific election "
-                "years voted in (e.g. 2016+2020+2024), voter engagement score, and age range. "
-                "Returns a download URL for the CSV file hosted on the Railway server. "
-                "Example: export all NY-13 Democrats who voted in the last 3 presidential "
-                "elections → congressional_district='13', party='DEM', "
-                "election_years=[2016,2020,2024], voted_in_all_years=True"
+                "Query the NYC voter database (full FOIL voter file, ~5-6M voters) "
+                "and export matching voters to a downloadable CSV. "
+                "Filters are fully combinable — any subset may be used. "
+                "\n\nGeographic: congressional_district, state_senate_district, "
+                "assembly_district, council_district, zip_code, county (borough name "
+                "or code), city. "
+                "\n\nDemographic: party (DEM/REP/WFP/BLK, comma-separate for multiple), "
+                "gender (M/F), min_age, max_age. "
+                "\n\nElections (natural language): pass a description like "
+                "'past 3 presidential elections', 'last 2 general elections', "
+                "'2016 and 2020', 'presidential elections since 2012'. "
+                "The tool resolves this to specific years and matches voters whose "
+                "voterhistory shows participation in those elections. "
+                "voted_in_all_elections=true (default) requires all listed years; "
+                "false requires any. "
+                "\n\nStatus: 'active' (default), 'inactive', or 'all'. "
+                "\n\nRegistration: registered_after / registered_before (YYYYMMDD). "
+                "\n\nAdvanced: custom_where for raw SQL filtering on any column "
+                "(e.g. \"vrsource = 'DMV'\" or \"rstreetname ILIKE '%MAIN%'\"). "
+                "\n\nReturns a download URL for the CSV and a 3-row preview."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "congressional_district": {
-                        "type": "string",
-                        "description": "Congressional district number, e.g. '13' for NY-13",
-                    },
-                    "state_senate_district": {
-                        "type": "string",
-                        "description": "NY State Senate district number",
-                    },
-                    "assembly_district": {
-                        "type": "string",
-                        "description": "NY Assembly district number",
-                    },
-                    "council_district": {
-                        "type": "string",
-                        "description": "NYC Council district number",
-                    },
-                    "zip_code": {
-                        "type": "string",
-                        "description": "5-digit ZIP code",
-                    },
-                    "county": {
-                        "type": "string",
-                        "description": "NYC borough/county: brooklyn, manhattan, queens, bronx, staten island",
-                    },
-                    "party": {
-                        "type": "string",
-                        "description": "Party code(s): DEM, REP, WFP, etc. Comma-separate for multiple: 'DEM,WFP'",
-                    },
-                    "election_years": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "General election years to filter on, e.g. [2016, 2020, 2024]",
-                    },
-                    "voted_in_all_years": {
-                        "type": "boolean",
-                        "description": "If true (default), voter must have voted in ALL listed years. If false, ANY of the listed years.",
-                    },
-                    "min_voter_score": {
-                        "type": "integer",
-                        "description": "Minimum voter engagement score (sum of GE + primary votes)",
-                    },
-                    "min_age": {
-                        "type": "integer",
-                        "description": "Minimum voter age in years",
-                    },
-                    "max_age": {
-                        "type": "integer",
-                        "description": "Maximum voter age in years",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Cap results at N rows. 0 or omit for no limit.",
-                    },
+                    "congressional_district": {"type": "string", "description": "e.g. '13' for NY-13"},
+                    "state_senate_district":  {"type": "string", "description": "NY State Senate district number"},
+                    "assembly_district":       {"type": "string", "description": "NY Assembly district number"},
+                    "council_district":        {"type": "string", "description": "NYC Council district (ld field)"},
+                    "zip_code":                {"type": "string", "description": "5-digit ZIP code"},
+                    "county":                  {"type": "string", "description": "Borough: brooklyn/manhattan/queens/bronx/staten island"},
+                    "city":                    {"type": "string", "description": "City name, e.g. BROOKLYN"},
+                    "party":                   {"type": "string", "description": "DEM/REP/WFP/BLK etc. Comma-separate for multiple: 'DEM,WFP'"},
+                    "gender":                  {"type": "string", "description": "M or F"},
+                    "min_age":                 {"type": "integer", "description": "Minimum voter age in years"},
+                    "max_age":                 {"type": "integer", "description": "Maximum voter age in years"},
+                    "elections":               {"type": "string", "description": "Natural language: 'past 3 presidential elections', 'last 2 general elections', '2016 and 2020', 'presidential elections since 2012'"},
+                    "election_type":           {"type": "string", "description": "general (default) or primary"},
+                    "voted_in_all_elections":  {"type": "boolean", "description": "True (default): must appear in ALL listed years. False: ANY listed year."},
+                    "status":                  {"type": "string", "description": "active (default) / inactive / all"},
+                    "registered_after":        {"type": "string", "description": "Only voters registered on or after this date (YYYYMMDD)"},
+                    "registered_before":       {"type": "string", "description": "Only voters registered on or before this date (YYYYMMDD)"},
+                    "custom_where":            {"type": "string", "description": "Raw SQL WHERE snippet for any column, e.g. \"vrsource = 'DMV'\" or \"rstreetname ILIKE '%MAIN%'\""},
+                    "limit":                   {"type": "integer", "description": "Cap rows (0 = no limit)"},
                 },
                 "required": [],
             },
@@ -6194,19 +6172,25 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 args = arguments or {}
                 log.info(f"export_voter_csv called: {args}")
                 result = await loop.run_in_executor(None, lambda: export_voter_csv(
-                    congressional_district = args.get("congressional_district", ""),
-                    state_senate_district  = args.get("state_senate_district",  ""),
-                    assembly_district      = args.get("assembly_district",       ""),
-                    council_district       = args.get("council_district",        ""),
-                    zip_code               = args.get("zip_code",                ""),
-                    county                 = args.get("county",                  ""),
-                    party                  = args.get("party",                   ""),
-                    election_years         = args.get("election_years",          None),
-                    voted_in_all_years     = args.get("voted_in_all_years",      True),
-                    min_voter_score        = int(args.get("min_voter_score",     0)),
-                    min_age                = int(args.get("min_age",             0)),
-                    max_age                = int(args.get("max_age",             0)),
-                    limit                  = int(args.get("limit",               0)),
+                    congressional_district  = args.get("congressional_district",   ""),
+                    state_senate_district   = args.get("state_senate_district",    ""),
+                    assembly_district       = args.get("assembly_district",        ""),
+                    council_district        = args.get("council_district",         ""),
+                    zip_code                = args.get("zip_code",                 ""),
+                    county                  = args.get("county",                   ""),
+                    city                    = args.get("city",                     ""),
+                    party                   = args.get("party",                    ""),
+                    gender                  = args.get("gender",                   ""),
+                    min_age                 = int(args.get("min_age",              0)),
+                    max_age                 = int(args.get("max_age",              0)),
+                    elections               = args.get("elections",                ""),
+                    election_type           = args.get("election_type",            "general"),
+                    voted_in_all_elections  = bool(args.get("voted_in_all_elections", True)),
+                    status                  = args.get("status",                   "active"),
+                    registered_after        = args.get("registered_after",         ""),
+                    registered_before       = args.get("registered_before",        ""),
+                    custom_where            = args.get("custom_where",             ""),
+                    limit                   = int(args.get("limit",                0)),
                 ))
                 return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
@@ -6262,7 +6246,446 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return [types.TextContent(type="text", text=json.dumps({"error": str(e)}, indent=2))]
 
 
-# ─── Voter CSV export ─────────────────────────────────────────────────────────
+# ─── Voter CSV export (Neon nyc_voters table) ────────────────────────────────
+
+# Presidential election years for natural-language resolution
+_PRESIDENTIAL_YEARS = [
+    1980, 1984, 1988, 1992, 1996, 2000,
+    2004, 2008, 2012, 2016, 2020, 2024,
+]
+
+# Borough / county-name → 2-digit NY BOE county code (Appendix A of FOIL layout)
+_BOROUGH_TO_COUNTYCODE: dict[str, str] = {
+    "bronx":         "03", "3":  "03",
+    "brooklyn":      "24", "kings":       "24",
+    "manhattan":     "31", "new york":    "31",
+    "queens":        "41",
+    "staten island": "43", "richmond":    "43",
+}
+
+
+def _parse_election_query(description: str) -> dict:
+    """
+    Convert a natural-language election description to a list of years + type.
+
+    Examples
+    --------
+    "past 3 presidential elections"  -> {years:[2016,2020,2024], type:"general"}
+    "last 2 general elections"       -> {years:[2023,2024],       type:"general"}
+    "past 4 primaries"               -> {years:[2021,2022,2023,2024], type:"primary"}
+    "2016 and 2020 general"          -> {years:[2016,2020],        type:"general"}
+    "presidential elections since 2012" -> {years:[2012,2016,2020,2024], type:"general"}
+    """
+    import re as _re
+    desc = description.lower().strip()
+
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+
+    # Explicit years
+    explicit_years = [int(y) for y in _re.findall(r"\b(19\d{2}|20[012]\d)\b", desc)]
+
+    # N count
+    n_match    = _re.search(r"\b(\d+)\b", desc)
+    word_n     = next((v for k, v in _WORD_NUMS.items() if k in desc), None)
+    n          = int(n_match.group(1)) if n_match else (word_n if word_n else 3)
+
+    is_pres    = any(w in desc for w in ["presidential", "president", "potus"])
+    is_primary = any(w in desc for w in ["primary", "primaries"])
+    is_past_n  = any(w in desc for w in ["past", "last", "recent", "previous", "latest"])
+    is_since   = "since" in desc or "from" in desc
+
+    election_type = "primary" if is_primary else "general"
+    current_year  = 2026
+
+    if explicit_years and is_since:
+        since_year = min(explicit_years)
+        if is_pres:
+            years = sorted(y for y in _PRESIDENTIAL_YEARS
+                           if since_year <= y <= current_year)
+        else:
+            years = list(range(since_year, current_year))
+    elif explicit_years:
+        years = sorted(explicit_years)
+    elif is_past_n:
+        if is_pres:
+            years = sorted(
+                [y for y in _PRESIDENTIAL_YEARS if y <= current_year],
+                reverse=True,
+            )[:n]
+        else:
+            years = list(range(current_year - 1, current_year - 1 - n, -1))
+    else:
+        years = []
+
+    return {"years": sorted(years), "election_type": election_type}
+
+
+def _voterhistory_year_condition(year: int, election_type: str = "general") -> str:
+    """
+    Return a single PostgreSQL condition (no leading AND) that matches a
+    voterhistory entry for the given year.
+
+    Handles every format observed in the FOIL voter file:
+      "20161108 GE(P)"              <- YYYYMMDD GE(method)
+      "GE 20241105(M)"              <- GE YYYYMMDD(method)
+      "General Election 2024(P)"    <- spelled-out year-at-end
+      "2024 GENERAL ELECTION(M)"    <- year-first spelled-out
+      "11/8/2016 General Election"  <- date/year spelled-out
+      "2024 General Election(E)"    <- year-first mixed-case
+
+    For primaries, the abbreviated code is PR instead of GE.
+    """
+    y = str(year)
+    if election_type == "primary":
+        return (
+            f"voterhistory ~* "
+            f"'({y}[0-9]{{4}} PR"
+            f"|PR {y}[0-9]{{4}}"
+            f"|[Pp]rimary.{{0,20}}{y}"
+            f"|{y}.{{0,20}}[Pp]rimary"
+            f"|[Pp]residential [Pp]rimary {y})'"
+        )
+    else:
+        # General election
+        return (
+            f"voterhistory ~* "
+            f"'({y}[0-9]{{4}} GE"
+            f"|GE {y}[0-9]{{4}}"
+            f"|[Gg]eneral [Ee]lection {y}"
+            f"|{y} [Gg][Ee][Nn][Ee][Rr][Aa][Ll]"
+            f"|[0-9]+/[0-9]+/{y} [Gg]eneral)'"
+        )
+
+
+def export_voter_csv(
+    # --- Geographic ---
+    congressional_district: str  = "",
+    state_senate_district:  str  = "",
+    assembly_district:      str  = "",
+    council_district:       str  = "",   # ld field in voter file
+    zip_code:               str  = "",   # rzip5
+    county:                 str  = "",   # borough name or 2-digit county code
+    city:                   str  = "",   # rcity
+    # --- Demographic ---
+    party:                  str  = "",   # enrollment: DEM/REP/WFP/BLK etc.
+    gender:                 str  = "",   # M/F/U/I/X
+    min_age:                int  = 0,
+    max_age:                int  = 0,
+    # --- Elections ---
+    elections:              str  = "",   # natural language: "past 3 presidential elections"
+    election_type:          str  = "general",  # general / primary
+    voted_in_all_elections: bool = True,  # True=must have voted in ALL, False=ANY
+    # --- Status & registration ---
+    status:                 str  = "active",  # active / inactive / all
+    registered_after:       str  = "",   # YYYYMMDD or YYYY-MM-DD
+    registered_before:      str  = "",
+    # --- Advanced ---
+    custom_where:           str  = "",   # raw SQL snippet appended with AND
+    limit:                  int  = 0,
+) -> dict:
+    """
+    Query the NYC voter database (Neon nyc_voters table — full FOIL voter file
+    filtered to NYC) and export matching voters to a downloadable CSV.
+
+    All filters are optional and combinable. Leave blank/zero to skip.
+
+    Geographic
+    ----------
+    congressional_district  "13"  — NY-13
+    state_senate_district   "27"
+    assembly_district       "72"
+    council_district        NYC Council district (ld field)
+    zip_code                "11215"
+    county                  "brooklyn" / "manhattan" / "queens" / "bronx" /
+                            "staten island"  (or 2-digit code "24")
+    city                    "BROOKLYN" / "NEW YORK" etc.
+
+    Demographic
+    -----------
+    party        "DEM" / "REP" / "WFP" / "BLK" / "DEM,WFP"  (comma for multiple)
+    gender       "M" / "F"
+    min_age      Minimum voter age in years (uses DOB field)
+    max_age      Maximum voter age in years
+
+    Elections
+    ---------
+    elections    Natural language description:
+                   "past 3 presidential elections"
+                   "last 2 general elections"
+                   "2016 and 2020 presidential"
+                   "presidential elections since 2012"
+                   "past 4 primaries"
+    election_type   "general" (default) or "primary"
+    voted_in_all_elections
+                 True  (default): voter must appear in ALL listed election years
+                 False: voter appears in ANY of the listed election years
+
+    Status & Registration
+    ---------------------
+    status              "active" (default) / "inactive" / "all"
+    registered_after    Only voters who registered on or after this date (YYYYMMDD)
+    registered_before   Only voters who registered on or before this date
+
+    Advanced
+    --------
+    custom_where    Raw SQL WHERE clause snippet, e.g.  "vrsource = 'DMV'"
+    limit           Cap results at N rows (0 = no limit)
+    """
+    import csv     as _csv
+    import uuid    as _uuid
+    import datetime as _dt
+
+    conditions: list[str] = []
+    params:     list      = []
+
+    # ── Status ───────────────────────────────────────────────────────────────
+    _STATUS_MAP = {
+        "active":   ("A", "AM", "AF", "AP", "AU"),
+        "inactive": ("I",),
+        "all":      None,
+    }
+    status_codes = _STATUS_MAP.get(status.lower(), _STATUS_MAP["active"])
+    if status_codes:
+        placeholders = ",".join(["%s"] * len(status_codes))
+        conditions.append(f"status IN ({placeholders})")
+        params.extend(status_codes)
+
+    # ── Geographic ────────────────────────────────────────────────────────────
+    if congressional_district.strip():
+        conditions.append("cd = %s")
+        params.append(congressional_district.strip().lstrip("0") or "0")
+
+    if state_senate_district.strip():
+        conditions.append("sd = %s")
+        params.append(state_senate_district.strip().lstrip("0") or "0")
+
+    if assembly_district.strip():
+        conditions.append("ad = %s")
+        params.append(assembly_district.strip().lstrip("0") or "0")
+
+    if council_district.strip():
+        conditions.append("ld = %s")
+        params.append(council_district.strip())
+
+    if zip_code.strip():
+        conditions.append("rzip5 = %s")
+        params.append(zip_code.strip())
+
+    if county.strip():
+        code = _BOROUGH_TO_COUNTYCODE.get(county.strip().lower())
+        if code:
+            conditions.append("countycode = %s")
+            params.append(code)
+        else:
+            # Passed a raw county code like "24" or "03"
+            conditions.append("countycode = %s")
+            params.append(county.strip().zfill(2))
+
+    if city.strip():
+        conditions.append("rcity ILIKE %s")
+        params.append(city.strip().upper())
+
+    # ── Demographic ──────────────────────────────────────────────────────────
+    if party.strip():
+        parties = [p.strip().upper() for p in party.split(",") if p.strip()]
+        if len(parties) == 1:
+            conditions.append("enrollment = %s")
+            params.append(parties[0])
+        else:
+            ph = ",".join(["%s"] * len(parties))
+            conditions.append(f"enrollment IN ({ph})")
+            params.extend(parties)
+
+    if gender.strip():
+        conditions.append("gender = %s")
+        params.append(gender.strip().upper())
+
+    current_year = _dt.datetime.now().year
+    if min_age > 0:
+        conditions.append("CAST(LEFT(dob, 4) AS INTEGER) <= %s")
+        params.append(current_year - min_age)
+    if max_age > 0:
+        conditions.append("CAST(LEFT(dob, 4) AS INTEGER) >= %s")
+        params.append(current_year - max_age)
+
+    # ── Registration dates ───────────────────────────────────────────────────
+    def _normalise_date(s: str) -> str:
+        return s.replace("-", "").strip()
+
+    if registered_after.strip():
+        conditions.append("regdate >= %s")
+        params.append(_normalise_date(registered_after))
+    if registered_before.strip():
+        conditions.append("regdate <= %s")
+        params.append(_normalise_date(registered_before))
+
+    # ── Election year filtering ───────────────────────────────────────────────
+    # Parsed from natural language; generates PostgreSQL regex conditions on
+    # the voterhistory text field.  All formats in the FOIL file are handled
+    # (YYYYMMDD GE, GE YYYYMMDD, "General Election YYYY", "YYYY GENERAL …").
+    election_years: list[int] = []
+    resolved_election_type = election_type or "general"
+
+    if elections.strip():
+        parsed = _parse_election_query(elections.strip())
+        election_years         = parsed["years"]
+        resolved_election_type = parsed["election_type"]
+
+    if election_years:
+        year_conditions = [
+            _voterhistory_year_condition(yr, resolved_election_type)
+            for yr in election_years
+        ]
+        if voted_in_all_elections:
+            # Voter must appear in EVERY listed year
+            conditions.extend(year_conditions)
+        else:
+            # Voter must appear in AT LEAST ONE listed year
+            conditions.append(f"({' OR '.join(year_conditions)})")
+
+    # ── Custom WHERE ─────────────────────────────────────────────────────────
+    if custom_where.strip():
+        conditions.append(f"({custom_where.strip()})")
+
+    # ── Build SQL ─────────────────────────────────────────────────────────────
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    limit_clause = f"LIMIT {limit}" if limit and limit > 0 else ""
+
+    count_sql = f"SELECT COUNT(*) FROM nyc_voters {where_clause}"
+    select_sql = f"""
+        SELECT
+            lastname, firstname, middlename, namesuffix,
+            raddnumber, rpredirection, rstreetname, rpostdirection,
+            rapartmenttype, rapartment,
+            rcity, rzip5, rzip4,
+            dob, gender, enrollment,
+            countycode, ed, ld, towncity, ward,
+            cd, sd, ad,
+            lastvoterdate, countyvrnumber, regdate, vrsource,
+            status, reasoncode, inact_date, purge_date,
+            sboeid, voterhistory
+        FROM nyc_voters
+        {where_clause}
+        ORDER BY countycode, lastname, firstname
+        {limit_clause}
+    """
+
+    CSV_COLUMNS = [
+        "last_name", "first_name", "middle_name", "suffix",
+        "house_number", "pre_direction", "street_name", "post_direction",
+        "apt_type", "apt_number",
+        "city", "zip5", "zip4",
+        "dob", "gender", "party",
+        "county_code", "election_district", "legislative_district",
+        "town_city", "ward",
+        "congressional_district", "state_senate_district", "assembly_district",
+        "last_vote_date", "county_vr_number", "reg_date", "reg_source",
+        "status", "reason_code", "inactive_date", "purge_date",
+        "sboeid", "voter_history",
+    ]
+
+    # ── Count first ───────────────────────────────────────────────────────────
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(count_sql, params)
+                total_rows = (cur.fetchone() or [0])[0]
+    except Exception as exc:
+        return {"status": "error", "message": f"Count query failed: {exc}"}
+
+    if total_rows == 0:
+        return {
+            "status":  "no_results",
+            "rows":    0,
+            "message": "No voters matched the specified filters.",
+            "filters_applied": {
+                "congressional_district": congressional_district or None,
+                "zip_code":               zip_code               or None,
+                "county":                 county                 or None,
+                "party":                  party                  or None,
+                "elections":              elections              or None,
+                "election_years_resolved": election_years        or None,
+            },
+        }
+
+    # ── Stream rows to CSV ────────────────────────────────────────────────────
+    export_id = _uuid.uuid4().hex[:12]
+    filename  = f"voter_export_{export_id}.csv"
+    filepath  = f"/tmp/{filename}"
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(select_sql, params)
+                with open(filepath, "w", newline="", encoding="utf-8") as f:
+                    writer = _csv.writer(f)
+                    writer.writerow(CSV_COLUMNS)
+                    written = 0
+                    while True:
+                        rows = cur.fetchmany(10_000)
+                        if not rows:
+                            break
+                        for row in rows:
+                            writer.writerow(list(row))
+                        written += len(rows)
+    except Exception as exc:
+        return {"status": "error", "message": f"Export failed: {exc}"}
+
+    preview = []
+    try:
+        import csv as _csv2
+        with open(filepath, encoding="utf-8") as f:
+            reader = _csv2.DictReader(f)
+            for i, row in enumerate(reader):
+                if i >= 3:
+                    break
+                preview.append(dict(row))
+    except Exception:
+        pass
+
+    note = ""
+    if limit and limit > 0 and total_rows > limit:
+        note = (f"Capped at {limit:,} rows. "
+                f"Full match is {total_rows:,} voters. Re-run with limit=0 for all.")
+
+    return {
+        "status":         "ready",
+        "rows":           written,
+        "total_matching": total_rows,
+        "filename":       filename,
+        "download_url":   f"/download/{filename}",
+        "full_url":       f"https://finance-mcp-production-af48.up.railway.app/download/{filename}",
+        "columns":        CSV_COLUMNS,
+        "preview":        preview,
+        "filters_applied": {
+            "congressional_district":    congressional_district   or None,
+            "state_senate_district":     state_senate_district    or None,
+            "assembly_district":         assembly_district        or None,
+            "council_district":          council_district         or None,
+            "zip_code":                  zip_code                 or None,
+            "county":                    county                   or None,
+            "party":                     party                    or None,
+            "gender":                    gender                   or None,
+            "status":                    status,
+            "elections":                 elections                or None,
+            "election_years_resolved":   election_years           or None,
+            "election_type":             resolved_election_type,
+            "voted_in_all_elections":    voted_in_all_elections,
+            "registered_after":          registered_after         or None,
+            "registered_before":         registered_before        or None,
+            "min_age":                   min_age                  or None,
+            "max_age":                   max_age                  or None,
+            "custom_where":              custom_where             or None,
+            "limit":                     limit                    or None,
+        },
+        "note": note,
+    }
+
+
+
 
 def export_voter_csv(
     congressional_district: str = "",
