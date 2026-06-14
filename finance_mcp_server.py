@@ -6554,7 +6554,7 @@ def export_voter_csv(
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     limit_clause = f"LIMIT {limit}" if limit and limit > 0 else ""
 
-    count_sql = f"SELECT COUNT(*) FROM nyc_voters {where_clause}"
+    count_sql = f"SELECT COUNT(*) AS cnt FROM nyc_voters {where_clause}"
     select_sql = f"""
         SELECT
             lastname, firstname, middlename, namesuffix,
@@ -6592,7 +6592,8 @@ def export_voter_csv(
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(count_sql, params)
-                total_rows = (cur.fetchone() or [0])[0]
+                row = cur.fetchone()
+                total_rows = (row["cnt"] if row else 0)
     except Exception as exc:
         return {"status": "error", "message": f"Count query failed: {exc}"}
 
@@ -6629,7 +6630,8 @@ def export_voter_csv(
                         if not rows:
                             break
                         for row in rows:
-                            writer.writerow(list(row))
+                            # DictCursor returns dict-like rows — use values() for ordered output
+                            writer.writerow(list(row.values()))
                         written += len(rows)
     except Exception as exc:
         return {"status": "error", "message": f"Export failed: {exc}"}
