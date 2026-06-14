@@ -6617,6 +6617,13 @@ def export_voter_csv(
     filename  = f"voter_export_{export_id}.csv"
     filepath  = f"/tmp/{filename}"
 
+    # Generate a signed download token so the URL is shareable without the API key
+    import hmac as _hmac, hashlib as _hashlib
+    _secret = (_cfg("MCP_API_KEY") or "fallback").encode()
+    _token  = _hmac.new(_secret, filename.encode(), _hashlib.sha256).hexdigest()[:24]
+    _base   = "https://finance-mcp-production-af48.up.railway.app"
+    _signed_url = f"{_base}/download/{filename}?token={_token}"
+
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -6659,7 +6666,7 @@ def export_voter_csv(
         "total_matching": total_rows,
         "filename":       filename,
         "download_url":   f"/download/{filename}",
-        "full_url":       f"https://finance-mcp-production-af48.up.railway.app/download/{filename}",
+        "full_url":       _signed_url,
         "columns":        CSV_COLUMNS,
         "preview":        preview,
         "filters_applied": {
@@ -6778,21 +6785,48 @@ async def lifespan(app):
     yield
 
 async def download_voter_export(request: Request):
-    """Serve a previously generated voter CSV export file."""
-    if not _check_auth(request):
-        return Response("Unauthorized", status_code=401)
+    """
+    Serve a previously generated voter CSV export file.
+
+    Authentication: accepts either
+      - X-Api-Key header / ?api_key= query param  (for MCP tool calls)
+      - ?token=<signed>                            (for shareable browser links)
+
+    The signed token is HMAC-SHA256(MCP_API_KEY, filename)[:24].
+    It is generated automatically by export_voter_csv and included in
+    the full_url field of the response — no manual key handling needed.
+    """
+    import hmac as _hmac
+    import hashlib as _hashlib
+
     filename = request.path_params.get("filename", "")
+
     # Security: only serve files matching our naming pattern
     if not (filename.startswith("voter_export_") and filename.endswith(".csv")):
         return Response("Not found", status_code=404)
+
     filepath = f"/tmp/{filename}"
     if not os.path.exists(filepath):
         return Response(
             "Export not found or expired. Re-run export_voter_csv to regenerate.",
             status_code=404,
         )
+
+    # Check signed token (for shareable browser URLs)
+    token = request.query_params.get("token", "")
+    secret = (_cfg("MCP_API_KEY") or "fallback").encode()
+    expected_token = _hmac.new(
+        secret, filename.encode(), _hashlib.sha256
+    ).hexdigest()[:24]
+    token_valid = _hmac.compare_digest(token, expected_token)
+
+    # Also accept the raw API key (for MCP tool calls / curl)
+    if not token_valid and not _check_auth(request):
+        return Response("Unauthorized", status_code=401)
+
     with open(filepath, "rb") as f:
         content = f.read()
+
     return Response(
         content,
         media_type="text/csv",
