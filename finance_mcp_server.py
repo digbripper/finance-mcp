@@ -1336,7 +1336,7 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT p.id::text AS person_id, p.full_name,
-                           p.personal_zip_code AS personal_zip,
+                           p.personal_postal_code AS personal_zip,
                            p.personal_city     AS personal_city,
                            STRING_AGG(DISTINCT o.location, ' | ') AS org_locations,
                            STRING_AGG(DISTINCT o.city,     ' | ') AS org_cities
@@ -1346,7 +1346,7 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
                     LEFT JOIN organizations_organization o
                            ON o.id = po.organization_id
                     WHERE p.is_active = TRUE
-                    GROUP BY p.id, p.full_name, p.personal_zip_code, p.personal_city
+                    GROUP BY p.id, p.full_name, p.personal_postal_code, p.personal_city
                     ORDER BY p.full_name
                 """)
                 contacts = [dict(r) for r in cur.fetchall()]
