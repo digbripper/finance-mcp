@@ -1250,36 +1250,32 @@ def _tables_exist() -> tuple[bool, bool]:
     return ("people_voter_enrichment" in found, "people_influence_scores" in found)
 
 
-def enrich_voter_data_batch(limit: int = 0) -> dict:
-    """
-    Match every active Pythia contact to the NYC voter file (Neon nyc_voters table).
+# ── Voter enrichment progress tracker ────────────────────────────────────────
+_enrich_status: dict = {
+    "running":   False,
+    "total":     0,
+    "processed": 0,
+    "matched":   0,
+    "flagged":   0,
+    "no_match":  0,
+    "errors":    0,
+    "matched_high":   0,
+    "matched_medium": 0,
+    "matched_low":    0,
+    "phase":     "idle",   # idle / stripping / loading / matching / done
+    "message":   "Not started",
+    "started_at": None,
+    "finished_at": None,
+}
 
-    Process
-    -------
-    0. Strip all existing people_voter_enrichment records and
-       voter_enrichment_flags — clean slate every run.
 
-    1. Load all active Pythia contacts with any available geographic
-       signals: personal ZIP, personal city, and org locations
-       (borough inferred from org.location / org.city).
+def _enrich_worker(limit: int) -> None:
+    """Background worker — runs the full 4-tier enrichment."""
+    import re as _re, json as _json, datetime as _dt, threading as _thr
 
-    2. For each contact, attempt matching through four tiers:
-
-       Tier 1 — name + personal ZIP      (high confidence, auto-accept)
-       Tier 2 — name + personal city     (medium confidence if ≤3 matches)
-       Tier 3 — name + org borough       (medium confidence if unique in borough)
-       Tier 4 — name only, all of NYC    (low confidence, ONLY if exactly 1 match)
-
-    3. When a match is found, write to people_voter_enrichment with:
-       sboeid, party, districts, address, voter stats from voterhistory,
-       match_confidence, and match_method.
-
-    4. When 2+ matches remain after all geographic filters → write to
-       voter_enrichment_flags for manual review (includes candidate records).
-       0 matches → silently skip (not an NYC voter or different name format).
-    """
-    import re as _re
-    import json as _json
+    global _enrich_status
+    _enrich_status.update(running=True, phase="matching",
+                          started_at=str(_dt.datetime.now()))
 
     _PREFIXES = {"dr","mr","mrs","ms","prof","rev","hon","sen","rep","cllr","esq"}
     _SUFFIXES = {"jr","sr","i","ii","iii","iv","v","esq","md","phd","cpa","dds","do","jd"}
@@ -1300,14 +1296,15 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
 
     def _infer_county(loc):
         s = (loc or "").lower()
-        for kw,code in _LOC_TO_COUNTY.items():
+        for kw, code in _LOC_TO_COUNTY.items():
             if kw in s: return code
         return None
 
     def _voter_stats(history):
         if not history:
-            return {"ge_votes":0,"primary_votes":0,"ge_years":"","primary_years":"","voter_score":0}
-        ge,pr = set(),set()
+            return {"ge_votes":0,"primary_votes":0,"ge_years":"",
+                    "primary_years":"","voter_score":0}
+        ge, pr = set(), set()
         for entry in history.split(";"):
             ym = _re.search(r"(20\d{2}|19\d{2})", entry)
             if not ym: continue
@@ -1319,49 +1316,6 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
                 "primary_years":",".join(sorted(pr,reverse=True)),
                 "voter_score":len(ge)+len(pr)}
 
-    # Step 0: strip
-    log.info("enrich_voter_data: stripping existing enrichments and flags")
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM voter_enrichment_flags")
-                cur.execute("DELETE FROM people_voter_enrichment")
-            conn.commit()
-    except Exception as exc:
-        return {"error": f"Strip failed: {exc}"}
-
-    # Step 1: load contacts with geographic signals
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT p.id::text AS person_id, p.full_name,
-                           p.personal_postal_code AS personal_zip,
-                           p.personal_city     AS personal_city,
-                           STRING_AGG(DISTINCT o.location, ' | ') AS org_locations,
-                           STRING_AGG(DISTINCT o.city,     ' | ') AS org_cities
-                    FROM people_person p
-                    LEFT JOIN people_personorganization po
-                           ON po.person_id = p.id AND po.is_current = TRUE
-                    LEFT JOIN organizations_organization o
-                           ON o.id = po.organization_id
-                    WHERE p.is_active = TRUE
-                    GROUP BY p.id, p.full_name, p.personal_postal_code, p.personal_city
-                    ORDER BY p.full_name
-                """)
-                contacts = [dict(r) for r in cur.fetchall()]
-    except Exception as exc:
-        return {"error": f"Failed to load contacts: {exc}"}
-
-    if limit and limit > 0:
-        contacts = contacts[:limit]
-
-    total = len(contacts)
-    log.info(f"enrich_voter_data: processing {total} contacts")
-
-    matched_high = matched_medium = matched_low = 0
-    skipped_no_match = flagged = errors = 0
-
     UPSERT_SQL = """
         INSERT INTO people_voter_enrichment (
             person_id, voter_address, voter_city, voter_zip, voter_state,
@@ -1370,14 +1324,19 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
             voter_score, sboeid, match_confidence, match_method
         ) VALUES (%s,%s,%s,%s,'NY',%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (person_id) DO UPDATE SET
-            voter_address=EXCLUDED.voter_address, voter_city=EXCLUDED.voter_city,
-            voter_zip=EXCLUDED.voter_zip, voter_state=EXCLUDED.voter_state,
-            party_label=EXCLUDED.party_label, county_name=EXCLUDED.county_name,
+            voter_address=EXCLUDED.voter_address,
+            voter_city=EXCLUDED.voter_city,
+            voter_zip=EXCLUDED.voter_zip,
+            voter_state=EXCLUDED.voter_state,
+            party_label=EXCLUDED.party_label,
+            county_name=EXCLUDED.county_name,
             assembly_district=EXCLUDED.assembly_district,
             state_senate_district=EXCLUDED.state_senate_district,
             congressional_district=EXCLUDED.congressional_district,
-            voter_score=EXCLUDED.voter_score, sboeid=EXCLUDED.sboeid,
-            match_confidence=EXCLUDED.match_confidence, match_method=EXCLUDED.match_method
+            voter_score=EXCLUDED.voter_score,
+            sboeid=EXCLUDED.sboeid,
+            match_confidence=EXCLUDED.match_confidence,
+            match_method=EXCLUDED.match_method
     """
     FLAG_SQL = """
         INSERT INTO voter_enrichment_flags
@@ -1387,11 +1346,14 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
 
     def _write_match(cur, pid, voter, confidence, method):
         stats = _voter_stats(voter.get("voterhistory","") or "")
-        addr  = " ".join(filter(None,[voter.get("raddnumber",""),voter.get("rstreetname","")])).strip().title()
+        addr  = " ".join(filter(None,[voter.get("raddnumber",""),
+                                      voter.get("rstreetname","")])).strip().title()
         pc    = (voter.get("enrollment") or "").upper()
         cur.execute(UPSERT_SQL,(
-            pid, addr, (voter.get("rcity") or "").title(), voter.get("rzip5",""),
-            PARTY_LABELS.get(pc,pc), _COUNTY_NAMES.get(voter.get("countycode",""),""),
+            pid, addr, (voter.get("rcity") or "").title(),
+            voter.get("rzip5",""),
+            PARTY_LABELS.get(pc, pc),
+            _COUNTY_NAMES.get(voter.get("countycode",""),""),
             voter.get("ad",""), voter.get("sd",""), voter.get("cd",""),
             stats["voter_score"], voter.get("sboeid",""), confidence, method,
         ))
@@ -1409,6 +1371,10 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
         """, (last, first)+params)
         return [dict(r) for r in cur.fetchall()]
 
+    contacts = _enrich_status.get("_contacts", [])
+    total    = len(contacts)
+    mh = mm = ml = skip = flag = err = 0
+
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -1416,123 +1382,231 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
                     pid  = contact["person_id"]
                     name = (contact["full_name"] or "").strip()
                     if not name or not pid:
-                        skipped_no_match += 1; continue
+                        skip += 1; continue
                     first, last = _parse_name(name)
                     if not first or not last:
-                        skipped_no_match += 1; continue
+                        skip += 1; continue
 
                     try:
                         personal_zip  = (contact.get("personal_zip")  or "").strip()
                         personal_city = (contact.get("personal_city") or "").strip().upper()
                         org_county = None
-                        for ls in filter(None,[contact.get("org_locations",""),contact.get("org_cities","")]):
+                        for ls in filter(None,[contact.get("org_locations",""),
+                                               contact.get("org_cities","")]):
                             org_county = _infer_county(ls)
                             if org_county: break
 
                         result = method = None
 
                         # Tier 1: name + personal ZIP
-                        if personal_zip and not result:
+                        if personal_zip:
                             rows = _qv(cur,first,last,"AND rzip5=%s",(personal_zip,))
-                            active = [r for r in rows if r["status"]=="A"]
-                            best = active if active else rows
+                            best = [r for r in rows if r["status"]=="A"] or rows
                             if len(best)==1: result,method = best[0],"tier1_zip"
 
                         # Tier 2: name + personal city
                         if not result and personal_city:
                             rows = _qv(cur,first,last,"AND rcity=%s",(personal_city,))
-                            active = [r for r in rows if r["status"]=="A"]
-                            best = active if active else rows
+                            best = [r for r in rows if r["status"]=="A"] or rows
                             if len(best)==1: result,method = best[0],"tier2_city"
 
                         # Tier 3: name + org borough
                         if not result and org_county:
                             rows = _qv(cur,first,last,"AND countycode=%s",(org_county,))
-                            active = [r for r in rows if r["status"]=="A"]
-                            best = active if active else rows
+                            best = [r for r in rows if r["status"]=="A"] or rows
                             if len(best)==1: result,method = best[0],"tier3_org_borough"
 
-                        # Tier 4: name only, strictly unique
+                        # Tier 4: name only, strictly unique in NYC
                         if not result:
                             rows = _qv(cur,first,last)
-                            active = [r for r in rows if r["status"]=="A"]
-                            best = active if active else rows
+                            best = [r for r in rows if r["status"]=="A"] or rows
                             if len(best)==1:
                                 result,method = best[0],"tier4_name_only"
                             elif len(best)>1:
-                                top = [{"firstname":r.get("firstname",""),"lastname":r.get("lastname",""),
-                                        "rzip5":r.get("rzip5",""),"rcity":r.get("rcity",""),
-                                        "enrollment":r.get("enrollment",""),"sboeid":r.get("sboeid",""),
-                                        "status":r.get("status","")} for r in best[:8]]
+                                top = [{"firstname":r.get("firstname",""),
+                                        "lastname":r.get("lastname",""),
+                                        "rzip5":r.get("rzip5",""),
+                                        "rcity":r.get("rcity",""),
+                                        "enrollment":r.get("enrollment",""),
+                                        "sboeid":r.get("sboeid",""),
+                                        "status":r.get("status","")}
+                                       for r in best[:8]]
                                 cur.execute(FLAG_SQL,(
-                                    pid,name,"ambiguous_name",len(best),
+                                    pid, name, "ambiguous_name", len(best),
                                     _COUNTY_NAMES.get(org_county,org_county) if org_county else None,
                                     _json.dumps(top),
                                 ))
-                                flagged += 1
+                                flag += 1
 
                         if result and method:
                             conf = ("high" if method=="tier1_zip"
                                     else "medium" if method in ("tier2_city","tier3_org_borough")
                                     else "low")
                             _write_match(cur,pid,result,conf,method)
-                            if conf=="high": matched_high+=1
-                            elif conf=="medium": matched_medium+=1
-                            else: matched_low+=1
+                            if conf=="high": mh+=1
+                            elif conf=="medium": mm+=1
+                            else: ml+=1
                         elif not result:
-                            skipped_no_match+=1
+                            skip+=1
 
                     except Exception as exc:
-                        log.warning(f"enrich contact {name!r}: {exc}"); errors+=1
+                        log.warning(f"enrich {name!r}: {exc}"); err+=1
 
-                    if (idx+1)%100==0:
+                    # Update progress and commit every 100
+                    if (idx+1) % 100 == 0:
                         conn.commit()
-                        log.info(f"enrich_voter_data: {idx+1}/{total} "
-                                 f"hi={matched_high} med={matched_medium} lo={matched_low} flags={flagged}")
+                        _enrich_status.update(
+                            processed=idx+1, matched=mh+mm+ml,
+                            matched_high=mh, matched_medium=mm, matched_low=ml,
+                            flagged=flag, no_match=skip, errors=err,
+                            message=f"Processing... {idx+1}/{total}"
+                        )
 
                 conn.commit()
 
     except Exception as exc:
-        log.error(f"enrich_voter_data outer: {exc}", exc_info=True)
-        return {"error": str(exc)}
+        log.error(f"_enrich_worker error: {exc}", exc_info=True)
+        _enrich_status.update(phase="error", message=str(exc))
+    finally:
+        total_matched = mh+mm+ml
+        _enrich_status.update(
+            running=False, phase="done",
+            processed=total, matched=total_matched,
+            matched_high=mh, matched_medium=mm, matched_low=ml,
+            flagged=flag, no_match=skip, errors=err,
+            finished_at=str(_dt.datetime.now()),
+            message=(f"Complete: {total_matched}/{total} matched "
+                     f"({mh} high/{mm} medium/{ml} low). "
+                     f"{flag} flagged for review."),
+        )
+        log.info(f"_enrich_worker done: {total_matched} matched, {flag} flagged")
 
-    total_matched = matched_high+matched_medium+matched_low
+
+def enrich_voter_data_batch(limit: int = 0) -> dict:
+    """
+    Match every active Pythia contact to the NYC voter file (Neon nyc_voters).
+
+    Runs as a background job — returns immediately with status "started".
+    If already running, returns current progress instead of starting again.
+    Call again at any time to check progress.
+
+    Steps:
+    1. Strip existing enrichments + flags (synchronous, fast)
+    2. Load contacts with geographic signals (synchronous)
+    3. Match all contacts in background via 4-tier strategy:
+       Tier 1: name + personal ZIP     (high confidence)
+       Tier 2: name + personal city    (medium confidence)
+       Tier 3: name + org borough      (medium confidence)
+       Tier 4: name only, unique in NYC (low confidence)
+    4. Flag ambiguous contacts in voter_enrichment_flags for manual review
+    """
+    import threading as _threading, datetime as _dt
+
+    global _enrich_status
+
+    # If already running, return current progress
+    if _enrich_status.get("running"):
+        p = _enrich_status
+        return {
+            "status":    "running",
+            "phase":     p["phase"],
+            "processed": p["processed"],
+            "total":     p["total"],
+            "matched":   p["matched"],
+            "flagged":   p["flagged"],
+            "message":   p["message"],
+        }
+
+    # Step 1: strip existing data (fast, synchronous)
+    log.info("enrich_voter_data: stripping existing enrichments")
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM voter_enrichment_flags")
+                cur.execute("DELETE FROM people_voter_enrichment")
+            conn.commit()
+    except Exception as exc:
+        return {"error": f"Strip failed: {exc}"}
+
+    # Step 2: load contacts (synchronous)
+    log.info("enrich_voter_data: loading contacts")
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT p.id::text AS person_id, p.full_name,
+                           p.personal_postal_code AS personal_zip,
+                           p.personal_city        AS personal_city,
+                           STRING_AGG(DISTINCT o.location, ' | ') AS org_locations,
+                           STRING_AGG(DISTINCT o.city,     ' | ') AS org_cities
+                    FROM people_person p
+                    LEFT JOIN people_personorganization po
+                           ON po.person_id = p.id AND po.is_current = TRUE
+                    LEFT JOIN organizations_organization o
+                           ON o.id = po.organization_id
+                    WHERE p.is_active = TRUE
+                    GROUP BY p.id, p.full_name,
+                             p.personal_postal_code, p.personal_city
+                    ORDER BY p.full_name
+                """)
+                contacts = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        return {"error": f"Failed to load contacts: {exc}"}
+
+    if limit and limit > 0:
+        contacts = contacts[:limit]
+
+    total = len(contacts)
+    _enrich_status.update(
+        running=False, total=total, processed=0, matched=0, flagged=0,
+        no_match=0, errors=0, matched_high=0, matched_medium=0, matched_low=0,
+        phase="starting", message=f"Loaded {total} contacts, starting background match...",
+        started_at=str(_dt.datetime.now()), finished_at=None,
+        _contacts=contacts,
+    )
+
+    # Step 3: launch background worker
+    t = _threading.Thread(target=_enrich_worker, args=(limit,), daemon=True,
+                          name="voter-enrich")
+    t.start()
+
     return {
-        "status":"complete","total_contacts":total,
-        "matched":total_matched,"matched_high":matched_high,
-        "matched_medium":matched_medium,"matched_low":matched_low,
-        "flagged":flagged,"no_match":skipped_no_match,"errors":errors,
-        "match_rate_pct":round(total_matched/max(total,1)*100,1),
-        "flag_rate_pct":round(flagged/max(total,1)*100,1),
-        "message":(f"{total_matched}/{total} contacts matched "
-                   f"({matched_high} high / {matched_medium} medium / {matched_low} low). "
-                   f"{flagged} flagged for manual review — call get_voter_enrichment_flags."),
+        "status":  "started",
+        "total":   total,
+        "message": (f"Enrichment started in background for {total} contacts. "
+                    "Call enrich_voter_data again (no args) to check progress. "
+                    "Typically takes 5-15 minutes. When done, "
+                    "call get_voter_enrichment_flags to review ambiguous matches."),
     }
 
 
 def get_voter_enrichment_flags(limit: int = 200, unresolved_only: bool = True) -> dict:
-    """Return contacts flagged during voter enrichment that need manual review."""
+    """Return contacts flagged during voter enrichment for manual review."""
     import json as _json
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 where = "WHERE resolved_sboeid IS NULL" if unresolved_only else ""
                 cur.execute(f"""
-                    SELECT person_id::text,full_name,flag_reason,match_count,
-                           inferred_borough,top_matches,flagged_at,review_notes,resolved_sboeid
+                    SELECT person_id::text, full_name, flag_reason, match_count,
+                           inferred_borough, top_matches, flagged_at,
+                           review_notes, resolved_sboeid
                     FROM voter_enrichment_flags {where}
-                    ORDER BY match_count ASC, full_name LIMIT %s
+                    ORDER BY match_count ASC, full_name
+                    LIMIT %s
                 """, (limit,))
                 rows = [dict(r) for r in cur.fetchall()]
                 cur.execute("SELECT COUNT(*) AS cnt FROM voter_enrichment_flags "
                             + ("WHERE resolved_sboeid IS NULL" if unresolved_only else ""))
-                total = (dict(cur.fetchone()) or {}).get("cnt",0)
-        return {"total_flagged":total,"returned":len(rows),
-                "unresolved_only":unresolved_only,"flags":rows,
-                "tip":"UPDATE voter_enrichment_flags SET resolved_sboeid='NY...' WHERE person_id='...'"}
+                total = (dict(cur.fetchone()) or {}).get("cnt", 0)
+        return {
+            "total_flagged": total, "returned": len(rows),
+            "unresolved_only": unresolved_only, "flags": rows,
+            "tip": ("To resolve: UPDATE voter_enrichment_flags "
+                    "SET resolved_sboeid='NY...' WHERE person_id='...'"),
+        }
     except Exception as exc:
         return {"error": str(exc)}
-
 
 
 
