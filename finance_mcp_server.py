@@ -1252,155 +1252,288 @@ def _tables_exist() -> tuple[bool, bool]:
 
 def enrich_voter_data_batch(limit: int = 0) -> dict:
     """
-    Match every active Pythia contact to the NYC voter file by name.
-    Writes party, voter score, districts, and address into people_voter_enrichment.
-    Safe to re-run — uses INSERT … ON CONFLICT DO UPDATE (upsert).
+    Match every active Pythia contact to the NYC voter file (Neon nyc_voters table).
+
+    Process
+    -------
+    0. Strip all existing people_voter_enrichment records and
+       voter_enrichment_flags — clean slate every run.
+
+    1. Load all active Pythia contacts with any available geographic
+       signals: personal ZIP, personal city, and org locations
+       (borough inferred from org.location / org.city).
+
+    2. For each contact, attempt matching through four tiers:
+
+       Tier 1 — name + personal ZIP      (high confidence, auto-accept)
+       Tier 2 — name + personal city     (medium confidence if ≤3 matches)
+       Tier 3 — name + org borough       (medium confidence if unique in borough)
+       Tier 4 — name only, all of NYC    (low confidence, ONLY if exactly 1 match)
+
+    3. When a match is found, write to people_voter_enrichment with:
+       sboeid, party, districts, address, voter stats from voterhistory,
+       match_confidence, and match_method.
+
+    4. When 2+ matches remain after all geographic filters → write to
+       voter_enrichment_flags for manual review (includes candidate records).
+       0 matches → silently skip (not an NYC voter or different name format).
     """
-    # ── Stage 1: get contacts ─────────────────────────────────────────────────
+    import re as _re
+    import json as _json
+
+    _PREFIXES = {"dr","mr","mrs","ms","prof","rev","hon","sen","rep","cllr","esq"}
+    _SUFFIXES = {"jr","sr","i","ii","iii","iv","v","esq","md","phd","cpa","dds","do","jd"}
+
+    def _parse_name(full_name):
+        tokens = [t.strip(".,") for t in full_name.strip().split() if t.strip(".,")]
+        if not tokens: return ("","")
+        while tokens and tokens[0].lower() in _PREFIXES: tokens = tokens[1:]
+        while tokens and tokens[-1].lower() in _SUFFIXES: tokens = tokens[:-1]
+        if not tokens: return ("","")
+        return (tokens[0].upper(), tokens[-1].upper() if len(tokens) > 1 else "")
+
+    _COUNTY_NAMES = {"03":"Bronx","24":"Kings","31":"New York","41":"Queens","43":"Richmond"}
+    _LOC_TO_COUNTY = {
+        "brooklyn":"24","kings":"24","manhattan":"31","new york city":"31",
+        "new york":"31","queens":"41","bronx":"03","staten island":"43","richmond":"43",
+    }
+
+    def _infer_county(loc):
+        s = (loc or "").lower()
+        for kw,code in _LOC_TO_COUNTY.items():
+            if kw in s: return code
+        return None
+
+    def _voter_stats(history):
+        if not history:
+            return {"ge_votes":0,"primary_votes":0,"ge_years":"","primary_years":"","voter_score":0}
+        ge,pr = set(),set()
+        for entry in history.split(";"):
+            ym = _re.search(r"(20\d{2}|19\d{2})", entry)
+            if not ym: continue
+            y = ym.group(1); eu = entry.upper()
+            if " GE" in eu or "GE " in eu or "GENERAL ELECTION" in eu: ge.add(y)
+            elif " PR" in eu or "PR " in eu or " PP" in eu or "PRIMARY" in eu: pr.add(y)
+        return {"ge_votes":len(ge),"primary_votes":len(pr),
+                "ge_years":",".join(sorted(ge,reverse=True)),
+                "primary_years":",".join(sorted(pr,reverse=True)),
+                "voter_score":len(ge)+len(pr)}
+
+    # Step 0: strip
+    log.info("enrich_voter_data: stripping existing enrichments and flags")
     try:
-        contacts = get_all_contacts()
-    except Exception as e:
-        return {"error": f"Failed to load contacts: {e}"}
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM voter_enrichment_flags")
+                cur.execute("DELETE FROM people_voter_enrichment")
+            conn.commit()
+    except Exception as exc:
+        return {"error": f"Strip failed: {exc}"}
+
+    # Step 1: load contacts with geographic signals
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT p.id::text AS person_id, p.full_name,
+                           p.personal_zip_code AS personal_zip,
+                           p.personal_city     AS personal_city,
+                           STRING_AGG(DISTINCT o.location, ' | ') AS org_locations,
+                           STRING_AGG(DISTINCT o.city,     ' | ') AS org_cities
+                    FROM people_person p
+                    LEFT JOIN people_personorganization po
+                           ON po.person_id = p.id AND po.is_current = TRUE
+                    LEFT JOIN organizations_organization o
+                           ON o.id = po.organization_id
+                    WHERE p.is_active = TRUE
+                    GROUP BY p.id, p.full_name, p.personal_zip_code, p.personal_city
+                    ORDER BY p.full_name
+                """)
+                contacts = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        return {"error": f"Failed to load contacts: {exc}"}
 
     if limit and limit > 0:
         contacts = contacts[:limit]
 
-    if not contacts:
-        return {"error": "No active contacts found in Pythia."}
+    total = len(contacts)
+    log.info(f"enrich_voter_data: processing {total} contacts")
 
-    # ── Stage 2: open write connection ────────────────────────────────────────
+    matched_high = matched_medium = matched_low = 0
+    skipped_no_match = flagged = errors = 0
+
+    UPSERT_SQL = """
+        INSERT INTO people_voter_enrichment (
+            person_id, voter_address, voter_city, voter_zip, voter_state,
+            party_label, county_name,
+            assembly_district, state_senate_district, congressional_district,
+            voter_score, sboeid, match_confidence, match_method
+        ) VALUES (%s,%s,%s,%s,'NY',%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (person_id) DO UPDATE SET
+            voter_address=EXCLUDED.voter_address, voter_city=EXCLUDED.voter_city,
+            voter_zip=EXCLUDED.voter_zip, voter_state=EXCLUDED.voter_state,
+            party_label=EXCLUDED.party_label, county_name=EXCLUDED.county_name,
+            assembly_district=EXCLUDED.assembly_district,
+            state_senate_district=EXCLUDED.state_senate_district,
+            congressional_district=EXCLUDED.congressional_district,
+            voter_score=EXCLUDED.voter_score, sboeid=EXCLUDED.sboeid,
+            match_confidence=EXCLUDED.match_confidence, match_method=EXCLUDED.match_method
+    """
+    FLAG_SQL = """
+        INSERT INTO voter_enrichment_flags
+            (person_id,full_name,flag_reason,match_count,inferred_borough,top_matches)
+        VALUES (%s,%s,%s,%s,%s,%s::jsonb)
+    """
+
+    def _write_match(cur, pid, voter, confidence, method):
+        stats = _voter_stats(voter.get("voterhistory","") or "")
+        addr  = " ".join(filter(None,[voter.get("raddnumber",""),voter.get("rstreetname","")])).strip().title()
+        pc    = (voter.get("enrollment") or "").upper()
+        cur.execute(UPSERT_SQL,(
+            pid, addr, (voter.get("rcity") or "").title(), voter.get("rzip5",""),
+            PARTY_LABELS.get(pc,pc), _COUNTY_NAMES.get(voter.get("countycode",""),""),
+            voter.get("ad",""), voter.get("sd",""), voter.get("cd",""),
+            stats["voter_score"], voter.get("sboeid",""), confidence, method,
+        ))
+
+    def _qv(cur, first, last, extra="", params=()):
+        cur.execute(f"""
+            SELECT lastname,firstname,raddnumber,rstreetname,rcity,rzip5,
+                   countycode,cd,sd,ad,enrollment,status,sboeid,voterhistory
+            FROM nyc_voters
+            WHERE lastname=%s AND firstname=%s
+              AND status IN ('A','AM','AF','AP','AU','I')
+              {extra}
+            ORDER BY CASE status WHEN 'A' THEN 1 ELSE 2 END
+            LIMIT 25
+        """, (last, first)+params)
+        return [dict(r) for r in cur.fetchall()]
+
     try:
-        conn = get_db()
-    except Exception as e:
-        return {"error": f"DB connection failed: {e}"}
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                for idx, contact in enumerate(contacts):
+                    pid  = contact["person_id"]
+                    name = (contact["full_name"] or "").strip()
+                    if not name or not pid:
+                        skipped_no_match += 1; continue
+                    first, last = _parse_name(name)
+                    if not first or not last:
+                        skipped_no_match += 1; continue
 
-    matched, unmatched, errors = 0, 0, 0
-    BATCH = 50
+                    try:
+                        personal_zip  = (contact.get("personal_zip")  or "").strip()
+                        personal_city = (contact.get("personal_city") or "").strip().upper()
+                        org_county = None
+                        for ls in filter(None,[contact.get("org_locations",""),contact.get("org_cities","")]):
+                            org_county = _infer_county(ls)
+                            if org_county: break
 
-    try:
-        batch_n = 0
-        for i, contact in enumerate(contacts):
-            pid  = contact.get("id", "")
-            name = (contact.get("full_name") or "").strip()
-            if not name or not pid:
-                unmatched += 1
-                continue
+                        result = method = None
 
-            try:
-                voter = lookup_voter(name)
+                        # Tier 1: name + personal ZIP
+                        if personal_zip and not result:
+                            rows = _qv(cur,first,last,"AND rzip5=%s",(personal_zip,))
+                            active = [r for r in rows if r["status"]=="A"]
+                            best = active if active else rows
+                            if len(best)==1: result,method = best[0],"tier1_zip"
 
-                if voter:
-                    v_first = (voter.get("firstname") or voter.get("first") or "").title()
-                    v_last  = (voter.get("lastname")  or voter.get("last")  or "").title()
-                    v_full  = f"{v_first} {v_last}".strip()
-                    conf    = int(fuzz.token_sort_ratio(normalize(name), normalize(v_full)))
-                    party_code = voter.get("party") or voter.get("party_code") or ""
+                        # Tier 2: name + personal city
+                        if not result and personal_city:
+                            rows = _qv(cur,first,last,"AND rcity=%s",(personal_city,))
+                            active = [r for r in rows if r["status"]=="A"]
+                            best = active if active else rows
+                            if len(best)==1: result,method = best[0],"tier2_city"
 
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO people_voter_enrichment (
-                                person_id, sboeid, party_code, party_label,
-                                voter_score, ge_votes, primary_votes,
-                                ge_years, primary_years, off_year_years,
-                                assembly_district, state_senate_district, congressional_district,
-                                county_code, county_name,
-                                voter_address, voter_city, voter_zip,
-                                match_confidence, matched_at, updated_at
-                            ) VALUES (%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s, %s,%s,%s, %s, NOW(),NOW())
-                            ON CONFLICT (person_id) DO UPDATE SET
-                                sboeid=%s, party_code=%s, party_label=%s,
-                                voter_score=%s, ge_votes=%s, primary_votes=%s,
-                                ge_years=%s, primary_years=%s, off_year_years=%s,
-                                assembly_district=%s, state_senate_district=%s, congressional_district=%s,
-                                county_code=%s, county_name=%s,
-                                voter_address=%s, voter_city=%s, voter_zip=%s,
-                                match_confidence=%s, updated_at=NOW()
-                        """, (
-                            # INSERT values
-                            pid,
-                            voter.get("sboeid","") or "",
-                            party_code,
-                            PARTY_LABELS.get(party_code, party_code),
-                            int(voter.get("voter_score",0) or 0),
-                            int(voter.get("ge_votes",0) or voter.get("general_elections_voted",0) or 0),
-                            int(voter.get("primary_votes",0) or voter.get("primaries_voted",0) or 0),
-                            voter.get("ge_years","") or "",
-                            voter.get("primary_years","") or "",
-                            voter.get("off_year_years","") or "",
-                            voter.get("ad","") or voter.get("assembly_district","") or "",
-                            voter.get("sd","") or voter.get("state_senate_district","") or "",
-                            voter.get("cd","") or voter.get("congressional_district","") or "",
-                            voter.get("county_code","") or "",
-                            voter.get("county_name","") or voter.get("county","") or "",
-                            voter.get("address","") or "",
-                            voter.get("city","") or "",
-                            voter.get("zip","") or "",
-                            conf,
-                            # ON CONFLICT UPDATE values (same order, no person_id)
-                            voter.get("sboeid","") or "",
-                            party_code,
-                            PARTY_LABELS.get(party_code, party_code),
-                            int(voter.get("voter_score",0) or 0),
-                            int(voter.get("ge_votes",0) or voter.get("general_elections_voted",0) or 0),
-                            int(voter.get("primary_votes",0) or voter.get("primaries_voted",0) or 0),
-                            voter.get("ge_years","") or "",
-                            voter.get("primary_years","") or "",
-                            voter.get("off_year_years","") or "",
-                            voter.get("ad","") or voter.get("assembly_district","") or "",
-                            voter.get("sd","") or voter.get("state_senate_district","") or "",
-                            voter.get("cd","") or voter.get("congressional_district","") or "",
-                            voter.get("county_code","") or "",
-                            voter.get("county_name","") or voter.get("county","") or "",
-                            voter.get("address","") or "",
-                            voter.get("city","") or "",
-                            voter.get("zip","") or "",
-                            conf,
-                        ))
-                    matched += 1
-                    batch_n += 1
-                    if batch_n >= BATCH:
+                        # Tier 3: name + org borough
+                        if not result and org_county:
+                            rows = _qv(cur,first,last,"AND countycode=%s",(org_county,))
+                            active = [r for r in rows if r["status"]=="A"]
+                            best = active if active else rows
+                            if len(best)==1: result,method = best[0],"tier3_org_borough"
+
+                        # Tier 4: name only, strictly unique
+                        if not result:
+                            rows = _qv(cur,first,last)
+                            active = [r for r in rows if r["status"]=="A"]
+                            best = active if active else rows
+                            if len(best)==1:
+                                result,method = best[0],"tier4_name_only"
+                            elif len(best)>1:
+                                top = [{"firstname":r.get("firstname",""),"lastname":r.get("lastname",""),
+                                        "rzip5":r.get("rzip5",""),"rcity":r.get("rcity",""),
+                                        "enrollment":r.get("enrollment",""),"sboeid":r.get("sboeid",""),
+                                        "status":r.get("status","")} for r in best[:8]]
+                                cur.execute(FLAG_SQL,(
+                                    pid,name,"ambiguous_name",len(best),
+                                    _COUNTY_NAMES.get(org_county,org_county) if org_county else None,
+                                    _json.dumps(top),
+                                ))
+                                flagged += 1
+
+                        if result and method:
+                            conf = ("high" if method=="tier1_zip"
+                                    else "medium" if method in ("tier2_city","tier3_org_borough")
+                                    else "low")
+                            _write_match(cur,pid,result,conf,method)
+                            if conf=="high": matched_high+=1
+                            elif conf=="medium": matched_medium+=1
+                            else: matched_low+=1
+                        elif not result:
+                            skipped_no_match+=1
+
+                    except Exception as exc:
+                        log.warning(f"enrich contact {name!r}: {exc}"); errors+=1
+
+                    if (idx+1)%100==0:
                         conn.commit()
-                        batch_n = 0
-                        log.info(f"enrich_voter_data: {i+1}/{len(contacts)}, matched={matched}")
-                else:
-                    unmatched += 1
+                        log.info(f"enrich_voter_data: {idx+1}/{total} "
+                                 f"hi={matched_high} med={matched_medium} lo={matched_low} flags={flagged}")
 
-            except Exception as e:
-                log.warning(f"enrich_voter_data contact error for {name!r}: {e}")
-                errors += 1
-                try:
-                    conn.rollback()  # clear aborted transaction so next insert works
-                except Exception:
-                    pass
+                conn.commit()
 
-        conn.commit()
+    except Exception as exc:
+        log.error(f"enrich_voter_data outer: {exc}", exc_info=True)
+        return {"error": str(exc)}
 
-    except Exception as e:
-        log.error(f"enrich_voter_data_batch outer error: {e}", exc_info=True)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return {"error": str(e), "type": type(e).__name__, "matched_before_error": matched}
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    log.info(f"enrich_voter_data complete: matched={matched} unmatched={unmatched} errors={errors}")
+    total_matched = matched_high+matched_medium+matched_low
     return {
-        "status":          "ok",
-        "total_processed": len(contacts),
-        "matched":         matched,
-        "unmatched":       unmatched,
-        "errors":          errors,
-        "match_rate_pct":  round(matched / max(len(contacts), 1) * 100, 1),
-        "message": (
-            f"{matched} of {len(contacts)} contacts matched to the voter file. "
-            "Next step: call compute_influence_scores."
-        ),
+        "status":"complete","total_contacts":total,
+        "matched":total_matched,"matched_high":matched_high,
+        "matched_medium":matched_medium,"matched_low":matched_low,
+        "flagged":flagged,"no_match":skipped_no_match,"errors":errors,
+        "match_rate_pct":round(total_matched/max(total,1)*100,1),
+        "flag_rate_pct":round(flagged/max(total,1)*100,1),
+        "message":(f"{total_matched}/{total} contacts matched "
+                   f"({matched_high} high / {matched_medium} medium / {matched_low} low). "
+                   f"{flagged} flagged for manual review — call get_voter_enrichment_flags."),
     }
+
+
+def get_voter_enrichment_flags(limit: int = 200, unresolved_only: bool = True) -> dict:
+    """Return contacts flagged during voter enrichment that need manual review."""
+    import json as _json
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                where = "WHERE resolved_sboeid IS NULL" if unresolved_only else ""
+                cur.execute(f"""
+                    SELECT person_id::text,full_name,flag_reason,match_count,
+                           inferred_borough,top_matches,flagged_at,review_notes,resolved_sboeid
+                    FROM voter_enrichment_flags {where}
+                    ORDER BY match_count ASC, full_name LIMIT %s
+                """, (limit,))
+                rows = [dict(r) for r in cur.fetchall()]
+                cur.execute("SELECT COUNT(*) AS cnt FROM voter_enrichment_flags "
+                            + ("WHERE resolved_sboeid IS NULL" if unresolved_only else ""))
+                total = (dict(cur.fetchone()) or {}).get("cnt",0)
+        return {"total_flagged":total,"returned":len(rows),
+                "unresolved_only":unresolved_only,"flags":rows,
+                "tip":"UPDATE voter_enrichment_flags SET resolved_sboeid='NY...' WHERE person_id='...'"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 
 
 # ─── Influence ranking — v1 scoring ──────────────────────────────────────────
@@ -5949,20 +6082,43 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="enrich_voter_data",
             description=(
-                "Match every active Pythia contact to the NYC voter file by name, then store "
-                "their party registration, voter score, assembly/senate/congressional districts, "
-                "and home address in people_voter_enrichment. "
-                "Safe to re-run — upserts on conflict. "
-                "Run setup_influence_tables first. "
-                "Use the optional limit parameter to test on a small batch before running on all contacts."
+                "Match every active Pythia contact to the NYC voter file "
+                "(5.36M voters in the Neon nyc_voters table from the full FOIL voter file). "
+                "ALWAYS strips all existing voter enrichments first for a clean pass. "
+                "Uses a 4-tier confidence strategy: "
+                "(1) name + personal ZIP — high; "
+                "(2) name + personal city — medium; "
+                "(3) name + inferred org borough — medium; "
+                "(4) name only, strictly unique across all of NYC — low. "
+                "Contacts with 2+ ambiguous matches are FLAGGED in voter_enrichment_flags "
+                "for manual review. Call get_voter_enrichment_flags after to see them. "
+                "Returns counts by confidence tier, match rate, and flag count."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "limit": {
                         "type": "integer",
-                        "description": "Max contacts to process. 0 or omit = all contacts (default)."
-                    }
+                        "description": "Process only the first N contacts (0 = all). Use for testing.",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="get_voter_enrichment_flags",
+            description=(
+                "Return contacts flagged during voter enrichment that need manual review. "
+                "Each flag shows the contact name, how many voter records matched, "
+                "and up to 8 candidate matches with ZIP, city, party, and SBOEID. "
+                "Use after enrich_voter_data to see which contacts need manual resolution. "
+                "To resolve: find the correct voter and set resolved_sboeid on the flag row."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max flags to return (default 200)"},
+                    "unresolved_only": {"type": "boolean", "description": "If true (default), only unresolved flags"},
                 },
                 "required": [],
             },
@@ -6219,6 +6375,16 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 log.info(f"enrich_voter_data called, limit={lim}")
                 result = await loop.run_in_executor(None, lambda: enrich_voter_data_batch(lim))
                 return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "get_voter_enrichment_flags":
+                args = arguments or {}
+                lim2 = int(args.get("limit", 200))
+                unresolved = bool(args.get("unresolved_only", True))
+                log.info(f"get_voter_enrichment_flags called limit={lim2} unresolved_only={unresolved}")
+                result = await loop.run_in_executor(
+                    None, lambda: get_voter_enrichment_flags(lim2, unresolved)
+                )
+                return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
             elif name == "compute_influence_scores":
                 log.info("compute_influence_scores called")
