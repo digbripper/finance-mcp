@@ -1318,16 +1318,15 @@ def _enrich_worker(limit: int) -> None:
 
     UPSERT_SQL = """
         INSERT INTO people_voter_enrichment (
-            person_id, voter_address, voter_city, voter_zip, voter_state,
+            person_id, voter_address, voter_city, voter_zip,
             party_label, county_name,
             assembly_district, state_senate_district, congressional_district,
             voter_score, sboeid, match_confidence, match_method
-        ) VALUES (%s,%s,%s,%s,'NY',%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (person_id) DO UPDATE SET
             voter_address=EXCLUDED.voter_address,
             voter_city=EXCLUDED.voter_city,
             voter_zip=EXCLUDED.voter_zip,
-            voter_state=EXCLUDED.voter_state,
             party_label=EXCLUDED.party_label,
             county_name=EXCLUDED.county_name,
             assembly_district=EXCLUDED.assembly_district,
@@ -1398,45 +1397,50 @@ def _enrich_worker(limit: int) -> None:
 
                         result = method = None
 
-                        # Tier 1: name + personal ZIP
-                        if personal_zip:
-                            rows = _qv(cur,first,last,"AND rzip5=%s",(personal_zip,))
-                            best = [r for r in rows if r["status"]=="A"] or rows
-                            if len(best)==1: result,method = best[0],"tier1_zip"
+                        # Try exact first name, then nickname variants
+                        for fn in _name_variants(first):
+                            if result: break
 
-                        # Tier 2: name + personal city
-                        if not result and personal_city:
-                            rows = _qv(cur,first,last,"AND rcity=%s",(personal_city,))
-                            best = [r for r in rows if r["status"]=="A"] or rows
-                            if len(best)==1: result,method = best[0],"tier2_city"
+                            # Tier 1: name + personal ZIP
+                            if personal_zip:
+                                rows = _qv(cur,fn,last,"AND rzip5=%s",(personal_zip,))
+                                best = [r for r in rows if r["status"]=="A"] or rows
+                                if len(best)==1: result,method = best[0],"tier1_zip"
 
-                        # Tier 3: name + org borough
-                        if not result and org_county:
-                            rows = _qv(cur,first,last,"AND countycode=%s",(org_county,))
-                            best = [r for r in rows if r["status"]=="A"] or rows
-                            if len(best)==1: result,method = best[0],"tier3_org_borough"
+                            # Tier 2: name + personal city
+                            if not result and personal_city:
+                                rows = _qv(cur,fn,last,"AND rcity=%s",(personal_city,))
+                                best = [r for r in rows if r["status"]=="A"] or rows
+                                if len(best)==1: result,method = best[0],"tier2_city"
 
-                        # Tier 4: name only, strictly unique in NYC
-                        if not result:
-                            rows = _qv(cur,first,last)
-                            best = [r for r in rows if r["status"]=="A"] or rows
-                            if len(best)==1:
-                                result,method = best[0],"tier4_name_only"
-                            elif len(best)>1:
-                                top = [{"firstname":r.get("firstname",""),
-                                        "lastname":r.get("lastname",""),
-                                        "rzip5":r.get("rzip5",""),
-                                        "rcity":r.get("rcity",""),
-                                        "enrollment":r.get("enrollment",""),
-                                        "sboeid":r.get("sboeid",""),
-                                        "status":r.get("status","")}
-                                       for r in best[:8]]
-                                cur.execute(FLAG_SQL,(
-                                    pid, name, "ambiguous_name", len(best),
-                                    _COUNTY_NAMES.get(org_county,org_county) if org_county else None,
-                                    _json.dumps(top),
-                                ))
-                                flag += 1
+                            # Tier 3: name + org borough
+                            if not result and org_county:
+                                rows = _qv(cur,fn,last,"AND countycode=%s",(org_county,))
+                                best = [r for r in rows if r["status"]=="A"] or rows
+                                if len(best)==1: result,method = best[0],"tier3_org_borough"
+
+                            # Tier 4: name only, strictly unique in NYC
+                            if not result:
+                                rows = _qv(cur,fn,last)
+                                best = [r for r in rows if r["status"]=="A"] or rows
+                                if len(best)==1:
+                                    result,method = best[0],"tier4_name_only"
+                                elif len(best)>1 and fn==first:
+                                    # Flag on primary name only (not nickname variants)
+                                    top = [{"firstname":r.get("firstname",""),
+                                            "lastname":r.get("lastname",""),
+                                            "rzip5":r.get("rzip5",""),
+                                            "rcity":r.get("rcity",""),
+                                            "enrollment":r.get("enrollment",""),
+                                            "sboeid":r.get("sboeid",""),
+                                            "status":r.get("status","")}
+                                           for r in best[:8]]
+                                    cur.execute(FLAG_SQL,(
+                                        pid, name, "ambiguous_name", len(best),
+                                        _COUNTY_NAMES.get(org_county,org_county) if org_county else None,
+                                        _json.dumps(top),
+                                    ))
+                                    flag += 1
 
                         if result and method:
                             conf = ("high" if method=="tier1_zip"
@@ -1451,6 +1455,8 @@ def _enrich_worker(limit: int) -> None:
 
                     except Exception as exc:
                         log.warning(f"enrich {name!r}: {exc}"); err+=1
+                        try: conn.rollback()
+                        except Exception: pass
 
                     # Update progress and commit every 100
                     if (idx+1) % 100 == 0:
