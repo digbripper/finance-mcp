@@ -1357,17 +1357,36 @@ def _enrich_worker(limit: int) -> None:
             stats["voter_score"], voter.get("sboeid",""), confidence, method,
         ))
 
-    def _qv(cur, first, last, extra="", params=()):
+    def _parse_middle_initial(full_name):
+        """'Carlos A. Ortiz' -> 'A'; 'Adriano Espaillat' -> None."""
+        tokens = [t.strip(".,") for t in full_name.strip().split() if t.strip(".,")]
+        while tokens and tokens[0].lower() in _PREFIXES: tokens = tokens[1:]
+        while tokens and tokens[-1].lower() in _SUFFIXES: tokens = tokens[:-1]
+        if len(tokens) >= 3 and tokens[1] and tokens[1][0].isalpha():
+            return tokens[1][0].upper()
+        return None
+
+    def _qv(cur, first, last, extra="", params=(), mi=None):
+        # When the Pythia name carries a middle initial, keep voters whose
+        # middlename is blank OR starts with that initial — cuts ambiguous
+        # matches at the source without excluding initial-less records.
+        mid_clause, mid_params = "", ()
+        if mi:
+            mid_clause = "AND (COALESCE(middlename,'') = '' OR middlename ILIKE %s)"
+            mid_params = (mi + "%",)
         cur.execute(f"""
-            SELECT lastname,firstname,raddnumber,rstreetname,rcity,rzip5,
-                   countycode,cd,sd,ad,enrollment,status,sboeid,voterhistory
+            SELECT lastname,firstname,middlename,namesuffix,dob,gender,
+                   raddnumber,rstreetname,rcity,rzip5,
+                   countycode,cd,sd,ad,enrollment,status,sboeid,voterhistory,
+                   regdate,lastvoterdate,prevname,prevcounty
             FROM nyc_voters
             WHERE lastname=%s AND firstname=%s
               AND status IN ('A','AM','AF','AP','AU','I')
+              {mid_clause}
               {extra}
             ORDER BY CASE status WHEN 'A' THEN 1 ELSE 2 END
             LIMIT 25
-        """, (last, first)+params)
+        """, (last, first)+mid_params+params)
         return [dict(r) for r in cur.fetchall()]
 
     contacts = _enrich_status.get("_contacts", [])
@@ -1396,6 +1415,7 @@ def _enrich_worker(limit: int) -> None:
                             if org_county: break
 
                         result = method = None
+                        mi = _parse_middle_initial(name)
 
                         # Try exact first name, then nickname variants
                         for fn in _name_variants(first):
@@ -1403,25 +1423,25 @@ def _enrich_worker(limit: int) -> None:
 
                             # Tier 1: name + personal ZIP
                             if personal_zip:
-                                rows = _qv(cur,fn,last,"AND rzip5=%s",(personal_zip,))
+                                rows = _qv(cur,fn,last,"AND rzip5=%s",(personal_zip,),mi=mi)
                                 best = [r for r in rows if r["status"]=="A"] or rows
                                 if len(best)==1: result,method = best[0],"tier1_zip"
 
                             # Tier 2: name + personal city
                             if not result and personal_city:
-                                rows = _qv(cur,fn,last,"AND rcity=%s",(personal_city,))
+                                rows = _qv(cur,fn,last,"AND rcity=%s",(personal_city,),mi=mi)
                                 best = [r for r in rows if r["status"]=="A"] or rows
                                 if len(best)==1: result,method = best[0],"tier2_city"
 
                             # Tier 3: name + org borough
                             if not result and org_county:
-                                rows = _qv(cur,fn,last,"AND countycode=%s",(org_county,))
+                                rows = _qv(cur,fn,last,"AND countycode=%s",(org_county,),mi=mi)
                                 best = [r for r in rows if r["status"]=="A"] or rows
                                 if len(best)==1: result,method = best[0],"tier3_org_borough"
 
                             # Tier 4: name only, strictly unique in NYC
                             if not result:
-                                rows = _qv(cur,fn,last)
+                                rows = _qv(cur,fn,last,mi=mi)
                                 best = [r for r in rows if r["status"]=="A"] or rows
                                 if len(best)==1:
                                     result,method = best[0],"tier4_name_only"
@@ -1429,11 +1449,19 @@ def _enrich_worker(limit: int) -> None:
                                     # Flag on primary name only (not nickname variants)
                                     top = [{"firstname":r.get("firstname",""),
                                             "lastname":r.get("lastname",""),
+                                            "middlename":r.get("middlename",""),
+                                            "namesuffix":r.get("namesuffix",""),
+                                            "dob":r.get("dob",""),
+                                            "gender":r.get("gender",""),
                                             "rzip5":r.get("rzip5",""),
                                             "rcity":r.get("rcity",""),
                                             "enrollment":r.get("enrollment",""),
                                             "sboeid":r.get("sboeid",""),
-                                            "status":r.get("status","")}
+                                            "status":r.get("status",""),
+                                            "regdate":r.get("regdate",""),
+                                            "lastvoterdate":r.get("lastvoterdate",""),
+                                            "prevname":r.get("prevname",""),
+                                            "prevcounty":r.get("prevcounty","")}
                                            for r in best[:8]]
                                     cur.execute(FLAG_SQL,(
                                         pid, name, "ambiguous_name", len(best),
