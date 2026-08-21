@@ -295,24 +295,80 @@ def best_match(name: str, index: dict, keys: list[str]) -> tuple[Optional[dict],
 #   low    (name only, otherwise)           → exclude entirely, log unconfirmed
 
 _NICKNAMES: dict[str, list[str]] = {
-    "steve": ["steven", "stephen"], "bob":  ["robert"],
-    "bill":  ["william"],           "will": ["william"],
-    "jim":   ["james"],             "jeff": ["jeffrey"],
-    "joe":   ["joseph"],            "mike": ["michael"],
-    "tom":   ["thomas"],            "tim":  ["timothy"],
-    "dan":   ["daniel"],            "dave": ["david"],
-    "rob":   ["robert"],            "rich": ["richard"],
-    "dick":  ["richard"],           "nick": ["nicholas"],
-    "matt":  ["matthew"],           "andy": ["andrew"],
-    "tony":  ["anthony"],           "ed":   ["edward", "edmund"],
-    "ted":   ["theodore", "edward"],"sam":  ["samuel"],
-    "ben":   ["benjamin"],          "ken":  ["kenneth"],
-    "liz":   ["elizabeth"],         "sue":  ["susan"],
-    "kate":  ["katherine"],         "chris": ["christopher"],
+    # Short → full
+    "dan": ["daniel", "danny"], "bill": ["william", "willy", "will"],
+    "bob": ["robert", "rob", "bobby"], "jim": ["james", "jimmy"],
+    "joe": ["joseph", "joey"], "jack": ["john", "jackson"],
+    "mike": ["michael", "micky"], "dave": ["david", "davy"],
+    "tom": ["thomas", "tommy"], "tim": ["timothy", "timmy"],
+    "chris": ["christopher", "christian"], "matt": ["matthew"],
+    "pat": ["patricia", "patrick"], "liz": ["elizabeth", "lisa", "beth", "eliza"],
+    "beth": ["elizabeth", "bethany"],
+    "kate": ["katherine", "kathryn", "kathy", "katie", "caitlin"],
+    "kathy": ["katherine", "kathryn", "kathleen"], "sue": ["susan", "susanna"],
+    "jen": ["jennifer", "jenny"], "becky": ["rebecca"], "becca": ["rebecca"],
+    "amy": ["amelia"], "maggie": ["margaret", "magdalena"],
+    "peg": ["margaret", "peggy"], "meg": ["margaret", "megan"],
+    "nan": ["nancy", "ann", "anne"], "ann": ["anne", "anna", "annette"],
+    "al": ["albert", "alfred", "alan", "alejandro"],
+    "alex": ["alexander", "alexis", "alejandro"], "fred": ["frederick", "alfred"],
+    "ted": ["theodore", "edward"], "ed": ["edward", "edgar", "edmund"],
+    "rick": ["richard", "eric"], "rich": ["richard"], "dick": ["richard"],
+    "nick": ["nicholas", "nicolas"], "tony": ["anthony", "antoinette"],
+    "andy": ["andrew"], "drew": ["andrew"], "ben": ["benjamin"],
+    "sam": ["samuel", "samantha"], "max": ["maximilian", "maxwell"],
+    "charlie": ["charles", "charlotte"], "chuck": ["charles"],
+    "frank": ["francis", "franklin", "francisco"], "hank": ["henry", "harold"],
+    "harry": ["harold", "henry", "harrison"], "don": ["donald", "donovan"],
+    "ron": ["ronald"], "ray": ["raymond"], "len": ["leonard", "lenny"],
+    "larry": ["lawrence", "laurence"], "lori": ["lorraine", "laura"],
+    "laura": ["lorraine", "laurie"], "carol": ["caroline", "carolyn", "carole"],
+    "trish": ["patricia"], "tina": ["christina", "martina"], "eve": ["evelyn"],
+    "yvonne": ["evonne"], "gus": ["augustus", "gustavo"],
+    "lou": ["louis", "louise", "luigi"], "vinny": ["vincent"], "vince": ["vincent"],
+    "zach": ["zachary"], "josh": ["joshua"], "jay": ["jason", "james"],
+    "ken": ["kenneth"], "stan": ["stanley"], "steve": ["steven", "stephen"],
+    "jeff": ["jeffrey"], "brad": ["bradley"], "glen": ["glenn"],
+    "rob": ["robert", "robin"], "will": ["william"],
+    # Full → nickname
+    "william": ["bill", "will", "billy", "willy"],
+    "robert": ["bob", "rob", "bobby", "robbie"],
+    "richard": ["rick", "rich", "dick", "ricky"],
+    "james": ["jim", "jimmy", "jamie", "jay"], "john": ["jack", "johnny", "jon"],
+    "michael": ["mike", "micky", "mikey"], "thomas": ["tom", "tommy"],
+    "charles": ["charlie", "chuck", "chas"], "joseph": ["joe", "joey", "jose"],
+    "daniel": ["dan", "danny"], "david": ["dave", "davy"],
+    "matthew": ["matt", "matty"], "andrew": ["andy", "drew"],
+    "christopher": ["chris", "kit"], "timothy": ["tim", "timmy"],
+    "patrick": ["pat", "paddy"], "benjamin": ["ben", "benny"],
+    "nicholas": ["nick", "nicky"], "anthony": ["tony"],
+    "edward": ["ed", "eddie", "ted", "ned"],
+    "elizabeth": ["liz", "beth", "eliza", "lisa", "bette"],
+    "margaret": ["meg", "maggie", "peg", "peggy", "marge"],
+    "katherine": ["kate", "kathy", "katie", "kat"],
+    "patricia": ["pat", "trish", "tricia"], "jennifer": ["jen", "jenny"],
+    "rebecca": ["becky", "becca"], "susan": ["sue", "susie"],
+    "barbara": ["barb", "babs", "barbie"], "carolyn": ["carol", "carrie"],
+    "carolyne": ["carol"], "dorothy": ["dot", "dottie", "dory"],
 }
 
 def _name_variants(firstname: str) -> list[str]:
-    return [firstname] + _NICKNAMES.get(firstname.lower(), [])
+    """All name forms to try, primary first, UPPERCASED (the voter file stores
+    uppercase names — the old version returned lowercase variants, which could
+    never match firstname='DANIEL'). Bidirectional: a name reaches its listed
+    expansions, any key that lists it, and that key's other expansions."""
+    lower = firstname.lower().strip()
+    if not lower:
+        return [firstname]
+    variants = {lower}
+    for v in _NICKNAMES.get(lower, []):
+        variants.add(v)
+    for key, values in _NICKNAMES.items():
+        if lower in values:
+            variants.add(key)
+            variants.update(values)
+    ordered = [firstname.upper()] + sorted(v.upper() for v in variants if v != lower)
+    return ordered
 
 # Manhattan business/PO zips (101xx, 102xx) belong to the same area as
 # residential 100xx — a 10021 voter giving from a 10154 office is the norm.
@@ -1416,8 +1472,12 @@ def _enrich_worker(limit: int) -> None:
 
                         result = method = None
                         mi = _parse_middle_initial(name)
+                        # Ambiguous candidates pooled across ALL name variants
+                        # (the old code only flagged on the primary-name pass,
+                        # so ambiguity under a variant name was silently lost).
+                        union_cands: dict[str, dict] = {}
 
-                        # Try exact first name, then nickname variants
+                        # Try exact first name, then nickname/formal variants
                         for fn in _name_variants(first):
                             if result: break
 
@@ -1439,36 +1499,31 @@ def _enrich_worker(limit: int) -> None:
                                 best = [r for r in rows if r["status"]=="A"] or rows
                                 if len(best)==1: result,method = best[0],"tier3_org_borough"
 
-                            # Tier 4: name only, strictly unique in NYC
+                            # Tier 4: name only — pool candidates for later
                             if not result:
                                 rows = _qv(cur,fn,last,mi=mi)
                                 best = [r for r in rows if r["status"]=="A"] or rows
                                 if len(best)==1:
                                     result,method = best[0],"tier4_name_only"
-                                elif len(best)>1 and fn==first:
-                                    # Flag on primary name only (not nickname variants)
-                                    top = [{"firstname":r.get("firstname",""),
-                                            "lastname":r.get("lastname",""),
-                                            "middlename":r.get("middlename",""),
-                                            "namesuffix":r.get("namesuffix",""),
-                                            "dob":r.get("dob",""),
-                                            "gender":r.get("gender",""),
-                                            "rzip5":r.get("rzip5",""),
-                                            "rcity":r.get("rcity",""),
-                                            "enrollment":r.get("enrollment",""),
-                                            "sboeid":r.get("sboeid",""),
-                                            "status":r.get("status",""),
-                                            "regdate":r.get("regdate",""),
-                                            "lastvoterdate":r.get("lastvoterdate",""),
-                                            "prevname":r.get("prevname",""),
-                                            "prevcounty":r.get("prevcounty","")}
-                                           for r in best[:8]]
-                                    cur.execute(FLAG_SQL,(
-                                        pid, name, "ambiguous_name", len(best),
-                                        _COUNTY_NAMES.get(org_county,org_county) if org_county else None,
-                                        _json.dumps(top),
-                                    ))
-                                    flag += 1
+                                else:
+                                    for r in best:
+                                        union_cands.setdefault(r.get("sboeid",""), r)
+
+                        # Fallback: some people go by their middle name.
+                        mn = (contact.get("middle_name") or "").strip()
+                        if not result and mn.isalpha() and len(mn) > 1:
+                            rows = _qv(cur, mn.upper(), last)
+                            best = [r for r in rows if r["status"]=="A"] or rows
+                            if len(best)==1 and not union_cands:
+                                result,method = best[0],"middle_name_match"
+                            else:
+                                for r in best:
+                                    union_cands.setdefault(r.get("sboeid",""), r)
+
+                        # A single candidate across the whole variant union is
+                        # an unambiguous match even though no one pass was unique.
+                        if not result and len(union_cands) == 1:
+                            result,method = next(iter(union_cands.values())),"tier4_variant_unique"
 
                         if result and method:
                             conf = ("high" if method=="tier1_zip"
@@ -1478,7 +1533,36 @@ def _enrich_worker(limit: int) -> None:
                             if conf=="high": mh+=1
                             elif conf=="medium": mm+=1
                             else: ml+=1
-                        elif not result:
+                        elif union_cands:
+                            # Ambiguous across the union → one flag with the
+                            # combined candidate list (actives first).
+                            cands = sorted(union_cands.values(),
+                                           key=lambda r: (r.get("status")!="A",
+                                                          -(int(r.get("lastvoterdate") or 0)
+                                                            if str(r.get("lastvoterdate") or "").isdigit() else 0)))
+                            top = [{"firstname":r.get("firstname",""),
+                                    "lastname":r.get("lastname",""),
+                                    "middlename":r.get("middlename",""),
+                                    "namesuffix":r.get("namesuffix",""),
+                                    "dob":r.get("dob",""),
+                                    "gender":r.get("gender",""),
+                                    "rzip5":r.get("rzip5",""),
+                                    "rcity":r.get("rcity",""),
+                                    "enrollment":r.get("enrollment",""),
+                                    "sboeid":r.get("sboeid",""),
+                                    "status":r.get("status",""),
+                                    "regdate":r.get("regdate",""),
+                                    "lastvoterdate":r.get("lastvoterdate",""),
+                                    "prevname":r.get("prevname",""),
+                                    "prevcounty":r.get("prevcounty","")}
+                                   for r in cands[:8]]
+                            cur.execute(FLAG_SQL,(
+                                pid, name, "ambiguous_name", len(union_cands),
+                                _COUNTY_NAMES.get(org_county,org_county) if org_county else None,
+                                _json.dumps(top),
+                            ))
+                            flag += 1
+                        else:
                             skip+=1
 
                     except Exception as exc:
@@ -1569,6 +1653,7 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT p.id::text AS person_id, p.full_name,
+                           p.middle_name          AS middle_name,
                            p.personal_postal_code AS personal_zip,
                            p.personal_city        AS personal_city,
                            STRING_AGG(DISTINCT o.location, ' | ') AS org_locations,
@@ -1579,7 +1664,7 @@ def enrich_voter_data_batch(limit: int = 0) -> dict:
                     LEFT JOIN organizations_organization o
                            ON o.id = po.organization_id
                     WHERE p.is_active = TRUE
-                    GROUP BY p.id, p.full_name,
+                    GROUP BY p.id, p.full_name, p.middle_name,
                              p.personal_postal_code, p.personal_city
                     ORDER BY p.full_name
                 """)
