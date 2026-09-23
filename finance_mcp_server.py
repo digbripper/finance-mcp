@@ -650,6 +650,11 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
                                   ),
                            computed_at         = NOW()
                      WHERE person_id = %s
+                       -- Elected officials are scored positionally
+                       -- (algorithm_version 'politician_v1', set by
+                       -- pythia-web scripts/politician-scores.mjs); financial
+                       -- enrichment must not overwrite those rows.
+                       AND algorithm_version <> 'politician_v1'
                 """, (
                     fin_score, composite,
                     fin_score,
@@ -1097,6 +1102,11 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
                                   ),
                            computed_at         = NOW()
                      WHERE person_id = %s
+                       -- Elected officials are scored positionally
+                       -- (algorithm_version 'politician_v1', set by
+                       -- pythia-web scripts/politician-scores.mjs); financial
+                       -- enrichment must not overwrite those rows.
+                       AND algorithm_version <> 'politician_v1'
                 """, (
                     fin_score, composite,
                     fin_score,
@@ -1870,7 +1880,19 @@ def compute_influence_scores_batch(person_ids_filter: list[str] | None = None) -
             revenue_990_map = {}  # tables may not exist yet
 
         with conn.cursor() as cur:
-            cur.execute("SELECT id::text AS person_id, full_name FROM people_person WHERE is_active = TRUE")
+            # Skip anyone scored by the politician formula: those scores come
+            # from office + network (pythia-web lib/politician-scores.js), not
+            # from the donations/lobbying components computed here.
+            cur.execute("""
+                SELECT p.id::text AS person_id, p.full_name
+                FROM people_person p
+                WHERE p.is_active = TRUE
+                  AND NOT EXISTS (
+                      SELECT 1 FROM people_influence_scores s
+                      WHERE s.person_id = p.id
+                        AND s.algorithm_version = 'politician_v1'
+                  )
+            """)
             all_people = list(cur.fetchall())
 
         # If filtering to specific contacts (e.g. after auto-enrichment), only score those
