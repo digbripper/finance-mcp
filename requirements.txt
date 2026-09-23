@@ -1,8 +1,15 @@
-mcp>=1.0.0
-requests>=2.31.0
-psycopg2-binary>=2.9.9
-rapidfuzz>=3.6.1
-python-dotenv>=1.0.0
-starlette>=0.36.0
-uvicorn>=0.27.0
-httpx>=0.26.0
+# mcp 2.0 (2026-07-28) removed the low-level Server decorator API this server is
+# built on — @mcp_server.list_tools() / @mcp_server.call_tool() no longer exist,
+# so an unpinned install fails at import with:
+#   AttributeError: 'Server' object has no attribute 'list_tools'
+# Staying on the 1.x line until the tool wiring is ported to the 2.x API.
+mcp>=1.29.0,<2.0.0
+# Major-version caps on the rest: this broke only because a rebuild with a cold
+# Docker cache re-resolved an unpinned dependency to a new major.
+requests>=2.31.0,<3
+psycopg2-binary>=2.9.9,<3
+rapidfuzz>=3.6.1,<4
+python-dotenv>=1.0.0,<2
+starlette>=0.36.0,<1
+uvicorn>=0.27.0,<1
+httpx>=0.26.0,<1
