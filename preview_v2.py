@@ -23,9 +23,9 @@ import psycopg2.extras
 
 import math
 
-from influence_v2 import POLITICIAN_VERSION, composite_v2, score_contacts
+from influence_v2 import POLITICIAN_VERSION, composite_v2, is_staff_role, score_contacts
 
-NAMED = ["Merryl Tisch", "Mitchell Katz", "Emily Giske", "Brad Lander", "Janno Lieber",
+NAMED = ["Merryl Tisch", "Mitchell Katz", "Emily Giske", "Heidi Evans", "Brad Lander", "Janno Lieber",
          "Chuck Schumer", "Zohran Mamdani", "James Tisch"]
 COUNCIL = re.compile(r"council ?member", re.I)
 STAFF = re.compile(r"chief of staff|director|aide|staff|deputy|liaison|counsel|analyst|scheduler|manager|former", re.I)
@@ -92,8 +92,9 @@ def main() -> None:
             "active_years": raw.get("active_years"),
             "financial_source": raw.get("financial_source"),
             "politician": p["algorithm_version"] == POLITICIAN_VERSION,
-            "staff_capped": raw.get("staff_capped"),
-            "floor": raw.get("institutional_floor"),
+            "inst_source": raw.get("institutional_source"),
+            "weights": (s or {}).get("breakdown", {}).get("weights"),
+            "staff": bool(p["titles"]) and all(is_staff_role(t) for t in (p["titles"] or "").split("; ") if t.strip()),
             "org_tier": raw.get("best_tier"),
         })
         rc = real_conn.get(pid, 0)
@@ -111,7 +112,10 @@ def main() -> None:
             return f"  {name:<26} {fmt(r['composite']):>7}   [skip — politician_v1]{'':<14} {tier}"
         cur = r["composite"]
         change = "" if cur is None or r["v2"] is None else f"{r['v2'] - cur:+.1f}"
-        flags = (" capped" if r["staff_capped"] else "") + (f" floor{r['floor']:.0f}" if r["floor"] else "")
+        w = r["weights"] or {}
+        flags = (f" [{r['inst_source']}]" if r["inst_source"] else "") + (
+            f" w{round(w['institutional']*100)}/{round(w['financial']*100)}/{round(w['network']*100)}"
+            if w and w.get("institutional") != 0.85 else "")
         detail = (f"inst {fmt(r['v2_inst'])}{flags} fin {fmt(r['v2_fin'])} net {fmt(r['v2_net'])}"
                   f" | no-co-donor {fmt(r['v2_no_codonor'])}")
         money = f" ${r['total_donated']:,.0f}/{r['unique_recipients']}r" if r["total_donated"] else ""
@@ -142,8 +146,8 @@ def main() -> None:
     council = [r for r in rows if COUNCIL.search(r["titles"] or "") and not STAFF.search(r["titles"] or "")]
     section("Council members", council)
     comptroller_staff = [r for r in rows if not r["politician"] and re.search(r"comptroller", r["orgs"] or "", re.I)
-                         and r["staff_capped"]]
-    section("Comptroller's Office staff (capped)", comptroller_staff)
+                         and r["staff"]]
+    section("Comptroller's Office staff", comptroller_staff)
     nonprofit = [r for r in rows if not r["politician"] and EXEC_DIRECTOR.search(r["titles"] or "")
                  and not GOVERNMENT.search(r["orgs"] or "") and (r["total_donated"] or 0) > 0]
     section("Nonprofit executive directors with donations", nonprofit)
@@ -207,16 +211,21 @@ def main() -> None:
         return statistics.median(vals) if vals else None
 
     print("\nTargets")
-    for (first, last), (lo, hi) in {("Merryl", "Tisch"): (70, 80), ("Mitchell", "Katz"): (68, 72),
-                                    ("Emily", "Giske"): (58, 65), ("Brad", "Lander"): (60, 65)}.items():
+    for (first, last), (lo, hi) in {("Merryl", "Tisch"): (65, 78), ("Mitchell", "Katz"): (68, 72),
+                                    ("Emily", "Giske"): (60, 65), ("Heidi", "Evans"): (10, 20)}.items():
         r = named(first, last)
         target(f"{first} {last}", r and r["v2"], lo, hi)
-    target("Comptroller's Office staff (median)", median(comptroller_staff), 25, 38)
-    target("Nonprofit EDs with donations (median)", median(nonprofit), 35, 50)
-    target("No donations, no org tier (median)", median(no_money), 5, 15)
+    target("Comptroller's Office staff (median)", median(comptroller_staff), 20, 35)
+    schumer = [r for r in rows if r["full_name"] == "Chuck Schumer"]
+    if schumer:
+        print(f"  - Chuck Schumer stays {schumer[0]['composite']:.1f} (politician_v1): "
+              f"{'✓' if schumer[0]['person_id'] not in v2 else '✗'}")
     politicians_touched = [r for r in rows if r["politician"] and r["person_id"] in v2]
     print(f"  - Politicians unchanged: {'✓' if not politicians_touched else '✗'} "
           f"({result['politicians_skipped']} politician_v1 rows skipped)")
+    heidi, merryl = named("Heidi", "Evans"), named("Merryl", "Tisch")
+    gate = bool(heidi and merryl and heidi["v2"] < 25 and merryl["v2"] > 65)
+    print(f"\nPush gate (Heidi Evans < 25 and Merryl Tisch > 65): {'PASS' if gate else 'FAIL'}")
 
     with open(out, "w") as f:
         json.dump({

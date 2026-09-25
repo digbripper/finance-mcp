@@ -5,13 +5,16 @@ the DB). Plain Python 3.9+ with no dependencies beyond a psycopg2 connection
 using RealDictCursor, so the preview runs exactly the code that deploys.
 
     composite = institutional × 0.85 + financial × 0.05 + network × 0.10
+    (Tier 1 trusted advisors / major donors: 0.60 / 0.30 / 0.10)
 
-Position dominates; donations and connections add to it. (Weights chosen
-2026-09-25 as the best fit to hand-set targets for known people — see
-preview_v2.py.) Lobbying and engagement are no longer scored (stored as 0)
-and there is no stacking bonus. Rows with algorithm_version 'politician_v1' (elected
-officials, scored by office in pythia-web scripts/politician-scores.mjs) are
-never touched.
+Position dominates; donations and connections add to it. Institutional is the
+elected office's score for elected officials; for everyone else it comes from
+person tier, tier-basis floors and a small org-tier bonus, capped at 75.
+(Weights chosen 2026-09-25 as the best fit to hand-set targets for known
+people — see preview_v2.py.) Lobbying and engagement are no longer scored
+(stored as 0) and there is no stacking bonus. Rows with algorithm_version
+'politician_v1' (elected officials, scored by office in pythia-web
+scripts/politician-scores.mjs) are never touched.
 """
 from __future__ import annotations
 
@@ -24,19 +27,27 @@ ALGORITHM_VERSION = "v2.0"
 POLITICIAN_VERSION = "politician_v1"
 WEIGHTS_V2 = dict(institutional=0.85, financial=0.05, network=0.10)
 
-# person_tier_basis values that mark influence an org tier can't see.
+# Donors and advisors whose influence is money and relationships: financial
+# gets real weight for them.
 ADVISOR_BASES = ("trusted_advisor", "major_donor")
-ADVISOR_INSTITUTIONAL_FLOOR = 40.0
-# Person-tier-1 designations get higher floors: an appointed executive runs a
-# large agency whatever its org tier (Mitchell Katz, Janno Lieber); a trusted
-# advisor's influence is relationships, not position (Emily Giske).
-APPOINTED_EXECUTIVE_FLOOR = 75.0
-TRUSTED_ADVISOR_TIER1_FLOOR = 65.0
+WEIGHTS_ADVISOR = dict(institutional=0.60, financial=0.30, network=0.10)
+
+# Non-elected institutional score (2026-09-25): person tier and tier-basis
+# floors, plus a small org-tier bonus, never above 75. No 990 revenue, no
+# seniority or decision-maker bonuses — those stacked a nonprofit VP at a
+# $82M org to 100.
+NON_ELECTED_MAX = 75.0
+TIER_BASIS_FLOORS = {
+    "appointed_executive": 75.0,  # MTA / H+H chiefs — at the ceiling
+    "trusted_advisor": 65.0,      # Emily Giske, Merryl Tisch
+    "manual": 50.0,               # manually set tier 1
+}
+DEFAULT_FLOOR = 10.0
+ORG_TIER_BONUS = {1: 10.0, 2: 5.0, 3: 2.0}
 
 # Staff inherit none of their principal's position: a budget analyst in the
-# Comptroller's Office is not the Comptroller. Any score reached through a
-# staff title is capped here; their real influence shows up in proximity.
-STAFF_INSTITUTIONAL_CAP = 40.0
+# Comptroller's Office is not the Comptroller. A staff title never earns an
+# office's score; their real influence shows up in proximity.
 STAFF_TITLE_KEYWORDS = [
     "director", "deputy director", "counsel", "chief of staff",
     "deputy chief", "analyst", "coordinator", "associate",
@@ -113,23 +124,56 @@ _NOT_A_POSITION = re.compile(
     r"\bfor\b|friends of|mayoral", re.I)
 
 
-def org_position_score(org_name: str | None) -> float:
-    org = (org_name or "").replace("’", "'")
-    if not org or _NOT_A_POSITION.search(org):
-        return 0.0
-    return _government_position_score("", org)
+# Appointed (not elected) entries in _GOV_POSITION_SCORES, by their first
+# keyword. Appointees are non-elected: their position counts, capped at 75.
+_APPOINTED_KEYS = {
+    "secretary of state", "director of the fbi", "nypd commissioner", "schools chancellor",
+    "mta chairman", "fire commissioner", "commissioner",
+}
 
 
-def institutional_floor(basis: str | None, person_tier) -> float:
-    if basis == "appointed_executive" and person_tier == 1:
-        return APPOINTED_EXECUTIVE_FLOOR
-    if basis == "trusted_advisor" and person_tier == 1:
-        return TRUSTED_ADVISOR_TIER1_FLOOR
-    if basis in ADVISOR_BASES:
-        return ADVISOR_INSTITUTIONAL_FLOOR
+def _position(text: str, elected: bool) -> float:
+    t = (text or "").lower()
+    for keywords, score in _GOV_POSITION_SCORES:
+        if (keywords[0] in _APPOINTED_KEYS) == elected:
+            continue
+        if any(kw in t for kw in keywords):
+            return float(score)
     return 0.0
 
-TIER_BASE = {1: 80, 2: 50, 3: 25}
+
+_SEEKING = re.compile(r"\b(candidate|nominee|running for)\b", re.I)
+
+
+def position_scores(title: str, org_name: str | None) -> tuple[float, float]:
+    """(elected, appointed) position score for one affiliation. Staff titles
+    earn neither, nor do candidates ("Candidate" on a US House link); an org
+    name counts only when the org IS the position."""
+    if is_staff_role(title) or _SEEKING.search(title or ""):
+        return 0.0, 0.0
+    org = (org_name or "").replace("\u2019", "'")
+    org_ok = bool(org) and not _NOT_A_POSITION.search(org)
+    elected = max(_position(title, True), _position(org, True) if org_ok else 0.0)
+    appointed = _position(title, False)
+    return elected, appointed
+
+
+def non_elected_institutional(person_tier, basis: str | None, org_tier) -> float:
+    floor = TIER_BASIS_FLOORS.get(basis, DEFAULT_FLOOR)
+    bonus = ORG_TIER_BONUS.get(org_tier, 0.0)
+    if person_tier == 2:
+        base = 35.0
+    elif person_tier == 1 and basis not in TIER_BASIS_FLOORS:
+        base = 50.0
+    else:
+        base = 10.0
+    return min(NON_ELECTED_MAX, max(floor, base) + bonus)
+
+
+def weights_for(person_tier, basis: str | None) -> dict:
+    if person_tier == 1 and basis in ADVISOR_BASES:
+        return WEIGHTS_ADVISOR
+    return WEIGHTS_V2
 
 
 # ─── Institutional helpers (moved from finance_mcp_server.py, unchanged) ─────
@@ -304,8 +348,9 @@ def calculate_financial_score_v2(total_donated: float, unique_officials: int,
     return float(min(100.0, base + breadth_bonus + spike_bonus + consistency_bonus))
 
 
-def composite_v2(institutional: float, financial: float, network: float) -> float:
-    w = WEIGHTS_V2
+def composite_v2(institutional: float, financial: float, network: float,
+                 weights: dict | None = None) -> float:
+    w = weights or WEIGHTS_V2
     return round(min(100.0, w["institutional"] * float(institutional or 0)
                      + w["financial"] * float(financial or 0)
                      + w["network"] * float(network or 0)), 2)
@@ -489,24 +534,6 @@ def score_contacts(conn, person_ids: list[str] | None = None) -> dict:
         net_map = {r["person_id"]: int(r["total_connections"] or 0) for r in cur.fetchall()}
 
         try:
-            cur.execute("""
-                SELECT o.id::text AS org_id,
-                    GREATEST(MAX(COALESCE(n.total_revenue, 0)), MAX(COALESCE(u.total_receipts, 0))) AS best
-                FROM organizations_organization o
-                LEFT JOIN organizations_990_data n
-                    ON n.organization_id = o.id AND n.match_confidence > 70
-                LEFT JOIN organizations_union_data u
-                    ON u.organization_id = o.id AND u.match_confidence > 70
-                WHERE (n.total_revenue IS NOT NULL AND n.total_revenue > 0)
-                   OR (u.total_receipts IS NOT NULL AND u.total_receipts > 0)
-                GROUP BY o.id
-            """)
-            revenue_map = {r["org_id"]: int(r["best"]) for r in cur.fetchall()}
-        except Exception:
-            conn.rollback()
-            revenue_map = {}
-
-        try:
             cur.execute("SELECT person_id::text, basis FROM person_tier_basis")
             basis_map = {r["person_id"]: r["basis"] for r in cur.fetchall()}
         except Exception:
@@ -551,9 +578,9 @@ def score_contacts(conn, person_ids: list[str] | None = None) -> dict:
             continue
 
         # ── Institutional ─────────────────────────────────────────────────────
-        # v1.0 inputs (org tier, 990/union revenue, seniority, decision-maker,
-        # multiple tier-1 orgs, government position), scored per affiliation;
-        # staff titles capped, then person-tier designations floored.
+        # Elected office → that office's score. Everyone else → person tier,
+        # tier-basis floor and org-tier bonus (or an appointed position held
+        # under a principal title), capped at 75. "Former" roles don't count.
         affs = []
         former_skipped = 0
         for a in inst["affiliations"]:
@@ -562,32 +589,20 @@ def score_contacts(conn, person_ids: list[str] | None = None) -> dict:
                 former_skipped += 1
                 continue
             affs.append({**a, "job_title": title})
-        bonus = (min(15, max((int(a["seniority"] or 0) for a in affs), default=0) * 2)
-                 + (15 if any(a["is_decision_maker"] for a in affs) else 0)
-                 + min(10, max(0, len({a["org_id"] for a in affs if a["org_tier"] == 1}) - 1) * 5))
-        institutional = 5.0
-        uncapped = 5.0
-        staff_capped = False
-        revenue = None
+        elected = appointed = 0.0
         for a in affs:
-            tier_base = TIER_BASE.get(a["org_tier"], 5) if a["org_tier"] else 5
-            org_revenue = revenue_map.get(a["org_id"])
-            if org_revenue and (revenue is None or org_revenue > revenue):
-                revenue = org_revenue
-            score = min(100.0, max(float(tier_base), _revenue_to_institutional_score(org_revenue)) + bonus)
-            score = max(score, _government_position_score(a["job_title"] or "", ""),
-                        org_position_score(a["org_name"]))
-            uncapped = max(uncapped, score)
-            if is_staff_role(a["job_title"]) and score > STAFF_INSTITUTIONAL_CAP:
-                score = STAFF_INSTITUTIONAL_CAP
-                staff_capped = True
-            institutional = max(institutional, score)
-        staff_capped = staff_capped and institutional < uncapped
+            e, ap = position_scores(a["job_title"], a["org_name"])
+            elected, appointed = max(elected, e), max(appointed, ap)
         tier = min((a["org_tier"] for a in affs if a["org_tier"]), default=None)
         basis = basis_map.get(pid)
-        floor = institutional_floor(basis, inst.get("person_tier"))
-        floored = floor > institutional
-        institutional = max(institutional, floor)
+        person_tier = inst.get("person_tier")
+        if elected > 0:
+            institutional, inst_source = elected, "elected_office"
+        else:
+            by_tier = non_elected_institutional(person_tier, basis, tier)
+            institutional = min(NON_ELECTED_MAX, max(by_tier, appointed))
+            inst_source = "appointed_position" if appointed > by_tier else "tier"
+        weights = weights_for(person_tier, basis)
 
         # ── Financial ─────────────────────────────────────────────────────────
         rel = rel_map.get(pid)
@@ -601,19 +616,17 @@ def score_contacts(conn, person_ids: list[str] | None = None) -> dict:
         total_conn = net_map.get(pid, 0)
         network = min(100.0, math.log10(total_conn + 1) * 30) if total_conn > 0 else 0.0
 
-        composite = composite_v2(institutional, financial, network)
+        composite = composite_v2(institutional, financial, network, weights)
 
         raw = {}
         if fin_in["trusted_enrichment"]:
             raw.update({k: stored_raw[k] for k in _CARRY_RAW if k in stored_raw})
         raw.update({
             "best_tier": tier,
-            "is_decision_maker": any(a["is_decision_maker"] for a in affs),
             "former_affiliations_skipped": former_skipped,
-            "revenue_990": revenue,
+            "person_tier": person_tier,
+            "institutional_source": inst_source,
             "tier_basis": basis,
-            "staff_capped": staff_capped,
-            "institutional_floor": floor if floored else None,
             "total_donated": fin_in["total_donated"],
             "unique_recipients": fin_in["unique_recipients"],
             "max_single_donation": fin_in["max_single_donation"],
@@ -642,7 +655,7 @@ def score_contacts(conn, person_ids: list[str] | None = None) -> dict:
                 "network": round(network, 2),
                 "lobbying": 0.0,
                 "engagement": 0.0,
-                "weights": WEIGHTS_V2,
+                "weights": weights,
                 "raw": raw,
             },
         })

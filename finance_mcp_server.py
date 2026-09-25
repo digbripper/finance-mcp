@@ -624,7 +624,8 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
             pids = [t[0] for t in score_updates]
             cur.execute("""
                 SELECT person_id::text, institutional_score, lobbying_score,
-                       network_score, engagement_score
+                       network_score, engagement_score,
+                       component_breakdown->'weights' AS weights
                 FROM people_influence_scores
                 WHERE person_id = ANY(%s)
             """, (pids,))
@@ -636,8 +637,10 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
                     continue
                 inst = float(row["institutional_score"] or 5)
                 net  = float(row["network_score"]       or 0)
-                # v2.0 (influence_v2.py): lobbying and engagement are no longer scored
-                composite = composite_v2(inst, fin_score, net)
+                # v2.0 (influence_v2.py): lobbying and engagement are no longer
+                # scored; the person's weights were stored by the last rescore.
+                w = row.get("weights")
+                composite = composite_v2(inst, fin_score, net, w if isinstance(w, dict) else None)
 
                 cur.execute("""
                     UPDATE people_influence_scores
@@ -1083,7 +1086,8 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
             for pid, (fin_score, raw) in results_map.items():
                 cur.execute("""
                     SELECT institutional_score, lobbying_score,
-                           network_score, engagement_score
+                           network_score, engagement_score,
+                           component_breakdown->'weights' AS weights
                     FROM people_influence_scores WHERE person_id = %s
                 """, (pid,))
                 row = cur.fetchone()
@@ -1091,8 +1095,10 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
                     continue
                 inst = float(row["institutional_score"] or 5)
                 net  = float(row["network_score"]       or 0)
-                # v2.0 (influence_v2.py): lobbying and engagement are no longer scored
-                composite = composite_v2(inst, fin_score, net)
+                # v2.0 (influence_v2.py): lobbying and engagement are no longer
+                # scored; the person's weights were stored by the last rescore.
+                w = row.get("weights")
+                composite = composite_v2(inst, fin_score, net, w if isinstance(w, dict) else None)
 
                 cur.execute("""
                     UPDATE people_influence_scores
@@ -1778,9 +1784,8 @@ def compute_influence_scores_batch(person_ids_filter: list[str] | None = None) -
     """
     Compute v2.0 influence scores (influence_v2.py) for every active Pythia
     contact, or only person_ids_filter. Three components:
-      institutional (85%) — org tier, 990/union revenue, role seniority,
-                            government position; staff titles capped at 40,
-                            "former" roles ignored, person-tier basis floors
+      institutional (85%) — elected office score; otherwise person tier,
+                            tier-basis floors and org-tier bonus (max 75)
       financial      (5%) — donations: total, breadth, largest gift, consistency
       network       (10%) — total relationship connections
     Lobbying and engagement are stored as 0. politician_v1 rows are skipped.
@@ -3441,21 +3446,57 @@ def fec_donations_to(candidate_name: str, limit: int = 50) -> list[dict]:
         return []
 
 def fec_donations_by(donor_name: str, limit: int = 50) -> list[dict]:
-    key = _cfg("FEC_API_KEY", "DEMO_KEY")
-    last = donor_name.strip().split()[-1]
-    try:
-        time.sleep(0.3)
-        resp = requests.get(f"{FEC_BASE}/schedules/schedule_a/",
-            params={"api_key": key, "per_page": min(limit, 100), "contributor_name": last,
-                    "contributor_state": "NY", "min_amount": 250,
-                    "sort": "-contribution_receipt_amount"},
-            timeout=15
-        )
-        resp.raise_for_status()
-        return resp.json().get("results", [])
-    except Exception as e:
-        log.warning(f"FEC by error: {e}")
+    """
+    Federal contributions made by a person. FEC stores individual donors as
+    "LAST, FIRST [MIDDLE] [TITLE]" and schedule_a has no separate first/last
+    name parameters — only a full-text contributor_name. Searching the last
+    name alone returned the whole family's largest gifts (every Tisch got
+    Jonathan's and Laurie's), so this searches "LAST, FIRST" for each
+    first-name variant (NY first, then nationwide) and keeps rows whose first
+    name matches. If that finds nothing, it falls back to last name + NY,
+    filtered the same way.
+    """
+    parts = donor_name.strip().split()
+    if not parts:
         return []
+    last = parts[-1]
+    variants = [v.upper() for v in _name_variants(parts[0])] if len(parts) > 1 else []
+
+    def _first_name_ok(row: dict) -> bool:
+        if (row.get("contributor_last_name") or "").strip().upper() not in ("", last.upper()):
+            return False
+        if not variants:
+            return True
+        first = (row.get("contributor_first_name") or "").strip().upper()
+        if not first:  # older filings: parse "LAST, FIRST MIDDLE"
+            name = (row.get("contributor_name") or "").upper()
+            first = name.split(",", 1)[1].strip() if "," in name else ""
+        return any(first == v or first.startswith(v + " ") for v in variants)
+
+    def _query(params: dict) -> list[dict]:
+        data = _fec_get("/schedules/schedule_a/", {
+            "per_page": min(limit, 100), "min_amount": 250,
+            "sort": "-contribution_receipt_amount", **params,
+        })
+        return data.get("results", [])
+
+    seen, rows = set(), []
+    def _add(found):
+        for r in found:
+            rid = r.get("sub_id") or id(r)
+            if rid not in seen and _first_name_ok(r):
+                seen.add(rid); rows.append(r)
+
+    names = [f"{last}, {v}".strip(", ") for v in variants or [""]]
+    for name in names:  # NY first: a common name nationwide crowds out the contact
+        _add(_query({"contributor_name": name, "contributor_state": "NY"}))
+    if not rows:
+        for name in names:
+            _add(_query({"contributor_name": name}))
+    if not rows:
+        _add(_query({"contributor_name": last, "contributor_state": "NY"}))
+    rows.sort(key=lambda r: -float(r.get("contribution_receipt_amount") or 0))
+    return rows[:limit]
 
 
 # ─── NYC Lobbying (City Clerk eLobbyist, dataset fmf3-knd8) ──────────────────
@@ -6036,7 +6077,8 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Compute v2.0 influence scores for active Pythia contacts and store results "
                 "in people_influence_scores. Three weighted components: "
-                "institutional authority (85%), financial influence (5%), network connections (10%). "
+                "institutional authority (85%), financial influence (5%), network connections (10%); "
+                "tier-1 trusted advisors and major donors 60/30/10. "
                 "Elected officials scored by office (politician_v1) are never overwritten. "
                 "Safe to re-run — updates existing scores. Pass person_ids to score only those "
                 "contacts. Run lookup_finance_connections on key contacts first so campaign "
