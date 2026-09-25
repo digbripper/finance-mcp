@@ -8,6 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy server code
 COPY finance_mcp_server.py .
+# Influence scoring v2.0 (imported by the server)
+COPY influence_v2.py .
 
 # Copy the BOE CSV
 COPY nys_boe_data/parsed_contributions.csv nys_boe_data/

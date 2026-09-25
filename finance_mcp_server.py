@@ -32,6 +32,17 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp import types
 from rapidfuzz import fuzz, process
+from influence_v2 import (
+    ALGORITHM_VERSION as INFLUENCE_ALGORITHM_VERSION,
+    WEIGHTS_V2,
+    _GOV_POSITION_SCORES,
+    _government_position_score,
+    _revenue_to_institutional_score,
+    calculate_financial_score_v2,
+    composite_v2,
+    profile_contribution_rows,
+    score_contacts as score_contacts_v2,
+)
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
@@ -623,27 +634,30 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
                 row = score_rows.get(pid)
                 if not row:
                     continue
-                inst  = float(row["institutional_score"] or 5)
-                lobby = float(row["lobbying_score"]      or 0)
-                net   = float(row["network_score"]        or 0)
-                eng   = float(row["engagement_score"]     or 0)
-
-                base   = inst*0.35 + fin_score*0.25 + lobby*0.20 + net*0.15 + eng*0.05
-                strong = sum(1 for s in [inst, fin_score, lobby, net, eng] if s >= 60)
-                if strong >= 2:
-                    base *= 1 + 0.15 * (strong - 1)
-                composite = round(min(100.0, base), 2)
+                inst = float(row["institutional_score"] or 5)
+                net  = float(row["network_score"]       or 0)
+                # v2.0 (influence_v2.py): lobbying and engagement are no longer scored
+                composite = composite_v2(inst, fin_score, net)
 
                 cur.execute("""
                     UPDATE people_influence_scores
                        SET financial_score     = %s,
                            composite_score     = %s,
-                           component_breakdown = component_breakdown::jsonb
+                           lobbying_score      = 0,
+                           engagement_score    = 0,
+                           algorithm_version   = 'v2.0',
+                           component_breakdown = COALESCE(component_breakdown::jsonb, '{}'::jsonb)
                                || jsonb_build_object(
                                     'financial', %s::numeric,
-                                    'raw', (component_breakdown->'raw')::jsonb
+                                    'lobbying', 0, 'engagement', 0,
+                                    'raw', COALESCE((component_breakdown->'raw')::jsonb, '{}'::jsonb)
                                         || jsonb_build_object(
+                                             'max_single_donation', %s::numeric,
+                                             'max_single_basis',    'single_contribution',
+                                             'annual_totals',       %s::jsonb,
+                                             'financial_source',    'enrichment',
                                              'total_donated',     %s::numeric,
+                                             'confirmed_total',   %s::numeric,
                                              'donation_count',    %s::int,
                                              'unique_recipients', %s::int
                                            )
@@ -658,6 +672,10 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
                 """, (
                     fin_score, composite,
                     fin_score,
+                    raw.get("max_single_donation", 0),
+                    json.dumps(raw.get("annual_totals") or {}),
+                    raw.get("total_donated", 0),
+                    # Phase 1 keeps only ZIP-matched BOE rows: all confirmed
                     raw.get("total_donated", 0),
                     raw.get("donation_count", 0),
                     raw.get("unique_recipients", 0),
@@ -730,20 +748,20 @@ def _compute_fin_score_from_rows(
     # leadership preferences, not a direct personal contribution
     total += company_pac_total * 0.15
 
-    # PAC receipts signal political value (money flowing TO them) — up to 15 pts
-    pac_recipient_score = (
-        min(15.0, _math.log10(pac_receipts_in + 1) * 5)
-        if pac_receipts_in > 0 else 0.0
-    )
-
-    if total <= 0 and pac_recipient_score <= 0:
+    if total <= 0 and pac_receipts_in <= 0:
         return 0.0, {}
 
-    amount_score  = min(60.0, _math.log10(total + 1) * 15) if total > 0 else 0.0
-    breadth_score = min(25.0, len(recipients) * 5)
-    fin_score     = round(min(100.0, amount_score + breadth_score + pac_recipient_score), 2)
+    # v2.0 formula (influence_v2.py): total, breadth, largest single gift,
+    # years with $1K+. PAC money flowing IN isn't scored — that describes
+    # politicians, who are scored by office (politician_v1); kept in raw.
+    profile   = profile_contribution_rows(boe_rows, cfb_rows, fec_rows, superpac_rows)
+    fin_score = round(calculate_financial_score_v2(
+        total, len(recipients), profile["max_single_donation"], profile["annual_totals"]), 2)
 
     return fin_score, {
+        "max_single_donation": profile["max_single_donation"],
+        "max_single_basis":    "single_contribution",
+        "annual_totals":       profile["annual_totals"],
         "total_donated":      round(total, 2),
         "donation_count":     (len(boe_rows or []) + len(cfb_rows or [])
                                + len(fec_rows or []) + len(superpac_rows or [])),
@@ -1071,26 +1089,28 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
                 row = cur.fetchone()
                 if not row:
                     continue
-                inst  = float(row["institutional_score"] or 5)
-                lobby = float(row["lobbying_score"]      or 0)
-                net   = float(row["network_score"]        or 0)
-                eng   = float(row["engagement_score"]     or 0)
-
-                base   = inst*0.35 + fin_score*0.25 + lobby*0.20 + net*0.15 + eng*0.05
-                strong = sum(1 for s in [inst, fin_score, lobby, net, eng] if s >= 60)
-                if strong >= 2:
-                    base *= 1 + 0.15 * (strong - 1)
-                composite = round(min(100.0, base), 2)
+                inst = float(row["institutional_score"] or 5)
+                net  = float(row["network_score"]       or 0)
+                # v2.0 (influence_v2.py): lobbying and engagement are no longer scored
+                composite = composite_v2(inst, fin_score, net)
 
                 cur.execute("""
                     UPDATE people_influence_scores
                        SET financial_score     = %s,
                            composite_score     = %s,
-                           component_breakdown = component_breakdown::jsonb
+                           lobbying_score      = 0,
+                           engagement_score    = 0,
+                           algorithm_version   = 'v2.0',
+                           component_breakdown = COALESCE(component_breakdown::jsonb, '{}'::jsonb)
                                || jsonb_build_object(
                                     'financial', %s::numeric,
-                                    'raw', (component_breakdown->'raw')::jsonb
+                                    'lobbying', 0, 'engagement', 0,
+                                    'raw', COALESCE((component_breakdown->'raw')::jsonb, '{}'::jsonb)
                                         || jsonb_build_object(
+                                             'max_single_donation', %s::numeric,
+                                             'max_single_basis',    'single_contribution',
+                                             'annual_totals',       %s::jsonb,
+                                             'financial_source',    'enrichment',
                                              'total_donated',    %s::numeric,
                                              'donation_count',   %s::int,
                                              'unique_recipients', %s::int,
@@ -1110,6 +1130,8 @@ def _sync_enrich_financial(contacts: list[dict]) -> list[str]:
                 """, (
                     fin_score, composite,
                     fin_score,
+                    raw.get("max_single_donation", 0),
+                    json.dumps(raw.get("annual_totals") or {}),
                     raw.get("total_donated", 0),
                     raw.get("donation_count", 0),
                     raw.get("unique_recipients", 0),
@@ -1754,255 +1776,27 @@ def _parse_first_dollar(text: str) -> float:
 
 def compute_influence_scores_batch(person_ids_filter: list[str] | None = None) -> dict:
     """
-    Compute v1 influence scores for every active Pythia contact.
-    Five components:
-      institutional (35%) — org influence tier + role seniority
-      financial     (25%) — campaign donations given/received
-      lobbying      (20%) — being targeted by lobbyists
-      network       (15%) — total relationship connections
-      engagement    (5%)  — voter score / civic participation
+    Compute v2.0 influence scores (influence_v2.py) for every active Pythia
+    contact, or only person_ids_filter. Three components:
+      institutional (85%) — org tier, 990/union revenue, role seniority,
+                            government position; staff titles capped at 40,
+                            "former" roles ignored, person-tier basis floors
+      financial      (5%) — donations: total, breadth, largest gift, consistency
+      network       (10%) — total relationship connections
+    Lobbying and engagement are stored as 0. politician_v1 rows are skipped.
     Scores are written to people_influence_scores (upsert — safe to re-run).
     """
-    WEIGHTS = dict(institutional=0.35, financial=0.25,
-                   lobbying=0.20, network=0.15, engagement=0.05)
-
-    # ── Stage 1: verify tables exist ──────────────────────────────────────────
     try:
         conn = get_db()
     except Exception as e:
         return {"error": f"DB connection failed: {e}"}
 
     try:
-        # ── Stage 2: load all scoring data in one connection ──────────────────
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT p.id::text AS person_id, p.full_name,
-                    MIN(o_tiered.influence_tier)                               AS best_tier,
-                    MAX(CASE WHEN rt.is_decision_maker THEN 1 ELSE 0 END)     AS is_decision_maker,
-                    MAX(COALESCE(rt.seniority_level, 0))                       AS max_seniority,
-                    COUNT(DISTINCT CASE WHEN o_tiered.influence_tier = 1
-                                        THEN o_tiered.id END)                 AS tier1_orgs,
-                    STRING_AGG(DISTINCT o_all.name,     ', ')                  AS all_orgs,
-                    STRING_AGG(DISTINCT po.job_title,   ', ')                  AS all_titles
-                FROM people_person p
-                LEFT JOIN people_personorganization po
-                       ON po.person_id = p.id AND po.is_current = TRUE
-                LEFT JOIN organizations_organization o_all
-                       ON o_all.id = po.organization_id
-                LEFT JOIN organizations_organization o_tiered
-                       ON o_tiered.id = po.organization_id
-                      AND o_tiered.influence_tier IS NOT NULL
-                LEFT JOIN people_roletype rt ON rt.id = po.role_type_id
-                WHERE p.is_active = TRUE
-                GROUP BY p.id, p.full_name
-            """)
-            inst_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
+        result = score_contacts_v2(conn, person_ids_filter)
+        scored = result["scored"]
+        log.info(f"compute_influence_scores: scoring {len(scored)} contacts "
+                 f"({result['politicians_skipped']} politician_v1 rows protected)")
 
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT from_person_id::text AS person_id,
-                    COUNT(*) AS donation_count,
-                    COUNT(DISTINCT to_person_id) AS unique_recipients,
-                    STRING_AGG(notes, '|||') AS all_notes
-                FROM people_personrelationship
-                WHERE relationship_type = 'Campaign Donor' AND is_active = TRUE
-                GROUP BY from_person_id
-            """)
-            donor_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
-
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT to_person_id::text AS person_id,
-                    COUNT(DISTINCT from_person_id) AS unique_donors
-                FROM people_personrelationship
-                WHERE relationship_type = 'Campaign Donor' AND is_active = TRUE
-                GROUP BY to_person_id
-            """)
-            recvd_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
-
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT to_person_id::text AS person_id,
-                    COUNT(*) AS lobbying_count,
-                    STRING_AGG(notes, '|||') AS all_notes
-                FROM people_personrelationship
-                WHERE relationship_type IN ('Lobbyist', 'Lobbying Client') AND is_active = TRUE
-                GROUP BY to_person_id
-            """)
-            lobby_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
-
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT person_id::text, COUNT(*) AS total_connections
-                FROM (
-                    SELECT from_person_id AS person_id FROM people_personrelationship WHERE is_active = TRUE
-                    UNION ALL
-                    SELECT to_person_id   FROM people_personrelationship WHERE is_active = TRUE
-                ) sides
-                JOIN people_person p ON p.id = person_id AND p.is_active = TRUE
-                GROUP BY person_id
-            """)
-            net_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
-
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT person_id::text, voter_score, ge_votes, primary_votes FROM people_voter_enrichment")
-                voter_map = {r["person_id"]: dict(r) for r in cur.fetchall()}
-        except Exception:
-            voter_map = {}  # table may be empty or not yet populated
-
-        # ── 990 revenue per person (best org they're currently at) ─────────
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT po.person_id::text,
-                        GREATEST(
-                            MAX(COALESCE(n.total_revenue, 0)),
-                            MAX(COALESCE(u.total_receipts, 0))
-                        ) AS best_financial_metric
-                    FROM people_personorganization po
-                    LEFT JOIN organizations_990_data n
-                        ON n.organization_id = po.organization_id
-                        AND n.match_confidence > 70
-                    LEFT JOIN organizations_union_data u
-                        ON u.organization_id = po.organization_id
-                        AND u.match_confidence > 70
-                    WHERE po.is_current = TRUE
-                      AND (
-                          (n.total_revenue IS NOT NULL AND n.total_revenue > 0)
-                          OR (u.total_receipts IS NOT NULL AND u.total_receipts > 0)
-                      )
-                    GROUP BY po.person_id
-                """)
-                revenue_990_map = {r["person_id"]: int(r["best_financial_metric"])
-                                   for r in cur.fetchall()}
-        except Exception:
-            revenue_990_map = {}  # tables may not exist yet
-
-        with conn.cursor() as cur:
-            # Skip anyone scored by the politician formula: those scores come
-            # from office + network (pythia-web lib/politician-scores.js), not
-            # from the donations/lobbying components computed here.
-            cur.execute("""
-                SELECT p.id::text AS person_id, p.full_name
-                FROM people_person p
-                WHERE p.is_active = TRUE
-                  AND NOT EXISTS (
-                      SELECT 1 FROM people_influence_scores s
-                      WHERE s.person_id = p.id
-                        AND s.algorithm_version = 'politician_v1'
-                  )
-            """)
-            all_people = list(cur.fetchall())
-
-        # If filtering to specific contacts (e.g. after auto-enrichment), only score those
-        if person_ids_filter:
-            allowed = set(person_ids_filter)
-            all_people = [p for p in all_people if p["person_id"] in allowed]
-
-        log.info(f"compute_influence_scores: scoring {len(all_people)} contacts")
-
-        # ── Stage 3: compute scores in Python ─────────────────────────────────
-        scored = []
-        for person in all_people:
-            pid  = person["person_id"]
-            name = person["full_name"] or ""
-
-            inst = inst_map.get(pid, {})
-            don  = donor_map.get(pid, {})
-            recv = recvd_map.get(pid, {})
-            lob  = lobby_map.get(pid, {})
-            net  = net_map.get(pid, {})
-            vot  = voter_map.get(pid)
-
-            # ── Institutional score ────────────────────────────────────────
-            tier      = inst.get("best_tier")
-            tier_base = {1: 80, 2: 50, 3: 25}.get(tier, 5) if tier else 5
-            # 990 revenue-based score — takes precedence over manual tier if higher
-            revenue_990    = revenue_990_map.get(pid)
-            revenue_score  = _revenue_to_institutional_score(revenue_990)
-            institutional_base = max(float(tier_base), revenue_score)
-            seniority_bonus   = min(15, int(inst.get("max_seniority", 0) or 0) * 2)
-            decision_bonus    = 15 if inst.get("is_decision_maker") else 0
-            multi_tier1_bonus = min(10, max(0, int(inst.get("tier1_orgs", 0) or 0) - 1) * 5)
-            institutional_score = min(100.0, institutional_base + seniority_bonus + decision_bonus + multi_tier1_bonus)
-
-            # Government position override — elected officials and senior
-            # appointees get a fixed base score based on their position title,
-            # regardless of whether their org has an influence_tier set.
-            gov_score = _government_position_score(
-                inst.get("all_titles") or "",
-                inst.get("all_orgs")   or "",
-            )
-            if gov_score > 0:
-                institutional_score = max(institutional_score, gov_score)
-
-            total_donated = 0.0
-            for chunk in (don.get("all_notes") or "").split("|||"):
-                total_donated += _parse_first_dollar(chunk)
-            amount_score    = min(60.0, _math.log10(total_donated + 1) * 15)
-            breadth_score   = min(25.0, int(don.get("unique_recipients", 0) or 0) * 5)
-            recipient_score = min(15.0, int(recv.get("unique_donors", 0) or 0) * 2)
-            financial_score = min(100.0, amount_score + breadth_score + recipient_score)
-
-            total_comp = 0.0
-            for chunk in (lob.get("all_notes") or "").split("|||"):
-                m = re.search(r"Compensation:\s*\$([0-9,]+)", chunk)
-                try:
-                    total_comp += float(m.group(1).replace(",", "")) if m else _parse_first_dollar(chunk)
-                except (ValueError, AttributeError):
-                    pass
-            lob_count_score = min(50.0, int(lob.get("lobbying_count", 0) or 0) * 5)
-            lob_comp_score  = min(50.0, _math.log10(total_comp + 1) * 12) if total_comp > 0 else 0.0
-            lobbying_score  = min(100.0, lob_count_score + lob_comp_score)
-
-            total_conn    = int(net.get("total_connections", 0) or 0)
-            network_score = min(100.0, _math.log10(total_conn + 1) * 30) if total_conn > 0 else 0.0
-
-            if vot:
-                vs    = int(vot.get("voter_score", 0) or 0)
-                ge_v  = int(vot.get("ge_votes", 0) or 0)
-                pri_v = int(vot.get("primary_votes", 0) or 0)
-                engagement_score = min(100.0, min(50.0, (vs/30.0)*50) + min(25.0, ge_v*2.0) + min(25.0, pri_v*3.0))
-            else:
-                engagement_score = 0.0
-
-            base    = (WEIGHTS["institutional"] * institutional_score + WEIGHTS["financial"] * financial_score
-                       + WEIGHTS["lobbying"] * lobbying_score + WEIGHTS["network"] * network_score
-                       + WEIGHTS["engagement"] * engagement_score)
-            strong  = sum(1 for s in [institutional_score, financial_score, lobbying_score, network_score] if s > 60)
-            composite_score = min(100.0, base * (1.0 + 0.15 * max(0, strong - 1)))
-
-            breakdown = {
-                "institutional": round(institutional_score, 2),
-                "financial":     round(financial_score, 2),
-                "lobbying":      round(lobbying_score, 2),
-                "network":       round(network_score, 2),
-                "engagement":    round(engagement_score, 2),
-                "raw": {
-                    "best_tier":         tier,
-                    "is_decision_maker": bool(inst.get("is_decision_maker")),
-                    "revenue_990":       revenue_990,
-                    "total_donated":     round(total_donated, 2),
-                    "donation_count":    int(don.get("donation_count", 0) or 0),
-                    "unique_donors_in":  int(recv.get("unique_donors", 0) or 0),
-                    "lobbying_filings":  int(lob.get("lobbying_count", 0) or 0),
-                    "total_connections": total_conn,
-                    "voter_score":       int(vot.get("voter_score", 0) or 0) if vot else None,
-                },
-            }
-            scored.append({
-                "person_id": pid, "name": name,
-                "institutional_score": round(institutional_score, 2),
-                "financial_score":     round(financial_score, 2),
-                "lobbying_score":      round(lobbying_score, 2),
-                "network_score":       round(network_score, 2),
-                "engagement_score":    round(engagement_score, 2),
-                "composite_score":     round(composite_score, 2),
-                "breakdown":           breakdown,
-            })
-
-        # ── Stage 4: bulk upsert all scores in one round trip ─────────────────────────
         rows = [
             (
                 r["person_id"],
@@ -2033,31 +1827,32 @@ def compute_influence_scores_batch(person_ids_filter: list[str] | None = None) -
                     component_breakdown = EXCLUDED.component_breakdown,
                     algorithm_version   = EXCLUDED.algorithm_version,
                     computed_at         = NOW()
+                -- Re-checked at write time: a politician score set while this
+                -- batch was computing must survive.
+                WHERE people_influence_scores.algorithm_version <> 'politician_v1'
                 """,
                 rows,
-                template="(%s,%s,%s,%s,%s,%s,%s,%s,'v1.0',NOW())",
+                template=f"(%s,%s,%s,%s,%s,%s,%s,%s,'{INFLUENCE_ALGORITHM_VERSION}',NOW())",
                 page_size=500,
             )
         conn.commit()
         log.info(f"compute_influence_scores: bulk upserted {len(scored)} rows")
 
         top10 = sorted(scored, key=lambda x: -x["composite_score"])[:10]
-        log.info(f"compute_influence_scores complete: {len(scored)} contacts scored")
         return {
             "status":          "ok",
             "contacts_scored": len(scored),
-            "algorithm":       "v1.0",
-            "weights":         WEIGHTS,
+            "politicians_skipped": result["politicians_skipped"],
+            "algorithm":       INFLUENCE_ALGORITHM_VERSION,
+            "weights":         WEIGHTS_V2,
             "top_10_preview": [
                 {"name": r["name"], "composite": r["composite_score"],
                  "inst": r["institutional_score"], "fin": r["financial_score"],
-                 "lob":  r["lobbying_score"],       "net": r["network_score"],
-                 "eng":  r["engagement_score"]}
+                 "net": r["network_score"]}
                 for r in top10
             ],
             "next_step": "Call rank_influential_people to query results with optional geographic filters.",
         }
-
     except Exception as e:
         log.error(f"compute_influence_scores_batch failed: {e}", exc_info=True)
         try:
@@ -2151,6 +1946,7 @@ def rank_influential_people(
                 pis.network_score,
                 pis.engagement_score,
                 pis.component_breakdown::text AS breakdown_json,
+                pis.algorithm_version,
                 pis.computed_at,
                 pve.voter_zip,
                 pve.assembly_district,
@@ -2181,7 +1977,7 @@ def rank_influential_people(
             r.person_id, r.full_name, r.composite_score,
             r.institutional_score, r.financial_score, r.lobbying_score,
             r.network_score, r.engagement_score, r.breakdown_json,
-            r.computed_at, r.voter_zip, r.assembly_district,
+            r.algorithm_version, r.computed_at, r.voter_zip, r.assembly_district,
             r.state_senate_district, r.congressional_district,
             r.county_name, r.party_label, r.voter_score,
             r.voter_address, r.voter_city
@@ -2387,111 +2183,8 @@ def _is_government_entity(org_name: str) -> bool:
     return any(kw in n for kw in _GOVT_KEYWORDS)
 
 
-def _revenue_to_institutional_score(revenue: int | None) -> float:
-    """
-    Convert annual nonprofit / union revenue (from IRS 990 or LM-2) to an
-    institutional score (0-100).  Log-like scale so small-org differences matter.
-    """
-    if not revenue or revenue <= 0:
-        return 0.0
-    if revenue >= 1_000_000_000:   return 95.0
-    if revenue >= 500_000_000:     return 88.0
-    if revenue >= 100_000_000:     return 80.0
-    if revenue >= 50_000_000:      return 70.0
-    if revenue >= 10_000_000:      return 55.0
-    if revenue >= 5_000_000:       return 40.0
-    if revenue >= 1_000_000:       return 25.0
-    return 10.0
-
-
-# ─── Government position institutional scores ─────────────────────────────────
-#
-# Elected officials and senior appointees get a fixed institutional base score
-# based on their position title, bypassing the org influence_tier system (which
-# doesn't cover government orgs).  Ordered from most specific → most general;
-# first match wins.  Matching is case-insensitive substring on combined
-# title + org string.
-
-_GOV_POSITION_SCORES: list[tuple[list[str], float]] = [
-    # Federal — leadership
-    (["president of the united states", "potus"],                           100),
-    (["vice president of the united states"],                                99),
-    (["senate majority leader"],                                             97),
-    (["senate minority leader"],                                             96),
-    (["speaker of the house"],                                               96),
-    (["senate majority whip", "senate minority whip"],                       93),
-    (["house majority leader", "house minority leader"],                     93),
-    (["house majority whip", "house minority whip"],                         91),
-    # Federal — rank and file
-    (["us senator", "united states senator", "senator from new york",
-      "senator, new york", "senator, ny"],                                   90),
-    (["us representative", "member of congress", "congressman",
-      "congresswoman", "us house of representatives",
-      "member, us house", "representative, ny"],                             83),
-    # Federal — cabinet / agencies
-    (["secretary of state", "secretary of defense",
-      "secretary of the treasury", "secretary of labor",
-      "secretary of commerce", "secretary of education",
-      "secretary of health"],                                                88),
-    (["director of the fbi", "director of the cia",
-      "national security advisor"],                                          85),
-    # NYS — leadership
-    (["governor of new york", "nys governor",
-      "governor, new york"],                                                 95),
-    (["new york state attorney general", "nys attorney general",
-      "attorney general of new york", "attorney general, new york"],         88),
-    (["new york state comptroller", "nys comptroller",
-      "state comptroller, new york"],                                        85),
-    (["lieutenant governor", "lt. governor"],                                80),
-    (["new york state senate majority leader",
-      "nys senate majority leader"],                                         84),
-    (["new york state senate minority leader",
-      "nys senate minority leader"],                                         83),
-    (["new york state assembly speaker", "nys assembly speaker"],            83),
-    # NYS — rank and file
-    (["new york state senator", "nys senator",
-      "state senator, new york", "state senator"],                           74),
-    (["assemblymember", "assembly member",
-      "new york state assembly", "nys assembly"],                            68),
-    # NYC — leadership
-    (["mayor of new york", "nyc mayor",
-      "mayor, new york city"],                                               92),
-    (["new york city comptroller", "nyc comptroller",
-      "comptroller, new york city", "comptroller, nyc",
-      "nyc comptroller"],                                                    82),
-    (["new york city public advocate", "nyc public advocate",
-      "public advocate, new york"],                                          79),
-    (["new york city council speaker", "nyc council speaker",
-      "speaker of the city council"],                                        82),
-    (["borough president"],                                                   77),
-    # NYC — rank and file
-    (["new york city council member", "nyc council member",
-      "city council member", "council member, new york"],                    68),
-    # NYC agencies — appointed officials
-    (["nypd commissioner", "police commissioner",
-      "commissioner of police"],                                             72),
-    (["schools chancellor", "nyc schools chancellor",
-      "chancellor of the new york city"],                                    75),
-    (["mta chairman", "mta ceo", "mta president"],                           73),
-    (["fire commissioner", "fdny commissioner"],                             70),
-    # Generic fallback for named commissioner / director roles
-    (["commissioner"],                                                        65),
-]
-
-
-def _government_position_score(titles: str, orgs: str) -> float:
-    """
-    Return the institutional base score for a government position, or 0.0 if
-    the combined title + org string doesn't match any known government position.
-    Matching is case-insensitive substring; first entry in _GOV_POSITION_SCORES wins.
-    """
-    combined = ((titles or "") + " || " + (orgs or "")).lower()
-    for keywords, score in _GOV_POSITION_SCORES:
-        if any(kw in combined for kw in keywords):
-            return float(score)
-    return 0.0
-
-
+# Institutional helpers (_revenue_to_institutional_score, _GOV_POSITION_SCORES,
+# _government_position_score) live in influence_v2.py with the v2.0 scoring.
 
 
 def _search_propublica_990(org_name: str) -> dict | None:
@@ -6341,16 +6034,25 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="compute_influence_scores",
             description=(
-                "Compute v1 influence scores for every active Pythia contact and store results "
-                "in people_influence_scores. Five weighted components: "
-                "institutional authority (35%), financial influence (25%), "
-                "lobbying exposure (20%), network connections (15%), civic engagement (5%). "
-                "Safe to re-run — updates existing scores. "
-                "Run setup_influence_tables and enrich_voter_data first for best results. "
-                "Also run lookup_finance_connections on key contacts before scoring so "
-                "campaign finance and lobbying data is written to the database."
+                "Compute v2.0 influence scores for active Pythia contacts and store results "
+                "in people_influence_scores. Three weighted components: "
+                "institutional authority (85%), financial influence (5%), network connections (10%). "
+                "Elected officials scored by office (politician_v1) are never overwritten. "
+                "Safe to re-run — updates existing scores. Pass person_ids to score only those "
+                "contacts. Run lookup_finance_connections on key contacts first so campaign "
+                "finance data is written to the database."
             ),
-            inputSchema={"type": "object", "properties": {}, "required": []},
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "person_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of person UUIDs to score. If omitted, scores all active contacts.",
+                    },
+                },
+                "required": [],
+            },
         ),
         types.Tool(
             name="rank_influential_people",
@@ -6602,8 +6304,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
             elif name == "compute_influence_scores":
-                log.info("compute_influence_scores called")
-                result = await loop.run_in_executor(None, compute_influence_scores_batch)
+                person_ids = [str(p) for p in (arguments.get("person_ids") or []) if p]
+                log.info(f"compute_influence_scores called ({len(person_ids) or 'all'} contacts)")
+                result = await loop.run_in_executor(
+                    None, compute_influence_scores_batch, person_ids or None)
                 return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
             elif name == "rank_influential_people":
