@@ -390,7 +390,12 @@ def parse_donor_note(note: str) -> tuple[float, str | None]:
     the first gift (see enrich_person), not a single contribution."""
     m = re.search(r"\$([0-9,]+(?:\.\d+)?)", note or "")
     amount = float(m.group(1).replace(",", "")) if m else 0.0
-    return amount, _year((note or "").split("|")[-1]) if "|" in (note or "") else None
+    # Notes grew extra segments ("| confidence: high (address)"); the year is
+    # whichever segment after the amount is a bare year.
+    for segment in (note or "").split("|")[1:]:
+        if re.fullmatch(r"\s*(19|20)\d{2}\s*", segment):
+            return amount, segment.strip()
+    return amount, None
 
 
 def _num(v) -> float:

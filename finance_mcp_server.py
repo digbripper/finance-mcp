@@ -176,30 +176,130 @@ def boe_donations_by_voter(lastname: str, firstname: str,
     """, [last, pattern, _BOE_MAX_ROWS])]
 
 
-def boe_donations_by(donor_name: str, limit: int = 500) -> list[dict]:
+def boe_donations_by(donor_name: str, limit: int = 1000, address: str = "", zip5: str = "") -> list[dict]:
     """
-    Contributions made by a person, largest first. Matches the last name (also
-    two- and three-word last names: "Carmen De La Rosa") and the first name or
-    any nickname variant by prefix.
+    Contributions made by a person, largest first — see boe_donations_layered.
+    With the person's voter address and ZIP it also finds filings under other
+    forms of their name; every row carries match_confidence / match_method.
+    Low-confidence (first name + ZIP only) candidates are NOT included.
     """
-    parts = normalize(donor_name).split()
+    return boe_donations_layered(donor_name, address, zip5, limit)["rows"]
+
+
+_STREET_NOISE = {
+    "n", "s", "e", "w", "north", "south", "east", "west", "apt", "unit", "fl", "floor", "ste", "suite",
+    "st", "street", "ave", "avenue", "av", "rd", "road", "blvd", "boulevard", "pl", "place", "dr",
+    "drive", "ct", "court", "ln", "lane", "pkwy", "parkway", "ter", "terrace", "way", "sq", "square",
+}
+
+
+def _address_anchor(address: str) -> tuple[str, str] | None:
+    """('285', 'montgomery') from '285 Montgomery Street Apt 9B'; ('208', '163')
+    from '208 East 163rd Street'. None when there's no house number."""
+    tokens = re.findall(r"[a-z0-9]+", (address or "").lower())
+    if not tokens or not re.fullmatch(r"\d+[a-z]?", tokens[0]):
+        return None
+    for t in tokens[1:]:
+        if t in _STREET_NOISE:
+            continue
+        m = re.match(r"\d+", t)
+        return tokens[0], (m.group(0) if m else t)
+    return None
+
+
+def boe_last_name_variants(full_name: str) -> list[str]:
+    """Normalized last names to search: the last word, both halves of a
+    hyphenated name ("Lewis-Martin" → lewis-martin, lewis, martin), and two-
+    and three-word last names ("De La Rosa")."""
+    parts = normalize(full_name).split()          # punctuation → spaces
+    raw_last = (full_name or "").strip().split()[-1] if (full_name or "").strip() else ""
+    out = {norm_last_name(raw_last)}
+    if "-" in raw_last:
+        out.update(norm_last_name(c) for c in raw_last.split("-"))
+        out.add(norm_last_name(raw_last.replace("-", " ")))
+    for n in (2, 3):
+        if len(parts) > n:
+            out.add(norm_last_name(" ".join(parts[-n:])))
+    return sorted(out - {""})
+
+
+def boe_donations_layered(donor_name: str, address: str = "", zip5: str = "",
+                          limit: int = 1000) -> dict:
+    """
+    Find a person's BOE contributions however they filed their name.
+
+      high   — address anchor: same house number + street + ZIP as the voter
+               file, first initial matches. Found by where they live, so
+               "Ingrid Martin", "Ingrid P Martin" and "Ingrid P Lewis-Martin"
+               at 285 Montgomery Street are all hers.
+      medium — a last-name variant + first-name variant, in the person's ZIP
+               region (same rule as identity confirmation: first 3 digits,
+               Manhattan unified).
+      name   — the same name match from elsewhere. Not confirmed by this
+               function; classify_contributions decides, as before (employer,
+               occupation, rare-name rules). People give from office addresses.
+      low    — first name + ZIP only, tried only when nothing above matched.
+               Returned under "review", never counted automatically.
+
+    Returns {"rows": [...], "review": [...]}; each row has match_confidence
+    and match_method.
+    """
+    parts = (donor_name or "").strip().split()
     if not parts:
-        return []
-    if len(parts) == 1:
-        return [_boe_row(r) for r in _boe_fetch(f"""
+        return {"rows": [], "review": []}
+    zip5 = (zip5 or "").strip()[:5]
+    first_variants = _name_variants(parts[0]) if len(parts) > 1 else []
+    patterns = sorted({_boe_first_pattern(v) for v in first_variants} - {""})
+    lasts = boe_last_name_variants(donor_name) if len(parts) > 1 else [norm_last_name(parts[0])]
+    found: dict[str, dict] = {}
+
+    def _take(rows, confidence, method):
+        for r in rows:
+            row = _boe_row(r)
+            if row["trans_key"] not in found:
+                row["match_confidence"], row["match_method"] = confidence, method
+                found[row["trans_key"]] = row
+
+    # Layer 1 — address anchor
+    anchor = _address_anchor(address)
+    initial = re.sub(r"[^a-z]", "", parts[0].lower())[:1]
+    if anchor and zip5 and initial:
+        number, street = anchor
+        _take(_boe_fetch(f"""
             SELECT {_BOE_SELECT} FROM nys_boe_contributions c
-            WHERE c.last_name_norm = %s
+            WHERE LEFT(c.zip, 5) = %s
+              AND LOWER(c.address) LIKE %s
+              AND LOWER(c.first_name) LIKE %s
             ORDER BY c.amount DESC NULLS LAST LIMIT %s
-        """, [norm_last_name(parts[0]), limit])]
-    lasts = sorted({norm_last_name(" ".join(parts[-n:])) for n in (1, 2, 3) if len(parts) > n} - {""})
-    patterns = sorted({_boe_first_pattern(v) for v in _name_variants(parts[0])} - {""})
-    if not lasts or not patterns:
-        return []
-    return [_boe_row(r) for r in _boe_fetch(f"""
-        SELECT {_BOE_SELECT} FROM nys_boe_contributions c
-        WHERE c.last_name_norm = ANY(%s) AND LOWER(c.first_name) LIKE ANY(%s)
-        ORDER BY c.amount DESC NULLS LAST LIMIT %s
-    """, [lasts, patterns, limit])]
+        """, [zip5, f"{number} %{street}%", initial + "%", limit]), "high", "address")
+
+    # Layer 2 — name variants; ZIP region decides medium vs. unconfirmed
+    if lasts and (patterns or len(parts) == 1):
+        sql = f"SELECT {_BOE_SELECT} FROM nys_boe_contributions c WHERE c.last_name_norm = ANY(%s)"
+        params: list = [lasts]
+        if patterns:
+            sql += " AND LOWER(c.first_name) LIKE ANY(%s)"
+            params.append(patterns)
+        sql += " ORDER BY c.amount DESC NULLS LAST LIMIT %s"
+        params.append(limit)
+        by_name = _boe_fetch(sql, params)
+        _take([r for r in by_name if zip5 and _zips_match(r.get("zip"), zip5)], "medium", "name+zip")
+        _take(by_name, "name", "name")
+
+    # Layer 3 — first name + ZIP, only when nothing else matched; for review
+    review: list[dict] = []
+    if not found and zip5 and len(parts) > 1:
+        for r in _boe_fetch(f"""
+            SELECT {_BOE_SELECT} FROM nys_boe_contributions c
+            WHERE LEFT(c.zip, 5) = %s AND LOWER(c.first_name) = %s
+            ORDER BY c.amount DESC NULLS LAST LIMIT 50
+        """, [zip5, parts[0].lower()]):
+            row = _boe_row(r)
+            row["match_confidence"], row["match_method"] = "low", "first name+zip"
+            review.append(row)
+
+    rows = sorted(found.values(), key=lambda r: -r["amount"])
+    return {"rows": rows, "review": review}
 
 
 def boe_donors_to(candidate_name: str, min_amount: float = 250, limit: int = 100) -> list[dict]:
@@ -340,14 +440,26 @@ def write_enrichment_note(person_id: str, note: str):
             )
         conn.commit()
 
-def write_relationship(from_id: str, to_id: str, rel_type: str, context: str, notes: str) -> bool:
+def write_relationship(from_id: str, to_id: str, rel_type: str, context: str, notes: str,
+                       refresh: bool = False) -> bool:
+    """Insert a relationship; returns True only when a new one was written.
+    refresh=True also updates the context/notes of an existing one (donation
+    totals and match confidence change as data improves)."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id FROM people_personrelationship
+                SELECT id, notes FROM people_personrelationship
                 WHERE from_person_id = %s AND to_person_id = %s AND relationship_type = %s
             """, (from_id, to_id, rel_type))
-            if cur.fetchone():
+            existing = cur.fetchone()
+            if existing:
+                if refresh and (existing["notes"] or "") != notes:
+                    cur.execute("""
+                        UPDATE people_personrelationship
+                        SET context = %s, notes = %s, is_active = TRUE, updated_at = NOW()
+                        WHERE id = %s
+                    """, (context, notes, existing["id"]))
+                    conn.commit()
                 return False
             cur.execute("""
                 INSERT INTO people_personrelationship
@@ -936,21 +1048,9 @@ def _cfb_search(fn_variants: list, ln: str, limit: int = 50) -> list[dict]:
     return rows
 
 
-def _fec_search(fn_variants: list, ln: str, limit: int = 50) -> list[dict]:
+def _fec_search(fn_variants: list, ln: str, limit: int = 50, zip5: str = "") -> list[dict]:
     """FEC hard-money contribution search by first+last name variants."""
-    seen, rows = set(), []
-    for fn in fn_variants:
-        data = _fec_get("/schedules/schedule_a/", {
-            "per_page":         min(limit, 100),
-            "contributor_name": f"{ln}, {fn}",
-            "min_amount":       200,   # FEC itemization threshold
-            "sort":             "-contribution_receipt_amount",
-        })
-        for r in data.get("results", []):
-            rid = r.get("sub_id") or id(r)
-            if rid not in seen:
-                seen.add(rid); rows.append(r)
-    return rows
+    return fec_contributions_by_name(ln, fn_variants, limit=limit, min_amount=200, zip5=zip5)
 
 
 def confidence_enrich_contact(contact: dict) -> Optional[dict]:
@@ -1024,7 +1124,7 @@ def confidence_enrich_contact(contact: dict) -> Optional[dict]:
 
     with _cf.ThreadPoolExecutor(max_workers=5) as p:
         f_cfb    = p.submit(_cfb_search, fn_variants, lastname)
-        f_fec    = p.submit(_fec_search, fn_variants, lastname)
+        f_fec    = p.submit(_fec_search, fn_variants, lastname, 50, voter_zip)
         f_sp     = p.submit(_fec_superpac_fetch, pac_name_variants)
         f_cpac   = p.submit(fec_company_pac, org_name) if is_executive else None
         f_polpac = p.submit(fec_politician_pac_profile, fn_variants) if is_politician else None
@@ -3515,21 +3615,16 @@ def cfb_donations_received(candidate_name: str, limit: int = 50) -> list[dict]:
         log.warning(f"CFB received error: {e}")
         return []
 
-def cfb_donations_made(donor_name: str, limit: int = 50) -> list[dict]:
-    last = donor_name.strip().split()[-1]
-    try:
-        resp = requests.get(
-            f"{CFB_BASE}/{CFB_CONTRIBUTIONS_ID}.json",
-            params={"$limit": limit,
-                    "$where": f"upper(contributor_name) like upper('%{last}%') AND amount >= 250",
-                    "$order": "amount DESC"},
-            timeout=15
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        log.warning(f"CFB made error: {e}")
+def cfb_donations_made(donor_name: str, limit: int = 100) -> list[dict]:
+    """NYC CFB contributions made by a person: last name AND a first-name
+    variant (first 4 letters) must both appear. The last name alone returned
+    the family's largest gifts — the same flaw the FEC search had."""
+    parts = donor_name.strip().split()
+    if not parts:
         return []
+    if len(parts) == 1:
+        return _cfb_search([""], parts[0], limit)
+    return _cfb_search(_name_variants(parts[0]), parts[-1], limit)
 
 def fec_donations_to(candidate_name: str, limit: int = 50) -> list[dict]:
     key = _cfg("FEC_API_KEY", "DEMO_KEY")
@@ -3555,58 +3650,101 @@ def fec_donations_to(candidate_name: str, limit: int = 50) -> list[dict]:
         log.warning(f"FEC to error: {e}")
         return []
 
-def fec_donations_by(donor_name: str, limit: int = 50) -> list[dict]:
-    """
-    Federal contributions made by a person. FEC stores individual donors as
-    "LAST, FIRST [MIDDLE] [TITLE]" and schedule_a has no separate first/last
-    name parameters — only a full-text contributor_name. Searching the last
-    name alone returned the whole family's largest gifts (every Tisch got
-    Jonathan's and Laurie's), so this searches "LAST, FIRST" for each
-    first-name variant (NY first, then nationwide) and keeps rows whose first
-    name matches. If that finds nothing, it falls back to last name + NY,
-    filtered the same way.
-    """
-    parts = donor_name.strip().split()
-    if not parts:
-        return []
-    last = parts[-1]
-    variants = [v.upper() for v in _name_variants(parts[0])] if len(parts) > 1 else []
+# Conduits report every earmarked gift a second time (ActBlue, WinRed); the
+# recipient committee's own row is the real contribution.
+_FEC_CONDUITS = {"C00401224", "C00694323"}
 
-    def _first_name_ok(row: dict) -> bool:
+
+def _fec_is_contribution(row: dict) -> bool:
+    """False for rows that repeat money counted elsewhere: memo entries (a
+    joint fundraising committee's allocation to its members shows up again on
+    each member's report with memo_code X) and conduit pass-throughs."""
+    if (row.get("memo_code") or "").upper() == "X":
+        return False
+    if row.get("committee_id") in _FEC_CONDUITS:
+        return False
+    if (row.get("receipt_type") or "").upper() in ("24T", "24I"):
+        return False
+    return True
+
+
+def _fec_first_name(row: dict) -> str:
+    first = (row.get("contributor_first_name") or "").strip().upper()
+    if not first:  # older filings: parse "LAST, FIRST MIDDLE"
+        name = (row.get("contributor_name") or "").upper()
+        first = name.split(",", 1)[1].strip() if "," in name else ""
+    return first
+
+
+def fec_contributions_by_name(last: str, first_variants: list[str], limit: int = 100,
+                              min_amount: int = 250, zip5: str = "") -> list[dict]:
+    """
+    Federal contributions made by a person — the ONE place that searches FEC
+    Schedule A by contributor (enrich_person, Phase 2 scoring).
+
+    FEC stores individuals as "LAST, FIRST [MIDDLE] [TITLE]" and schedule_a
+    has no first/last-name parameters, only a full-text contributor_name.
+    Searching the last name alone returned the whole family's largest gifts,
+    so this searches "LAST, FIRST" for each first-name variant — New York
+    first, because a common name nationwide crowds out the contact — and keeps
+    rows whose first name matches. Fallbacks when that finds nothing:
+      1. the same search nationwide;
+      2. last name + state + the contact's ZIP, accepting any first name with
+         the same initial (catches name variants: "MERYL", "M. H. TISCH");
+      3. last name + NY, first name filtered as in the main search.
+    Memo entries and conduit pass-throughs are dropped (double counting).
+    """
+    last = (last or "").strip()
+    variants = [v.strip().upper() for v in (first_variants or []) if v and v.strip()]
+    if not last:
+        return []
+
+    def _name_ok(row: dict, initial_only: bool = False) -> bool:
         if (row.get("contributor_last_name") or "").strip().upper() not in ("", last.upper()):
             return False
         if not variants:
             return True
-        first = (row.get("contributor_first_name") or "").strip().upper()
-        if not first:  # older filings: parse "LAST, FIRST MIDDLE"
-            name = (row.get("contributor_name") or "").upper()
-            first = name.split(",", 1)[1].strip() if "," in name else ""
+        first = _fec_first_name(row)
+        if initial_only:
+            return bool(first) and any(first[0] == v[0] for v in variants)
         return any(first == v or first.startswith(v + " ") for v in variants)
 
     def _query(params: dict) -> list[dict]:
         data = _fec_get("/schedules/schedule_a/", {
-            "per_page": min(limit, 100), "min_amount": 250,
+            "per_page": min(limit, 100), "min_amount": min_amount,
             "sort": "-contribution_receipt_amount", **params,
         })
         return data.get("results", [])
 
     seen, rows = set(), []
-    def _add(found):
+    def _add(found, initial_only=False):
         for r in found:
             rid = r.get("sub_id") or id(r)
-            if rid not in seen and _first_name_ok(r):
+            if rid not in seen and _fec_is_contribution(r) and _name_ok(r, initial_only):
                 seen.add(rid); rows.append(r)
 
     names = [f"{last}, {v}".strip(", ") for v in variants or [""]]
-    for name in names:  # NY first: a common name nationwide crowds out the contact
+    for name in names:
         _add(_query({"contributor_name": name, "contributor_state": "NY"}))
     if not rows:
         for name in names:
             _add(_query({"contributor_name": name}))
+    if not rows and zip5:
+        _add(_query({"contributor_name": last, "contributor_state": "NY",
+                     "contributor_zip": zip5[:5]}), initial_only=True)
     if not rows:
         _add(_query({"contributor_name": last, "contributor_state": "NY"}))
     rows.sort(key=lambda r: -float(r.get("contribution_receipt_amount") or 0))
     return rows[:limit]
+
+
+def fec_donations_by(donor_name: str, limit: int = 100, zip5: str = "") -> list[dict]:
+    """Federal contributions made by a person (see fec_contributions_by_name)."""
+    parts = donor_name.strip().split()
+    if not parts:
+        return []
+    variants = _name_variants(parts[0]) if len(parts) > 1 else []
+    return fec_contributions_by_name(parts[-1], variants, limit=limit, zip5=zip5)
 
 
 # ─── NYC Lobbying (City Clerk eLobbyist, dataset fmf3-knd8) ──────────────────
@@ -5443,6 +5581,142 @@ def find_influential_in_area(
 
 # ─── Core enrichment ──────────────────────────────────────────────────────────
 
+# ─── Recipient classification ────────────────────────────────────────────────
+
+_STATEWIDE_OFFICES = {"governor", "lt. governor", "lieutenant governor", "attorney general", "comptroller"}
+_STATEWIDE_NAME = re.compile(r"\bfor (new york|ny)\b|\bgovernor\b|attorney general|comptroller", re.I)
+_CFB_CITYWIDE = {"1", "2", "3", "mayor", "public advocate", "comptroller"}
+_CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+
+
+def _fec_entity_type(committee: dict) -> str:
+    designation = (committee.get("designation") or "").upper()
+    ctype = (committee.get("committee_type") or "").upper()
+    if designation == "J":
+        return "federal_victory_fund"
+    if designation == "D":
+        return "federal_leadership_pac"
+    if ctype in ("X", "Y", "Z"):
+        return "federal_committee"
+    if ctype in ("H", "S", "P"):
+        return "federal_candidate"
+    return "federal_other"
+
+
+def summarize_recipients(inc_cfb: dict, inc_fec: dict, inc_boe: dict) -> dict:
+    """
+    Group a person's confirmed contributions by recipient and classify each
+    recipient by race type (the thresholds for donor circles depend on it).
+
+    Returns {"entities": [...largest first], "summary": {...}}. Each entity:
+    entity_id (BOE:<filer>, FEC committee id, CFB:<name>), name, source,
+    entity_type, amount, count, max_single, year (latest), annual,
+    confidence + match_method (best evidence among its rows), and — when the
+    committee is in fec_committee_candidates — linked_person_id / linked_note.
+    """
+    def bucket_of(cls: dict) -> dict:
+        out = {}
+        for b, label, method in (("high_zip", "high", "zip"), ("high_employer", "high", "employer"),
+                                 ("medium", "medium", "occupation"), ("low_ny", "low", "rare name")):
+            for r in cls.get(b, []):
+                out[id(r)] = (label, method)
+        return out
+
+    entities: dict[str, dict] = {}
+
+    def add(key, name, source, etype, amount, year, confidence, method):
+        e = entities.setdefault(key, {
+            "entity_id": key, "name": name, "source": source, "entity_type": etype,
+            "amount": 0.0, "count": 0, "max_single": 0.0, "year": "", "annual": {},
+            "confidence": "low", "match_method": method,
+            "linked_person_id": None, "linked_note": None,
+        })
+        e["amount"] += amount
+        e["count"] += 1
+        e["max_single"] = max(e["max_single"], amount)
+        year = str(year or "")[:4]
+        if year.isdigit():
+            e["annual"][year] = round(e["annual"].get(year, 0) + amount, 2)
+            e["year"] = max(e["year"], year)
+        if _CONFIDENCE_RANK.get(confidence, 0) > _CONFIDENCE_RANK.get(e["confidence"], 0):
+            e["confidence"], e["match_method"] = confidence, method
+
+    b = bucket_of(inc_boe)
+    for r in inc_boe["included"]:
+        conf, method = b.get(id(r), ("low", "name"))
+        if r.get("match_confidence") == "high":
+            conf, method = "high", "address"
+        add(f"BOE:{r['filer_id']}", (r.get("candidate_name") or "").strip(), "NYS BOE", "nys_other",
+            float(r.get("amount") or 0), r.get("date") or r.get("election_year"), conf, method)
+
+    b = bucket_of(inc_fec)
+    for r in inc_fec["included"]:
+        committee = r.get("committee") or {}
+        name = (r.get("committee_name") or committee.get("name") or "").strip()
+        cid = r.get("committee_id") or committee.get("committee_id") or f"FEC:{name.upper()}"
+        if not name:
+            continue
+        conf, method = b.get(id(r), ("low", "name"))
+        add(cid, name, "FEC", _fec_entity_type(committee),
+            float(r.get("contribution_receipt_amount") or 0), r.get("contribution_receipt_date"), conf, method)
+
+    b = bucket_of(inc_cfb)
+    for r in inc_cfb["included"]:
+        name = (r.get("candidate_name") or r.get("recipname") or "").strip()
+        if not name:
+            continue
+        office = str(r.get("officecd") or r.get("office_cd") or r.get("office") or "").strip().lower()
+        conf, method = b.get(id(r), ("low", "name"))
+        add(f"CFB:{name.upper()}", name, "NYC CFB",
+            "nyc_citywide_candidate" if office in _CFB_CITYWIDE else "nyc_local",
+            float(r.get("amount") or 0), r.get("date") or r.get("election_year") or r.get("election"), conf, method)
+
+    # BOE race types from the filer table; politician links from the mapping.
+    boe_ids = [k[4:] for k in entities if k.startswith("BOE:")]
+    filers = {f["filer_id"]: f for f in (_boe_fetch(
+        "SELECT filer_id, committee_type, office_desc FROM nys_boe_filers WHERE filer_id = ANY(%s)",
+        [boe_ids]) if boe_ids else [])}
+    links = {l["committee_id"]: l for l in (_boe_fetch(
+        "SELECT committee_id, committee_type, pythia_person_id::text AS person_id, notes "
+        "FROM fec_committee_candidates WHERE committee_id = ANY(%s)", [list(entities)]) if entities else [])}
+    for key, e in entities.items():
+        link = links.get(key)
+        if key.startswith("BOE:"):
+            f = filers.get(key[4:]) or {}
+            ctype = (f.get("committee_type") or "").lower()
+            if "state committee" in ctype or "state housekeeping" in ctype:
+                e["entity_type"] = "nys_party_committee"
+            elif ((f.get("office_desc") or "").lower() in _STATEWIDE_OFFICES
+                  or (link and link.get("committee_type") == "NYS-STATEWIDE")
+                  or ("candidate" in ctype and _STATEWIDE_NAME.search(e["name"]))):
+                e["entity_type"] = "nys_statewide_candidate"
+        if link:
+            e["linked_person_id"], e["linked_note"] = link.get("person_id"), link.get("notes")
+
+    ordered = sorted(entities.values(), key=lambda e: -e["amount"])
+    annual: dict[str, float] = {}
+    by_source: dict[str, float] = {}
+    for e in ordered:
+        e["amount"] = round(e["amount"], 2)
+        for y, v in e["annual"].items():
+            annual[y] = round(annual.get(y, 0) + v, 2)
+        by_source[e["source"]] = round(by_source.get(e["source"], 0) + e["amount"], 2)
+        e["display"] = (f"${e['amount']:,.0f} → {e['name']}"
+                        + (f" ({e['linked_note']})" if e["linked_note"] else "")
+                        + f" | {e['source']} {e['year']}".rstrip())
+    return {
+        "entities": ordered,
+        "summary": {
+            "total": round(sum(e["amount"] for e in ordered), 2),
+            "recipients": len(ordered),
+            "max_recipient_total": max((e["amount"] for e in ordered), default=0.0),
+            "max_single": max((e["max_single"] for e in ordered), default=0.0),
+            "annual_totals": dict(sorted(annual.items())),
+            "by_source": by_source,
+        },
+    }
+
+
 def enrich_person(person_name: str) -> dict:
     import concurrent.futures as _cf
 
@@ -5468,6 +5742,17 @@ def enrich_person(person_name: str) -> dict:
         "new_connections_written": 0,
     }
 
+    # The subject's own identity signals: voter ZIP and home address anchor the
+    # BOE and FEC searches; orgs/titles confirm employer and occupation.
+    subj_zip    = (subject.get("voter_zip") or "").strip() if subject else ""
+    subj_orgs   = (subject.get("orgs")   or "") if subject else ""
+    subj_titles = (subject.get("titles") or "") if subject else ""
+    subj_address = ""
+    if subject_id:
+        _va = _boe_fetch("SELECT voter_address FROM people_voter_enrichment WHERE person_id = %s LIMIT 1",
+                         [subject_id])
+        subj_address = (_va[0]["voter_address"] or "") if _va else ""
+
     # 1. Who donated TO this person? — fetch all sources in parallel
     with _cf.ThreadPoolExecutor(max_workers=8) as pool:
         f_cfb_recv  = pool.submit(cfb_donations_received, person_name)
@@ -5478,8 +5763,8 @@ def enrich_person(person_name: str) -> dict:
         f_fec_recv  = pool.submit(fec_donations_to, person_name) if _use_legacy_fec else pool.submit(lambda: [])
         f_boe_recv  = pool.submit(boe_donors_to, person_name)
         f_cfb_made  = pool.submit(cfb_donations_made, person_name)
-        f_fec_made  = pool.submit(fec_donations_by, person_name)
-        f_boe_made  = pool.submit(boe_donations_by, person_name)
+        f_fec_made  = pool.submit(fec_donations_by, person_name, 100, subj_zip)
+        f_boe_made  = pool.submit(boe_donations_layered, person_name, subj_address, subj_zip)
         f_nyc_lobby  = pool.submit(nyc_lobbying_targets, person_name)
         f_nys_lobby  = pool.submit(nys_lobbying_targets, person_name)
         # Federal LDA + FEC donors — only meaningful for federal officials
@@ -5533,53 +5818,61 @@ def enrich_person(person_name: str) -> dict:
             findings["new_connections_written"] += 1
 
     # 2. Who did THIS person donate to? — confidence-filtered before attribution
-    # (contributions are only attributed to the subject when ZIP, employer, or
-    # occupation confirms identity, or the name is rare and NY-clustered)
-    subj_zip    = (subject.get("voter_zip") or "").strip() if subject else ""
-    subj_orgs   = (subject.get("orgs")   or "") if subject else ""
-    subj_titles = (subject.get("titles") or "") if subject else ""
-
+    # (contributions are only attributed to the subject when the address, ZIP,
+    # employer or occupation confirms identity, or the name is rare and
+    # NY-clustered)
     cfb_made = f_cfb_made.result() or []
     fec_made = f_fec_made.result() or []
-    boe_made = f_boe_made.result() or []
+    boe_layers = f_boe_made.result() or {"rows": [], "review": []}
+    boe_made = boe_layers["rows"]
     made_rarity = _name_rarity(fec_made)
     inc_cfb = classify_contributions(cfb_made, "cfb", subj_zip, subj_orgs, subj_titles, made_rarity)
     inc_fec = classify_contributions(fec_made, "fec", subj_zip, subj_orgs, subj_titles, made_rarity)
     inc_boe = classify_contributions(boe_made, "boe", subj_zip, subj_orgs, subj_titles, made_rarity)
-    n_excluded_made = len(inc_cfb["excluded"]) + len(inc_fec["excluded"]) + len(inc_boe["excluded"])
+    # A BOE row found at the subject's own address is theirs whatever the
+    # ZIP-region rule says about it.
+    _in = {id(r) for r in inc_boe["included"]}
+    inc_boe["included"] += [r for r in boe_made if r.get("match_confidence") == "high" and id(r) not in _in]
+    n_excluded_made = (len(cfb_made) - len(inc_cfb["included"]) + len(fec_made) - len(inc_fec["included"])
+                       + len(boe_made) - len(inc_boe["included"]))
     if n_excluded_made:
         log.info(f"enrich_person {person_name!r}: excluded {n_excluded_made} "
                  f"unconfirmed donations-made rows (name-only)")
 
-    rmap: dict[str, dict] = {}
-    for row in inc_cfb["included"]:
-        c = (row.get("candidate_name") or "").strip()
-        if c:
-            if c not in rmap: rmap[c] = {"amount": 0, "year": (row.get("date") or "")[:4], "source": "NYC CFB"}
-            rmap[c]["amount"] += float(row.get("amount") or 0)
-    for row in inc_fec["included"]:
-        c = (row.get("committee_name") or "").strip()
-        if c:
-            if c not in rmap: rmap[c] = {"amount": 0, "year": (row.get("contribution_receipt_date") or "")[:4], "source": "FEC"}
-            rmap[c]["amount"] += float(row.get("contribution_receipt_amount") or 0)
-    for row in inc_boe["included"]:
-        c = (row.get("candidate_name") or "").strip()
-        if c:
-            if c not in rmap: rmap[c] = {"amount": 0, "year": row.get("election_year") or "", "source": "NYS BOE"}
-            rmap[c]["amount"] += float(row.get("amount") or 0)
+    recipients = summarize_recipients(inc_cfb, inc_fec, inc_boe)
+    findings["donations_made_summary"] = recipients["summary"]
+    findings["boe_review"] = [
+        {"contributor_name": r["contributor_name"], "amount": r["amount"], "candidate": r["candidate_name"],
+         "year": r["election_year"], "zip": r["zip"], "match_method": r["match_method"]}
+        for r in boe_layers["review"][:20]
+    ]
 
-    for cname, info in sorted(rmap.items(), key=lambda x: -x[1]["amount"])[:15]:
+    for e in recipients["entities"][:40]:
+        cname = e["name"]
         cc, _ = best_match(cname, index, keys)
+        linked_id = e.get("linked_person_id")
         findings["known_recipients_in_db"].append({
             "candidate_name": cname, "in_db": bool(cc),
-            "db_match": cc["_display"] if cc else None, **info,
+            "db_match": cc["_display"] if cc else None,
+            **{k: e[k] for k in ("amount", "year", "source", "entity_id", "entity_type", "confidence",
+                                 "match_method", "count", "max_single", "linked_person_id",
+                                 "linked_note", "display")},
         })
-        if subject_id and cc:
+        note = (f"${e['amount']:,.0f} | Source: {e['source']} | {e['year']} | "
+                f"confidence: {e['confidence']} ({e['match_method']})")
+        if subject_id and cc and cc["id"] != subject_id:
             write_finance_note(subject_id,
-                f"[{info['source']} {info['year']}] Donated ${info['amount']:,.0f} to {cname} (auto-detected)")
+                f"[{e['source']} {e['year']}] Donated ${e['amount']:,.0f} to {cname} (auto-detected)")
             if write_relationship(subject_id, cc["id"], "Campaign Donor",
-                    f"Donated to {cname}",
-                    f"${info['amount']:,.0f} | Source: {info['source']} | {info['year']}"):
+                                  f"Donated to {cname}", note, refresh=True):
+                findings["new_connections_written"] += 1
+        # A victory fund, leadership PAC or party committee tied to a
+        # politician: the gift is in that politician's orbit, not a direct
+        # campaign contribution.
+        if subject_id and linked_id and linked_id != subject_id and not (cc and cc["id"] == linked_id):
+            if write_relationship(subject_id, linked_id, "Committee Donor",
+                                  f"Donated to {cname} ({e['linked_note'] or 'linked committee'})",
+                                  note + f" | via {cname}", refresh=True):
                 findings["new_connections_written"] += 1
 
 
@@ -5635,27 +5928,11 @@ def enrich_person(person_name: str) -> dict:
                     rel_note):
                 findings["new_connections_written"] += 1
 
-    # 3. Co-donors
-    if rmap:
-        top = max(rmap, key=lambda k: rmap[k]["amount"])
-        seen: set[str] = set()
-        for row in list(cfb_donations_received(top, limit=100)) + list(boe_donors_to(top)):
-            d = (row.get("contributor_name") or "").strip()
-            if not d or normalize(d) == normalize(person_name): continue
-            m, _ = best_match(d, index, keys)
-            if m and m["id"] not in seen:
-                seen.add(m["id"])
-                findings["co_donors_in_db"].append({
-                    "name": m["_display"], "person_id": m["id"], "orgs": m.get("orgs", ""),
-                    "shared_candidate": top, "their_amount": float(row.get("amount") or 0),
-                    "source": "NYS BOE" if row.get("election_year") else "NYC CFB",
-                })
-                if subject_id and m["id"] != subject_id:
-                    if write_relationship(subject_id, m["id"], "Co-Donor",
-                            f"Co-donors to {top}", f"Both donated to {top} (auto-detected)"):
-                        findings["new_connections_written"] += 1
-
-
+    # 3. Co-donors — no longer written here. The old rule linked the subject to
+    # everyone in Pythia who gave anything to the subject's top recipient (93% of
+    # all relationships, mostly noise). Donor circles are now rebuilt from the
+    # saved donation summaries with per-race thresholds:
+    # pythia-web scripts/rebuild-donor-circles.mjs.
 
     # ── Voter file cross-reference ────────────────────────────────────────────
     voter = lookup_voter(person_name)

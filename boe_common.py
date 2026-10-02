@@ -120,6 +120,7 @@ INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_boe_full_name  ON nys_boe_contributions(LOWER(full_name))",
     "CREATE INDEX IF NOT EXISTS idx_boe_recipient  ON nys_boe_contributions(LOWER(cand_comm_name))",
     "CREATE INDEX IF NOT EXISTS idx_boe_filer      ON nys_boe_contributions(filer_id)",
+    "CREATE INDEX IF NOT EXISTS idx_boe_zip5       ON nys_boe_contributions(LEFT(zip, 5))",
     "CREATE INDEX IF NOT EXISTS idx_boe_year       ON nys_boe_contributions(election_year)",
     "CREATE INDEX IF NOT EXISTS idx_boe_amount     ON nys_boe_contributions(amount DESC)",
     "CREATE INDEX IF NOT EXISTS idx_boe_lobbyist   ON nys_boe_contributions(is_lobbyist) WHERE is_lobbyist = TRUE",
