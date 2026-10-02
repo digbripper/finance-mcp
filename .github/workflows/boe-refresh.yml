@@ -1,0 +1,41 @@
+name: BOE Data Quarterly Refresh
+
+# Loads new NYS BOE contributions into Neon (nys_boe_contributions).
+#
+# NOTE: the BOE site blocks scripted downloads (Cloudflare 403) and has no
+# stable direct file URL, so until one exists the scheduled run fails with a
+# message saying to download in a browser and run
+#   python3 scripts/boe_quarterly_refresh.py <downloaded.zip>
+# locally. That failure email is the quarterly reminder. If BOE publishes
+# direct links, set the repository variable BOE_ZIP_URLS (comma-separated).
+
+on:
+  schedule:
+    # Jan 15, Apr 15, Jul 15, Oct 15 at 9am ET (after quarterly filing deadlines)
+    - cron: '0 14 15 1,4,7,10 *'
+  workflow_dispatch:
+    inputs:
+      zip_urls:
+        description: 'Comma-separated zip URLs to load (blank = BOE_ZIP_URLS variable)'
+        required: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Download and load BOE data
+        run: python scripts/boe_quarterly_refresh.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BOE_ZIP_URLS: ${{ github.event.inputs.zip_urls || vars.BOE_ZIP_URLS }}

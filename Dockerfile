@@ -11,8 +11,9 @@ COPY finance_mcp_server.py .
 # Influence scoring v2.0 (imported by the server)
 COPY influence_v2.py .
 
-# Copy the BOE CSV
-COPY nys_boe_data/parsed_contributions.csv nys_boe_data/
+# NYS BOE contributions are queried from Neon (nys_boe_contributions);
+# boe_common.py holds the shared name normalization and loader.
+COPY boe_common.py .
 
 # Copy LDA registrants for in-memory cross-reference
 COPY lda_registrants.csv .

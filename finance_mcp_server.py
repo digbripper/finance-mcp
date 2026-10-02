@@ -32,6 +32,7 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp import types
 from rapidfuzz import fuzz, process
+from boe_common import norm_last_name
 from influence_v2 import (
     ALGORITHM_VERSION as INFLUENCE_ALGORITHM_VERSION,
     WEIGHTS_V2,
@@ -68,95 +69,195 @@ FEC_BASE             = "https://api.open.fec.gov/v1"
 CFB_CONTRIBUTIONS_ID = "k3cd-yu9d"
 MATCH_THRESHOLD      = 82
 
-BOE_CSV_PATH = Path(__file__).parent / "nys_boe_data" / "parsed_contributions.csv"
+# ─── NYS BOE contributions (Neon table nys_boe_contributions) ────────────────
+#
+# ~7.5M itemized Schedule A contributions, 1999–present, loaded by
+# scripts/load_boe_to_neon.py and refreshed quarterly by
+# scripts/boe_quarterly_refresh.py (see boe_common.py for the file layout).
+# Replaces the static 107K-row CSV that used to be held in memory.
+#
+# Every function returns one dict per contribution in the shape the
+# enrichment code has always used (candidate_name, contributor_name, amount,
+# zip, state, date, election_year), because identity confirmation
+# (classify_contributions) judges each contribution by its own ZIP/employer.
 
-# ─── NYS BOE CSV cache ────────────────────────────────────────────────────────
+_BOE_SELECT = """
+    c.filer_id, c.cand_comm_name, c.election_year, c.filing_abbrev, c.trans_number,
+    c.full_name, c.first_name, c.last_name, c.last_name_norm,
+    c.address, c.city, c.state, c.zip, c.amount, c.sched_date,
+    c.contrib_type, c.employer, c.occupation, c.is_lobbyist
+"""
+_BOE_MAX_ROWS = 5000
 
-_boe_rows:   list[dict] = []
-_boe_loaded: bool       = False
 
-def _load_boe_csv():
-    global _boe_rows, _boe_loaded
-    if _boe_loaded:
-        return
-    if not BOE_CSV_PATH.exists():
-        log.warning(f"NYS BOE CSV not found at {BOE_CSV_PATH}")
-        _boe_loaded = True
-        return
-    with open(BOE_CSV_PATH, newline="", encoding="utf-8") as f:
-        _boe_rows = list(csv.DictReader(f))
-    log.info(f"Loaded {len(_boe_rows):,} NYS BOE contributions")
-    _boe_loaded = True
+def _boe_row(r: dict) -> dict:
+    d = r.get("sched_date")
+    return {
+        "filer_id":         r["filer_id"],
+        "candidate_name":   r["cand_comm_name"],
+        "election_year":    str(r["election_year"] or ""),
+        "contributor_name": r["full_name"] or "",
+        "first_name":       r["first_name"] or "",
+        "last_name":        r["last_name"] or "",
+        "last_name_norm":   r["last_name_norm"] or "",
+        "address":          r["address"] or "",
+        "city":             r["city"] or "",
+        "state":            r["state"] or "",
+        "zip":              r["zip"] or "",
+        "amount":           float(r["amount"] or 0),
+        "date":             d.isoformat() if d else "",
+        "office":           "",
+        "schedule":         "A",
+        "contrib_type":     r["contrib_type"] or "",
+        "employer":         r["employer"] or "",
+        "occupation":       r["occupation"] or "",
+        "is_lobbyist":      bool(r["is_lobbyist"]),
+        "trans_key":        f"{r['filer_id']}|{r['election_year']}|{r['filing_abbrev']}|{r['trans_number']}",
+    }
 
-def boe_donors_to(candidate_name: str, limit: int = 100) -> list[dict]:
-    _load_boe_csv()
-    if not _boe_rows:
+
+def _boe_first_pattern(firstname: str) -> str:
+    """First 4 letters as a LIKE prefix ("merr%"), as the CSV matcher did."""
+    letters = re.sub(r"[^a-z]", "", (firstname or "").lower())
+    return letters[:4] + "%" if letters else ""
+
+
+def _boe_fetch(sql: str, params: list) -> list[dict]:
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning(f"BOE query failed: {e}")
         return []
-    norm_target = normalize(candidate_name)
-    results = []
-    for row in _boe_rows:
-        cname = (row.get("candidate_name") or "").strip()
-        if cname and fuzz.token_sort_ratio(normalize(cname), norm_target) >= MATCH_THRESHOLD:
-            results.append(row)
-            if len(results) >= limit:
-                break
-    return results
 
-def boe_donations_by(donor_name: str, limit: int = 100) -> list[dict]:
-    _load_boe_csv()
-    if not _boe_rows:
+
+def boe_prefetch(pairs: list[tuple[str, str]]) -> dict[str, list[dict]]:
+    """
+    One query for many (last name, first name) pairs — Phase 1 scans every
+    contact in a zip code and find_super_voters every voter in the result.
+    Returns {normalized last name: [contribution rows]}; pass it to
+    boe_donations_by_voter(..., prefetched=...) to filter per person.
+    """
+    wanted = sorted({(norm_last_name(l), _boe_first_pattern(f)) for l, f in pairs if l and f})
+    wanted = [(l, f) for l, f in wanted if l and f]
+    if not wanted:
+        return {}
+    rows = _boe_fetch(f"""
+        SELECT DISTINCT {_BOE_SELECT}
+        FROM unnest(%s::text[], %s::text[]) AS w(last, pat)
+        JOIN nys_boe_contributions c
+          ON c.last_name_norm = w.last AND LOWER(c.first_name) LIKE w.pat
+        LIMIT %s
+    """, [[l for l, _ in wanted], [f for _, f in wanted], _BOE_MAX_ROWS * 10])
+    out: dict[str, list[dict]] = {l: [] for l, _ in wanted}
+    for r in rows:
+        out.setdefault(r["last_name_norm"], []).append(_boe_row(r))
+    return out
+
+
+def boe_donations_by_voter(lastname: str, firstname: str,
+                           prefetched: dict[str, list[dict]] | None = None) -> list[dict]:
+    """Contributions by one person: exact (normalized) last name + first-name prefix."""
+    last, pattern = norm_last_name(lastname), _boe_first_pattern(firstname)
+    if not last or not pattern:
         return []
-    norm_target = normalize(donor_name)
-    results = []
-    for row in _boe_rows:
-        cname = (row.get("contributor_name") or "").strip()
-        if cname and fuzz.token_sort_ratio(normalize(cname), norm_target) >= MATCH_THRESHOLD:
-            results.append(row)
-            if len(results) >= limit:
-                break
-    return results
+    if prefetched is not None:
+        prefix = pattern[:-1]
+        return [r for r in prefetched.get(last, []) if r["first_name"].lower().startswith(prefix)]
+    return [_boe_row(r) for r in _boe_fetch(f"""
+        SELECT {_BOE_SELECT} FROM nys_boe_contributions c
+        WHERE c.last_name_norm = %s AND LOWER(c.first_name) LIKE %s
+        ORDER BY c.amount DESC NULLS LAST LIMIT %s
+    """, [last, pattern, _BOE_MAX_ROWS])]
 
 
-# ─── BOE donor name index (built lazily for fast voter cross-reference) ───────
-
-_boe_donor_index: dict[str, list[dict]] = {}  # lastname_upper -> [rows]
-_boe_index_built: bool = False
-
-def _build_boe_donor_index():
-    """Build a lastname-keyed index of BOE donor rows for fast lookup."""
-    global _boe_donor_index, _boe_index_built
-    if _boe_index_built:
-        return
-    _load_boe_csv()
-    for row in _boe_rows:
-        raw = (row.get("contributor_name") or "").strip().upper()
-        if not raw:
-            continue
-        # Handle "LAST, FIRST" and "FIRST LAST" formats
-        if "," in raw:
-            last = raw.split(",")[0].strip()
-        else:
-            parts = raw.split()
-            last = parts[-1] if parts else ""
-        if last:
-            _boe_donor_index.setdefault(last, []).append(row)
-    log.info(f"BOE donor index built: {len(_boe_donor_index):,} unique last names")
-    _boe_index_built = True
-
-def boe_donations_by_voter(lastname: str, firstname: str) -> list[dict]:
-    """Fast BOE lookup for a voter by last + first name."""
-    _build_boe_donor_index()
-    candidates = _boe_donor_index.get(lastname.upper(), [])
-    if not candidates:
+def boe_donations_by(donor_name: str, limit: int = 500) -> list[dict]:
+    """
+    Contributions made by a person, largest first. Matches the last name (also
+    two- and three-word last names: "Carmen De La Rosa") and the first name or
+    any nickname variant by prefix.
+    """
+    parts = normalize(donor_name).split()
+    if not parts:
         return []
-    first_up = firstname.upper()
-    results = []
-    for row in candidates:
-        raw = (row.get("contributor_name") or "").strip().upper()
-        # Check first name appears in contributor string
-        if first_up[:4] in raw or raw.startswith(first_up[:4]):
-            results.append(row)
-    return results
+    if len(parts) == 1:
+        return [_boe_row(r) for r in _boe_fetch(f"""
+            SELECT {_BOE_SELECT} FROM nys_boe_contributions c
+            WHERE c.last_name_norm = %s
+            ORDER BY c.amount DESC NULLS LAST LIMIT %s
+        """, [norm_last_name(parts[0]), limit])]
+    lasts = sorted({norm_last_name(" ".join(parts[-n:])) for n in (1, 2, 3) if len(parts) > n} - {""})
+    patterns = sorted({_boe_first_pattern(v) for v in _name_variants(parts[0])} - {""})
+    if not lasts or not patterns:
+        return []
+    return [_boe_row(r) for r in _boe_fetch(f"""
+        SELECT {_BOE_SELECT} FROM nys_boe_contributions c
+        WHERE c.last_name_norm = ANY(%s) AND LOWER(c.first_name) LIKE ANY(%s)
+        ORDER BY c.amount DESC NULLS LAST LIMIT %s
+    """, [lasts, patterns, limit])]
+
+
+def boe_donors_to(candidate_name: str, min_amount: float = 250, limit: int = 100) -> list[dict]:
+    """
+    Largest donors to a candidate or committee, one row per donor (name + ZIP)
+    with their total. Finds the committees through the filer table — every
+    word of the name must appear in the committee name, so "Kathy Hochul"
+    finds "Friends for Kathy Hochul" — then reads contributions by filer id.
+    """
+    words = [w for w in re.findall(r"[a-z0-9']+", (candidate_name or "").lower()) if len(w) > 1]
+    if not words:
+        return []
+    filers = _boe_fetch(
+        "SELECT filer_id FROM nys_boe_filers WHERE filer_name ILIKE ALL(%s) LIMIT 50",
+        [[f"%{w}%" for w in words]])
+    if not filers:
+        return []
+    rows = _boe_fetch("""
+        SELECT MAX(c.full_name)       AS full_name,
+               MAX(c.first_name)      AS first_name,
+               MAX(c.last_name)       AS last_name,
+               MAX(c.cand_comm_name)  AS cand_comm_name,
+               SUM(c.amount)          AS total,
+               MAX(c.election_year)   AS latest_year,
+               COUNT(*)               AS num_donations,
+               MAX(c.city)            AS city,
+               MAX(c.state)           AS state,
+               LEFT(c.zip, 5)         AS zip,
+               BOOL_OR(c.is_lobbyist) AS is_lobbyist,
+               MAX(c.employer)        AS employer
+        FROM nys_boe_contributions c
+        WHERE c.filer_id = ANY(%s) AND c.full_name IS NOT NULL
+        GROUP BY LOWER(c.full_name), LEFT(c.zip, 5)
+        HAVING SUM(c.amount) >= %s
+        ORDER BY total DESC
+        LIMIT %s
+    """, [[f["filer_id"] for f in filers], min_amount, limit])
+    return [{
+        "candidate_name":   r["cand_comm_name"],
+        "contributor_name": r["full_name"] or "",
+        "first_name":       r["first_name"] or "",
+        "last_name":        r["last_name"] or "",
+        "amount":           float(r["total"] or 0),
+        "num_donations":    int(r["num_donations"] or 0),
+        "election_year":    str(r["latest_year"] or ""),
+        "date":             "",
+        "city":             r["city"] or "",
+        "state":            r["state"] or "",
+        "zip":              r["zip"] or "",
+        "is_lobbyist":      bool(r["is_lobbyist"]),
+        "employer":         r["employer"] or "",
+    } for r in rows]
+
+
+def boe_row_count() -> int | None:
+    """Planner's row estimate — instant, for the health check."""
+    rows = _boe_fetch("SELECT reltuples::bigint AS n FROM pg_class WHERE relname = 'nys_boe_contributions'", [])
+    return int(rows[0]["n"]) if rows else None
 
 # ─── DB helpers ───────────────────────────────────────────────────────────────
 
@@ -480,8 +581,8 @@ def _row_signals(row: dict, source: str) -> dict:
         return {
             "zip":        row.get("zip") or "",
             "state":      (row.get("state") or "NY").upper(),
-            "employer":   "",
-            "occupation": "",
+            "employer":   row.get("employer") or "",
+            "occupation": row.get("occupation") or "",
             "amount":     float(row.get("amount") or 0),
         }
     # CFB (NYC Socrata) — field names vary by dataset version
@@ -576,6 +677,14 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
 
     score_updates: list[tuple] = []   # (pid, fin_score, raw_dict)
 
+    # One query for every contact and nickname variant
+    prefetched = boe_prefetch([
+        (c["full_name"].split()[-1], fn)
+        for c in contacts
+        if (c.get("full_name") or "").strip() and (c.get("voter_zip") or "").strip()
+        for fn in _name_variants(c["full_name"].split()[0])
+    ])
+
     for contact in contacts:
         name      = (contact.get("full_name") or "").strip()
         person_id = (contact.get("person_id") or "").strip()
@@ -596,7 +705,7 @@ def _boe_enrich_contacts(contacts: list[dict]) -> list[str]:
 
         boe_rows: list[dict] = []
         for fn in _name_variants(firstname):
-            rows = boe_donations_by_voter(lastname, fn)
+            rows = boe_donations_by_voter(lastname, fn, prefetched)
             for r in rows:
                 if r not in boe_rows:
                     boe_rows.append(r)
@@ -872,10 +981,11 @@ def confidence_enrich_contact(contact: dict) -> Optional[dict]:
     lastname  = parts[-1] if parts else ""
     fn_variants = _name_variants(firstname)
 
-    # BOE (in-memory, instant)
+    # BOE (Neon, one indexed query for all name variants)
     boe_rows: list[dict] = []
+    boe_pre = boe_prefetch([(lastname, fn) for fn in fn_variants])
     for fn in fn_variants:
-        for r in boe_donations_by_voter(lastname, fn):
+        for r in boe_donations_by_voter(lastname, fn, boe_pre):
             if r not in boe_rows:
                 boe_rows.append(r)
 
@@ -4919,8 +5029,8 @@ def find_super_voters(
     rows.sort(key=lambda x: -_recency_score(x))
     log.info(f"find_super_voters: {len(rows)} voters for {county} score>={min_voter_score} | db_conn={_voter_db_conn is not None} | db_exists={os.path.exists(VOTER_DB_LOCAL_PATH)}")
 
-    if cross_reference_finance:
-        _build_boe_donor_index()
+    boe_pre = (boe_prefetch([(v.get("last", ""), v.get("first", "")) for v in rows])
+               if cross_reference_finance else None)
 
 
     results = []
@@ -4952,7 +5062,7 @@ def find_super_voters(
         }
 
         if cross_reference_finance:
-            donations = boe_donations_by_voter(v.get("last",""), v.get("first",""))
+            donations = boe_donations_by_voter(v.get("last",""), v.get("first",""), boe_pre)
             if donations:
                 total = sum(float(d.get("amount") or 0) for d in donations)
                 candidates = {}
@@ -6891,9 +7001,11 @@ async def messages_asgi(scope, receive, send):
     await sse_transport.handle_post_message(scope, receive, send)
 
 async def healthcheck(request: Request):
-    boe_status = f"{len(_boe_rows):,} rows loaded" if _boe_loaded else "not yet loaded"
+    loop = asyncio.get_event_loop()
+    n = await loop.run_in_executor(None, boe_row_count)
+    boe_status = f"~{n:,} rows in Neon" if n else "nys_boe_contributions not found"
     return Response(
-        json.dumps({"status": "ok", "boe_csv": boe_status}),
+        json.dumps({"status": "ok", "boe": boe_status}),
         media_type="application/json"
     )
 
@@ -6903,11 +7015,10 @@ async def lifespan(app):
     log.info(f"DATABASE_URL set: {bool(os.environ.get('DATABASE_URL'))}")
     log.info(f"MCP_API_KEY set:  {bool(os.environ.get('MCP_API_KEY'))}")
     log.info(f"FEC_API_KEY set:  {bool(os.environ.get('FEC_API_KEY'))}")
-    _load_boe_csv()
+    log.info(f"NYS BOE contributions: ~{boe_row_count() or 0:,} rows in Neon")
     # Eagerly load LDA registrants CSV and voter file
     _load_lda_registrants()
     _init_voter_db()
-    # BOE donor index built lazily on first find_super_voters call
     log.info("=== Ready ===")
     yield
 
